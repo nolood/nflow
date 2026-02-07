@@ -16,4 +16,10 @@ pub enum ClaudeError {
 
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
+
+    #[error("Template '{name}' not found")]
+    TemplateNotFound { name: String },
+
+    #[error("Unresolved template variable '{variable}'")]
+    UnresolvedVariable { variable: String },
 }
