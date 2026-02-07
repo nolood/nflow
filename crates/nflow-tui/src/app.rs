@@ -597,17 +597,25 @@ impl PlanFeedbackState {
 }
 
 /// Action to confirm in the confirmation popup.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConfirmAction {
     ApprovePlan,
     DiscardPlan,
+    StopStory(String),
+    CancelStory(String),
+    EscalateStory(String),
 }
 
 impl ConfirmAction {
-    pub fn message(&self) -> &'static str {
+    pub fn message(&self) -> String {
         match self {
-            ConfirmAction::ApprovePlan => "Approve current draft wave?",
-            ConfirmAction::DiscardPlan => "Discard current draft wave?",
+            ConfirmAction::ApprovePlan => "Approve current draft wave?".to_string(),
+            ConfirmAction::DiscardPlan => "Discard current draft wave?".to_string(),
+            ConfirmAction::StopStory(id) => format!("Stop story {}?", id),
+            ConfirmAction::CancelStory(id) => format!("Cancel story {}?", id),
+            ConfirmAction::EscalateStory(id) => {
+                format!("Escalate story {}? (stops & shows worktree path)", id)
+            }
         }
     }
 }
@@ -788,6 +796,59 @@ impl ExecuteTreeState {
             if node.depth == 3 {
                 return Some(node.status.clone());
             }
+        }
+        None
+    }
+
+    /// Get the short_id of the currently selected story (depth 2), if any.
+    /// If a task (depth 3) is selected, returns its parent story.
+    pub fn selected_story_id(&self) -> Option<String> {
+        let visible = self.visible_nodes();
+        if let Some(&(real_idx, _)) = visible.get(self.selected) {
+            let node = &self.nodes[real_idx];
+            if node.depth == 2 {
+                return Some(node.short_id.clone());
+            }
+            // If a task is selected, find its parent story
+            if node.depth == 3 {
+                // Walk backwards in the nodes array to find the parent story
+                for i in (0..real_idx).rev() {
+                    if self.nodes[i].depth == 2 {
+                        return Some(self.nodes[i].short_id.clone());
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Get the status of the currently selected story (depth 2), if any.
+    /// If a task (depth 3) is selected, returns its parent story's status.
+    pub fn selected_story_status(&self) -> Option<String> {
+        let visible = self.visible_nodes();
+        if let Some(&(real_idx, _)) = visible.get(self.selected) {
+            let node = &self.nodes[real_idx];
+            if node.depth == 2 {
+                return Some(node.status.clone());
+            }
+            if node.depth == 3 {
+                for i in (0..real_idx).rev() {
+                    if self.nodes[i].depth == 2 {
+                        return Some(self.nodes[i].status.clone());
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Get the depth, short_id, and status of the currently selected node.
+    #[allow(dead_code)]
+    pub fn selected_node_info(&self) -> Option<(u8, String, String)> {
+        let visible = self.visible_nodes();
+        if let Some(&(real_idx, _)) = visible.get(self.selected) {
+            let node = &self.nodes[real_idx];
+            return Some((node.depth, node.short_id.clone(), node.status.clone()));
         }
         None
     }
@@ -1199,6 +1260,8 @@ pub struct App {
     pub execute_tree: ExecuteTreeState,
     /// Execute output pane state (right pane).
     pub execute_output: ExecuteOutputState,
+    /// Active execute confirmation popup state (if open).
+    pub execute_confirm: Option<PlanConfirmState>,
     /// Event subscription state for real-time updates.
     pub event_subscription: EventSubscriptionState,
 }
@@ -1225,6 +1288,7 @@ impl App {
             plan_detail: None,
             execute_tree: ExecuteTreeState::new(),
             execute_output: ExecuteOutputState::new(),
+            execute_confirm: None,
             event_subscription: EventSubscriptionState::new(),
         }
     }
@@ -1434,6 +1498,21 @@ impl App {
     /// Returns true if the execute output pane is streaming.
     pub fn in_execute_streaming(&self) -> bool {
         self.execute_output.is_streaming
+    }
+
+    /// Returns true if any execute sub-view (confirm popup) is active.
+    pub fn in_execute_sub_view(&self) -> bool {
+        self.execute_confirm.is_some()
+    }
+
+    /// Open a confirmation popup for an execute action.
+    pub fn open_execute_confirm(&mut self, action: ConfirmAction) {
+        self.execute_confirm = Some(PlanConfirmState { action });
+    }
+
+    /// Close the execute confirmation popup.
+    pub fn close_execute_confirm(&mut self) {
+        self.execute_confirm = None;
     }
 
     /// Fetch the execute tree from the daemon.

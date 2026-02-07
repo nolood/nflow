@@ -54,6 +54,16 @@ pub enum ViewAction {
     PlanSubViewExit,
     /// Request to fetch and display a task's log output.
     ExecuteSelectTask(String),
+    /// Request to start execution (equivalent to nflow run).
+    ExecuteRun,
+    /// Request to stop a story (with confirmation).
+    ExecuteStopStory(String),
+    /// Request to cancel a story (with confirmation).
+    ExecuteCancelStory(String),
+    /// Request to escalate a story: stop and show worktree path.
+    ExecuteEscalate(String),
+    /// Execute confirmation popup was closed (Esc/n).
+    ExecuteConfirmExit,
 }
 
 /// Handle a key event, returning true if the app should continue, false to quit.
@@ -80,6 +90,12 @@ pub fn handle_key_event(app: &mut App, key: KeyEvent) -> (bool, ViewAction) {
     // If in plan sub-view (generate, feedback, detail, confirm), handle exclusively
     if app.in_plan_sub_view() {
         let action = handle_plan_sub_view_key(app, key);
+        return (true, action);
+    }
+
+    // If in execute sub-view (confirm popup), handle exclusively
+    if app.in_execute_sub_view() {
+        let action = handle_execute_confirm_key(app, key);
         return (true, action);
     }
 
@@ -457,10 +473,43 @@ fn handle_confirm_key(app: &mut App, key: KeyEvent) -> ViewAction {
             match confirm.action {
                 ConfirmAction::ApprovePlan => ViewAction::PlanApprove,
                 ConfirmAction::DiscardPlan => ViewAction::PlanDiscard,
+                // Execute-specific actions are handled by handle_execute_confirm_key
+                _ => ViewAction::None,
             }
         }
         KeyCode::Char('n') | KeyCode::Char('N') => {
             app.plan_confirm = None;
+            ViewAction::None
+        }
+        _ => ViewAction::None,
+    }
+}
+
+/// Handle key events in the execute confirmation popup.
+fn handle_execute_confirm_key(app: &mut App, key: KeyEvent) -> ViewAction {
+    // Escape closes the confirm popup
+    if key.code == KeyCode::Esc {
+        app.close_execute_confirm();
+        return ViewAction::ExecuteConfirmExit;
+    }
+
+    let confirm = match &app.execute_confirm {
+        Some(c) => c.clone(),
+        None => return ViewAction::None,
+    };
+
+    match key.code {
+        KeyCode::Char('y') | KeyCode::Char('Y') => {
+            app.close_execute_confirm();
+            match confirm.action {
+                ConfirmAction::StopStory(story_id) => ViewAction::ExecuteStopStory(story_id),
+                ConfirmAction::CancelStory(story_id) => ViewAction::ExecuteCancelStory(story_id),
+                ConfirmAction::EscalateStory(story_id) => ViewAction::ExecuteEscalate(story_id),
+                _ => ViewAction::None,
+            }
+        }
+        KeyCode::Char('n') | KeyCode::Char('N') => {
+            app.close_execute_confirm();
             ViewAction::None
         }
         _ => ViewAction::None,
@@ -489,13 +538,60 @@ fn handle_execute_key(app: &mut App, key: KeyEvent) -> ViewAction {
             app.execute_tree.toggle_verify_visibility();
             ViewAction::None
         }
-        // Enter: view selected task's output
+        // Enter: view selected task's output (or open logs view for tasks)
         KeyCode::Enter => {
             if let Some(task_id) = app.execute_tree.selected_task_id() {
                 ViewAction::ExecuteSelectTask(task_id)
             } else {
                 ViewAction::None
             }
+        }
+        // r: start/resume execution
+        KeyCode::Char('r') => ViewAction::ExecuteRun,
+        // s: stop selected story (confirmation required, in_progress only)
+        KeyCode::Char('s') => {
+            if let Some(story_id) = app.execute_tree.selected_story_id() {
+                let status = app.execute_tree.selected_story_status();
+                if status.as_deref() == Some("in_progress") {
+                    app.open_execute_confirm(ConfirmAction::StopStory(story_id));
+                } else {
+                    app.status_message = "Can only stop in_progress stories".to_string();
+                }
+            } else {
+                app.status_message = "Select a story or task to stop".to_string();
+            }
+            ViewAction::None
+        }
+        // c: cancel selected story (confirmation required, pending/ready only)
+        KeyCode::Char('c') => {
+            if let Some(story_id) = app.execute_tree.selected_story_id() {
+                let status = app.execute_tree.selected_story_status();
+                match status.as_deref() {
+                    Some("pending") | Some("ready") => {
+                        app.open_execute_confirm(ConfirmAction::CancelStory(story_id));
+                    }
+                    _ => {
+                        app.status_message = "Can only cancel pending/ready stories".to_string();
+                    }
+                }
+            } else {
+                app.status_message = "Select a story or task to cancel".to_string();
+            }
+            ViewAction::None
+        }
+        // e: escalate — stop story and show worktree path for manual intervention
+        KeyCode::Char('e') => {
+            if let Some(story_id) = app.execute_tree.selected_story_id() {
+                let status = app.execute_tree.selected_story_status();
+                if status.as_deref() == Some("in_progress") {
+                    app.open_execute_confirm(ConfirmAction::EscalateStory(story_id));
+                } else {
+                    app.status_message = "Can only escalate in_progress stories".to_string();
+                }
+            } else {
+                app.status_message = "Select a story or task to escalate".to_string();
+            }
+            ViewAction::None
         }
         // Scroll output pane
         KeyCode::Char('J') => {

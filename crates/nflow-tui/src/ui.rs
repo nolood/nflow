@@ -36,6 +36,11 @@ pub fn render(app: &App, frame: &mut Frame) {
     } else if app.plan_detail.is_some() {
         render_detail_popup(app, frame, frame.area());
     }
+
+    // Render execute sub-views on top
+    if app.execute_confirm.is_some() {
+        render_execute_confirm_popup(app, frame, frame.area());
+    }
 }
 
 /// Render the header with view tabs.
@@ -1135,6 +1140,9 @@ fn render_confirm_popup(app: &App, frame: &mut Frame, area: Rect) {
     let border_color = match confirm.action {
         ConfirmAction::ApprovePlan => Color::Green,
         ConfirmAction::DiscardPlan => Color::Red,
+        ConfirmAction::StopStory(_) => Color::Yellow,
+        ConfirmAction::CancelStory(_) => Color::Red,
+        ConfirmAction::EscalateStory(_) => Color::Red,
     };
 
     let block = Block::default()
@@ -1335,4 +1343,56 @@ fn render_filter_overlay(frame: &mut Frame, area: Rect) {
     .block(block);
 
     frame.render_widget(content, popup_area);
+}
+
+/// Render a confirmation popup for execute actions (stop, cancel, escalate).
+fn render_execute_confirm_popup(app: &App, frame: &mut Frame, area: Rect) {
+    let confirm = match &app.execute_confirm {
+        Some(c) => c,
+        None => return,
+    };
+
+    let popup_area = centered_rect(40, 20, area);
+    frame.render_widget(Clear, popup_area);
+
+    let border_color = match &confirm.action {
+        ConfirmAction::StopStory(_) => Color::Yellow,
+        ConfirmAction::CancelStory(_) => Color::Red,
+        ConfirmAction::EscalateStory(_) => Color::Red,
+        _ => Color::White,
+    };
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title("Confirm")
+        .title_style(
+            Style::default()
+                .fg(border_color)
+                .add_modifier(Modifier::BOLD),
+        )
+        .border_style(Style::default().fg(border_color));
+
+    let lines = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            format!("  {}", confirm.action.message()),
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  y", Style::default().fg(Color::Green)),
+            Span::styled(" = Yes    ", Style::default().fg(Color::DarkGray)),
+            Span::styled("n", Style::default().fg(Color::Red)),
+            Span::styled(" = No    ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Esc", Style::default().fg(Color::DarkGray)),
+            Span::styled(" = Cancel", Style::default().fg(Color::DarkGray)),
+        ]),
+    ];
+
+    let paragraph = Paragraph::new(lines)
+        .block(block)
+        .wrap(Wrap { trim: false });
+    frame.render_widget(paragraph, popup_area);
 }

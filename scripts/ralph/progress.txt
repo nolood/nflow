@@ -47,6 +47,8 @@
 - TUI execute split view: 40% tree (ExecuteTreeState) + 60% output (ExecuteOutputState); tree mirrors plan tree pattern; output supports streaming (auto-scroll bottom) and historical (scroll from top); Enter on task fetches log; J/K scroll output pane
 - exec.status returns { waves: [{ wave_number, status, epics: [...] }] } — multi-wave unlike plan.show which returns a single wave
 - ExecuteOutputState streaming: start_streaming(task_id, request_id) then append_line(); stop_streaming() on done; auto_select_running_task() finds first in_progress task at depth 3
+- Execute actions with state guards: ConfirmAction enum variants carry story IDs (StopStory, CancelStory, EscalateStory); execute_confirm on App is separate from plan_confirm
+- selected_story_id() on ExecuteTreeState: walks backwards from depth-3 task to find parent depth-2 story
 - plan.show daemon command returns { wave_number, status, epics: [{ short_id, title, status, stories: [{ ..., progress, depends_on, tasks }] }] }
 - visible_nodes() pattern: iterate all nodes, skip children when parent.collapsed, filter verify tasks when hide_verify — returns Vec<(real_index, &node)> for mapping back to flat array
 - Story completion lifecycle: rebase → push → MR creation → DB update → worktree cleanup → event broadcast (all in execute_complete_story)
@@ -2063,4 +2065,16 @@ Started: Sat Feb  7 03:49:10 PM MSK 2026
 - Running counts in status bar: count_task_stats() iterates depth=3 nodes for running/total/done/failed counts
 - ExecuteTreeNode.mr_url field stores MR URL for completed stories, displayed inline in tree
 - Event polling: poll_daemon_events() when not actively streaming dialogue/exec.log; events detected in streaming polls too
+---
+## US-083: TUI — execute actions
+- Execute key bindings: r (run), s (stop story), c (cancel story), e (escalate), Enter (view task log)
+- Actions with state guards: s only for in_progress stories, c only for pending/ready, e only for in_progress
+- Confirmation popup pattern reused from plan view: ConfirmAction enum extended with StopStory(String), CancelStory(String), EscalateStory(String)
+- execute_confirm field on App (separate from plan_confirm) — prevents interference between plan and execute views
+- in_execute_sub_view() checked in handle_key_event before global keys — blocks q, Tab, etc. when confirm popup open
+- handle_execute_confirm_key() dispatches y→ViewAction, n→close, Esc→close
+- selected_story_id() walks backwards from selected task (depth 3) to find parent story (depth 2)
+- Escalate: stops story via exec.stop then shows worktree path in status message for manual intervention
+- ConfirmAction.message() returns String (not &str) to support dynamic content with story IDs
+- render_execute_confirm_popup() renders in render() after plan sub-views — only one type of popup at a time
 ---

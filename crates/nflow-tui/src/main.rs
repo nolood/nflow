@@ -178,6 +178,21 @@ async fn event_loop(
                 event::ViewAction::ExecuteSelectTask(task_id) => {
                     handle_execute_select_task(app, client, &task_id).await;
                 }
+                event::ViewAction::ExecuteRun => {
+                    handle_execute_run(app, client).await;
+                }
+                event::ViewAction::ExecuteStopStory(story_id) => {
+                    handle_execute_stop_story(app, client, &story_id).await;
+                }
+                event::ViewAction::ExecuteCancelStory(story_id) => {
+                    handle_execute_cancel_story(app, client, &story_id).await;
+                }
+                event::ViewAction::ExecuteEscalate(story_id) => {
+                    handle_execute_escalate(app, client, &story_id).await;
+                }
+                event::ViewAction::ExecuteConfirmExit => {
+                    // Confirmation popup was dismissed — no action needed
+                }
                 _ => {}
             }
 
@@ -545,6 +560,133 @@ async fn handle_execute_select_task(app: &mut App, client: &mut SocketClient, ta
                 app.execute_output
                     .set_historical(task_id.to_string(), vec![format!("[Error: {}]", e)]);
             }
+        }
+    }
+}
+
+/// Handle starting/resuming execution.
+async fn handle_execute_run(app: &mut App, client: &mut SocketClient) {
+    let params = serde_json::json!({
+        "project_name": &app.project,
+    });
+
+    match client.send_command("exec.run", params).await {
+        Ok(resp) if resp.status == ResponseStatus::Ok => {
+            let running = resp
+                .data
+                .get("running_count")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let pending = resp
+                .data
+                .get("pending_count")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            app.status_message = format!(
+                "Execution started ({} running, {} pending)",
+                running, pending
+            );
+            // Refresh execute tree
+            app.fetch_execute(client).await.ok();
+        }
+        Ok(resp) => {
+            let msg = resp
+                .data
+                .get("message")
+                .and_then(|v| v.as_str())
+                .unwrap_or("Failed to start execution");
+            app.status_message = msg.to_string();
+        }
+        Err(e) => {
+            app.status_message = format!("Error: {}", e);
+        }
+    }
+}
+
+/// Handle stopping a story.
+async fn handle_execute_stop_story(app: &mut App, client: &mut SocketClient, story_id: &str) {
+    let params = serde_json::json!({
+        "project_name": &app.project,
+        "story_id": story_id,
+    });
+
+    match client.send_command("exec.stop", params).await {
+        Ok(resp) if resp.status == ResponseStatus::Ok => {
+            app.status_message = format!("Story {} stopped", story_id);
+            // Refresh execute tree
+            app.fetch_execute(client).await.ok();
+        }
+        Ok(resp) => {
+            let msg = resp
+                .data
+                .get("message")
+                .and_then(|v| v.as_str())
+                .unwrap_or("Failed to stop story");
+            app.status_message = msg.to_string();
+        }
+        Err(e) => {
+            app.status_message = format!("Error: {}", e);
+        }
+    }
+}
+
+/// Handle cancelling a story.
+async fn handle_execute_cancel_story(app: &mut App, client: &mut SocketClient, story_id: &str) {
+    let params = serde_json::json!({
+        "project_name": &app.project,
+        "story_id": story_id,
+    });
+
+    match client.send_command("exec.cancel", params).await {
+        Ok(resp) if resp.status == ResponseStatus::Ok => {
+            app.status_message = format!("Story {} cancelled", story_id);
+            // Refresh execute tree
+            app.fetch_execute(client).await.ok();
+        }
+        Ok(resp) => {
+            let msg = resp
+                .data
+                .get("message")
+                .and_then(|v| v.as_str())
+                .unwrap_or("Failed to cancel story");
+            app.status_message = msg.to_string();
+        }
+        Err(e) => {
+            app.status_message = format!("Error: {}", e);
+        }
+    }
+}
+
+/// Handle escalating a story: stop it and display the worktree path for manual intervention.
+async fn handle_execute_escalate(app: &mut App, client: &mut SocketClient, story_id: &str) {
+    // First stop the story
+    let params = serde_json::json!({
+        "project_name": &app.project,
+        "story_id": story_id,
+    });
+
+    match client.send_command("exec.stop", params).await {
+        Ok(resp) if resp.status == ResponseStatus::Ok => {
+            // Extract worktree path from response if available
+            let worktree = resp
+                .data
+                .get("worktree_path")
+                .and_then(|v| v.as_str())
+                .unwrap_or("(worktree path not available)");
+            app.status_message = format!("Story {} escalated — worktree: {}", story_id, worktree);
+            // Refresh execute tree
+            app.fetch_execute(client).await.ok();
+        }
+        Ok(resp) => {
+            let msg = resp
+                .data
+                .get("message")
+                .and_then(|v| v.as_str())
+                .unwrap_or("Failed to escalate story");
+            app.status_message = msg.to_string();
+        }
+        Err(e) => {
+            app.status_message = format!("Error: {}", e);
         }
     }
 }
