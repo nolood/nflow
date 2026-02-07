@@ -138,6 +138,40 @@ pub fn find_running_agent_runs(conn: &Connection) -> Result<Vec<AgentRun>> {
     Ok(runs)
 }
 
+/// Find running agent runs for a specific project.
+pub fn find_running_agent_runs_by_project(
+    conn: &Connection,
+    project_id: &Uuid,
+) -> Result<Vec<AgentRun>> {
+    let mut stmt = conn.prepare(
+        "SELECT ar.id, ar.work_item_id, ar.pid, ar.session_id, ar.pid_start_time, ar.status, ar.exit_code, ar.log_path, ar.error_message, ar.started_at, ar.finished_at
+         FROM agent_runs ar
+         JOIN work_items w ON ar.work_item_id = w.id
+         JOIN decomposition_sessions ds ON w.decomposition_session_id = ds.id
+         WHERE ar.status = 'running' AND ds.project_id = ?1",
+    )?;
+    let rows = stmt.query_map(params![project_id.to_string()], row_to_agent_run)?;
+    let mut runs = Vec::new();
+    for row in rows {
+        runs.push(row?);
+    }
+    Ok(runs)
+}
+
+/// Cancel running agent runs for a project (mark as cancelled in DB).
+pub fn cancel_running_agent_runs_by_project(conn: &Connection, project_id: &Uuid) -> Result<u64> {
+    let changed = conn.execute(
+        "UPDATE agent_runs SET status = 'cancelled', finished_at = ?1
+         WHERE status = 'running' AND work_item_id IN (
+             SELECT w.id FROM work_items w
+             JOIN decomposition_sessions ds ON w.decomposition_session_id = ds.id
+             WHERE ds.project_id = ?2
+         )",
+        params![Utc::now().to_rfc3339(), project_id.to_string()],
+    )?;
+    Ok(changed as u64)
+}
+
 pub fn count_agent_runs_for_task(conn: &Connection, work_item_id: &Uuid) -> Result<u32> {
     let count: u32 = conn.query_row(
         "SELECT COUNT(*) FROM agent_runs WHERE work_item_id = ?1",

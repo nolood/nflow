@@ -6,6 +6,14 @@ use nflow_core::project::{CreateProjectParams, GitProvider, ProjectService};
 use crate::db;
 use crate::socket::{HandlerResult, Request, Response};
 
+/// Helper to convert GitProvider to string for JSON response.
+fn git_provider_str(provider: GitProvider) -> &'static str {
+    match provider {
+        GitProvider::Github => "github",
+        GitProvider::Gitlab => "gitlab",
+    }
+}
+
 /// Shared state available to all command handlers.
 pub struct HandlerState {
     /// Path to the SQLite database file.
@@ -24,6 +32,8 @@ pub fn create_handler(state: Arc<HandlerState>) -> crate::socket::CommandHandler
 fn dispatch(req: Request, state: &HandlerState) -> HandlerResult {
     match req.command.as_str() {
         "project.init" => HandlerResult::Single(handle_project_init(req, state)),
+        "project.list" => HandlerResult::Single(handle_project_list(req, state)),
+        "project.delete" => HandlerResult::Single(handle_project_delete(req, state)),
         _ => HandlerResult::Single(Response::error(
             req.id,
             &format!("unknown command: {}", req.command),
@@ -130,11 +140,6 @@ fn handle_project_init(req: Request, state: &HandlerState) -> Response {
     }
 
     // Return success
-    let git_provider_str = match project.git_provider {
-        GitProvider::Github => "github",
-        GitProvider::Gitlab => "gitlab",
-    };
-
     Response::ok(
         id,
         serde_json::json!({
@@ -142,7 +147,141 @@ fn handle_project_init(req: Request, state: &HandlerState) -> Response {
             "name": project.name,
             "path": project.path,
             "base_branch": project.base_branch,
-            "git_provider": git_provider_str,
+            "git_provider": git_provider_str(project.git_provider),
+        }),
+    )
+}
+
+/// Handle "project.list" command.
+///
+/// Returns all projects with: name, path, base_branch, git_provider, execution_enabled, spec_count, story_count
+fn handle_project_list(req: Request, state: &HandlerState) -> Response {
+    let id = req.id.clone();
+
+    // Open DB connection
+    let conn = match db::open_connection(&state.db_path) {
+        Ok(c) => c,
+        Err(e) => return Response::error(id, &format!("database error: {}", e)),
+    };
+
+    // List all projects
+    let projects = match db::projects::list_projects(&conn) {
+        Ok(p) => p,
+        Err(e) => return Response::error(id, &format!("database error: {}", e)),
+    };
+
+    // Build response with counts for each project
+    let mut project_list = Vec::new();
+    for project in &projects {
+        let spec_count = db::specs::count_specs_by_project(&conn, &project.id).unwrap_or(0);
+        let story_count = db::work_items::count_stories_by_project(&conn, &project.id).unwrap_or(0);
+
+        project_list.push(serde_json::json!({
+            "name": project.name,
+            "path": project.path,
+            "base_branch": project.base_branch,
+            "git_provider": git_provider_str(project.git_provider),
+            "execution_enabled": project.execution_enabled,
+            "spec_count": spec_count,
+            "story_count": story_count,
+        }));
+    }
+
+    Response::ok(id, serde_json::json!({ "projects": project_list }))
+}
+
+/// Handle "project.delete" command.
+///
+/// Receives: { name, force? }
+/// Without force: returns error if project has running agents.
+/// With force: marks in-progress items as cancelled and proceeds.
+/// Deletes: project record (cascades), project dir, worktrees.
+fn handle_project_delete(req: Request, state: &HandlerState) -> Response {
+    let id = req.id.clone();
+
+    // Parse required params
+    let name = match req.params.get("name").and_then(|v| v.as_str()) {
+        Some(n) => n.to_string(),
+        None => {
+            return Response::error(id, "missing required parameter: name");
+        }
+    };
+
+    let force = req
+        .params
+        .get("force")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    // Open DB connection
+    let conn = match db::open_connection(&state.db_path) {
+        Ok(c) => c,
+        Err(e) => return Response::error(id, &format!("database error: {}", e)),
+    };
+
+    // Find the project by name
+    let project = match db::projects::get_project_by_name(&conn, &name) {
+        Ok(Some(p)) => p,
+        Ok(None) => {
+            return Response::error(id, &format!("NOT_FOUND: project '{}' not found", name));
+        }
+        Err(e) => return Response::error(id, &format!("database error: {}", e)),
+    };
+
+    // Check for running agents
+    let running_agents =
+        match db::agent_runs::find_running_agent_runs_by_project(&conn, &project.id) {
+            Ok(runs) => runs,
+            Err(e) => return Response::error(id, &format!("database error: {}", e)),
+        };
+
+    if !running_agents.is_empty() && !force {
+        return Response::error(
+            id,
+            &format!(
+                "INVALID_STATE: project '{}' has {} running agent(s). Use force=true to override",
+                name,
+                running_agents.len()
+            ),
+        );
+    }
+
+    // With force: cancel in-progress items and running agents
+    if force && !running_agents.is_empty() {
+        if let Err(e) = db::work_items::cancel_in_progress_items_by_project(&conn, &project.id) {
+            return Response::error(id, &format!("database error while cancelling items: {}", e));
+        }
+        if let Err(e) = db::agent_runs::cancel_running_agent_runs_by_project(&conn, &project.id) {
+            return Response::error(
+                id,
+                &format!("database error while cancelling agents: {}", e),
+            );
+        }
+    }
+
+    // Collect worktree paths before deleting DB records
+    let worktree_paths =
+        db::work_items::list_worktree_paths_by_project(&conn, &project.id).unwrap_or_default();
+
+    // Delete project from DB (cascades to specs, work_items, agent_runs, decomposition_sessions)
+    if let Err(e) = db::projects::delete_project(&conn, &project.id) {
+        return Response::error(id, &format!("database error: {}", e));
+    }
+
+    // Remove worktrees via git
+    for worktree_path in &worktree_paths {
+        remove_worktree_sync(Path::new(&project.path), Path::new(worktree_path));
+    }
+
+    // Remove project directory (~/.nflow/projects/{name}/)
+    remove_project_dirs(&name);
+
+    Response::ok(
+        id,
+        serde_json::json!({
+            "name": name,
+            "deleted": true,
+            "worktrees_removed": worktree_paths.len(),
         }),
     )
 }
@@ -212,6 +351,38 @@ fn parse_git_provider(s: &str) -> Option<GitProvider> {
         "github" => Some(GitProvider::Github),
         "gitlab" => Some(GitProvider::Gitlab),
         _ => None,
+    }
+}
+
+/// Remove a git worktree synchronously.
+fn remove_worktree_sync(repo_path: &Path, worktree_path: &Path) {
+    // Try git worktree remove --force first
+    let _ = std::process::Command::new("git")
+        .args([
+            "worktree",
+            "remove",
+            "--force",
+            &worktree_path.to_string_lossy(),
+        ])
+        .current_dir(repo_path)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+
+    // Prune any stale worktree entries
+    let _ = std::process::Command::new("git")
+        .args(["worktree", "prune"])
+        .current_dir(repo_path)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+}
+
+/// Remove the project directories under ~/.nflow/projects/{name}/.
+fn remove_project_dirs(project_name: &str) {
+    if let Ok(home) = crate::daemon::nflow_home() {
+        let project_dir = home.join("projects").join(project_name);
+        let _ = std::fs::remove_dir_all(project_dir);
     }
 }
 
@@ -629,5 +800,358 @@ mod tests {
         HandlerState {
             db_path: PathBuf::from("/nonexistent/test.db"),
         }
+    }
+
+    /// Create a test DB and return (state, db_dir) for cleanup.
+    fn make_db_state(suffix: &str) -> (HandlerState, PathBuf) {
+        let db_dir =
+            std::env::temp_dir().join(format!("nflow_test_db_{}_{}", suffix, uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&db_dir).unwrap();
+        let db_path = db_dir.join("test.db");
+
+        let conn = db::open_connection(&db_path).unwrap();
+        db::run_migrations(&conn, &db_path).unwrap();
+        drop(conn);
+
+        let state = HandlerState {
+            db_path: db_path.clone(),
+        };
+        (state, db_dir)
+    }
+
+    fn cleanup_db(db_dir: &Path) {
+        let db_path = db_dir.join("test.db");
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(db_path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(db_path.with_extension("db-shm"));
+        let _ = std::fs::remove_dir_all(db_dir);
+    }
+
+    /// Insert a project directly into the DB and return its UUID.
+    fn insert_test_project(state: &HandlerState, name: &str) -> uuid::Uuid {
+        use chrono::Utc;
+        use nflow_core::project::Project;
+        let conn = db::open_connection(&state.db_path).unwrap();
+        let project = Project {
+            id: uuid::Uuid::new_v4(),
+            name: name.to_string(),
+            path: "/tmp/fakepath".to_string(),
+            base_branch: "main".to_string(),
+            git_provider: GitProvider::Github,
+            execution_enabled: true,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        db::projects::insert_project(&conn, &project).unwrap();
+        project.id
+    }
+
+    // --- project.list tests ---
+
+    #[test]
+    fn test_handle_project_list_empty() {
+        let (state, db_dir) = make_db_state("list_empty");
+        let req = Request {
+            id: "10".to_string(),
+            command: "project.list".to_string(),
+            params: serde_json::json!({}),
+        };
+        let result = handle_project_list(req, &state);
+        assert_eq!(result.status, crate::socket::ResponseStatus::Ok);
+        let projects = result.data["projects"].as_array().unwrap();
+        assert!(projects.is_empty());
+        cleanup_db(&db_dir);
+    }
+
+    #[test]
+    fn test_handle_project_list_with_projects() {
+        let (state, db_dir) = make_db_state("list_projects");
+        insert_test_project(&state, "alpha");
+        insert_test_project(&state, "beta");
+
+        let req = Request {
+            id: "11".to_string(),
+            command: "project.list".to_string(),
+            params: serde_json::json!({}),
+        };
+        let result = handle_project_list(req, &state);
+        assert_eq!(result.status, crate::socket::ResponseStatus::Ok);
+        let projects = result.data["projects"].as_array().unwrap();
+        assert_eq!(projects.len(), 2);
+        // Ordered by name
+        assert_eq!(projects[0]["name"], "alpha");
+        assert_eq!(projects[1]["name"], "beta");
+        // Check all fields present
+        assert_eq!(projects[0]["base_branch"], "main");
+        assert_eq!(projects[0]["git_provider"], "github");
+        assert_eq!(projects[0]["execution_enabled"], true);
+        assert_eq!(projects[0]["spec_count"], 0);
+        assert_eq!(projects[0]["story_count"], 0);
+        cleanup_db(&db_dir);
+    }
+
+    #[test]
+    fn test_handle_project_list_with_spec_count() {
+        let (state, db_dir) = make_db_state("list_specs");
+        let project_id = insert_test_project(&state, "myproject");
+
+        // Insert a spec directly
+        let conn = db::open_connection(&state.db_path).unwrap();
+        conn.execute(
+            "INSERT INTO specs (id, project_id, name, file_path, status, session_active, created_at, updated_at)
+             VALUES (?1, ?2, 'spec1', '/tmp/spec.md', 'draft', 0, '2024-01-01', '2024-01-01')",
+            rusqlite::params![uuid::Uuid::new_v4().to_string(), project_id.to_string()],
+        )
+        .unwrap();
+        drop(conn);
+
+        let req = Request {
+            id: "12".to_string(),
+            command: "project.list".to_string(),
+            params: serde_json::json!({}),
+        };
+        let result = handle_project_list(req, &state);
+        assert_eq!(result.status, crate::socket::ResponseStatus::Ok);
+        let projects = result.data["projects"].as_array().unwrap();
+        assert_eq!(projects[0]["spec_count"], 1);
+        cleanup_db(&db_dir);
+    }
+
+    // --- project.delete tests ---
+
+    #[test]
+    fn test_handle_project_delete_missing_name() {
+        let state = make_test_state();
+        let req = Request {
+            id: "20".to_string(),
+            command: "project.delete".to_string(),
+            params: serde_json::json!({}),
+        };
+        let result = handle_project_delete(req, &state);
+        assert_eq!(result.status, crate::socket::ResponseStatus::Error);
+        assert!(result.data["message"]
+            .as_str()
+            .unwrap()
+            .contains("missing required parameter: name"));
+    }
+
+    #[test]
+    fn test_handle_project_delete_not_found() {
+        let (state, db_dir) = make_db_state("del_notfound");
+        let req = Request {
+            id: "21".to_string(),
+            command: "project.delete".to_string(),
+            params: serde_json::json!({ "name": "nonexistent" }),
+        };
+        let result = handle_project_delete(req, &state);
+        assert_eq!(result.status, crate::socket::ResponseStatus::Error);
+        assert!(result.data["message"]
+            .as_str()
+            .unwrap()
+            .contains("NOT_FOUND"));
+        cleanup_db(&db_dir);
+    }
+
+    #[test]
+    fn test_handle_project_delete_success() {
+        let (state, db_dir) = make_db_state("del_success");
+        insert_test_project(&state, "to-delete");
+
+        let req = Request {
+            id: "22".to_string(),
+            command: "project.delete".to_string(),
+            params: serde_json::json!({ "name": "to-delete" }),
+        };
+        let result = handle_project_delete(req, &state);
+        assert_eq!(
+            result.status,
+            crate::socket::ResponseStatus::Ok,
+            "Expected Ok but got error: {:?}",
+            result.data
+        );
+        assert_eq!(result.data["name"], "to-delete");
+        assert_eq!(result.data["deleted"], true);
+
+        // Verify project is actually deleted
+        let conn = db::open_connection(&state.db_path).unwrap();
+        let project = db::projects::get_project_by_name(&conn, "to-delete").unwrap();
+        assert!(project.is_none());
+        cleanup_db(&db_dir);
+    }
+
+    #[test]
+    fn test_handle_project_delete_with_running_agents_no_force() {
+        let (state, db_dir) = make_db_state("del_running");
+        let project_id = insert_test_project(&state, "running-project");
+
+        // Create a decomposition session and work item with a running agent
+        let conn = db::open_connection(&state.db_path).unwrap();
+        let session_id = uuid::Uuid::new_v4();
+        conn.execute(
+            "INSERT INTO decomposition_sessions (id, project_id, wave_number, status, created_at, updated_at)
+             VALUES (?1, ?2, 1, 'approved', '2024-01-01', '2024-01-01')",
+            rusqlite::params![session_id.to_string(), project_id.to_string()],
+        )
+        .unwrap();
+        let epic_id = uuid::Uuid::new_v4();
+        conn.execute(
+            "INSERT INTO work_items (id, decomposition_session_id, item_type, title, status, short_id, sort_order, created_at, updated_at)
+             VALUES (?1, ?2, 'epic', 'Epic', 'in_progress', 'E1', 0, '2024-01-01', '2024-01-01')",
+            rusqlite::params![epic_id.to_string(), session_id.to_string()],
+        )
+        .unwrap();
+        let agent_id = uuid::Uuid::new_v4();
+        conn.execute(
+            "INSERT INTO agent_runs (id, work_item_id, status, started_at)
+             VALUES (?1, ?2, 'running', '2024-01-01')",
+            rusqlite::params![agent_id.to_string(), epic_id.to_string()],
+        )
+        .unwrap();
+        drop(conn);
+
+        // Without force: should error
+        let req = Request {
+            id: "23".to_string(),
+            command: "project.delete".to_string(),
+            params: serde_json::json!({ "name": "running-project" }),
+        };
+        let result = handle_project_delete(req, &state);
+        assert_eq!(result.status, crate::socket::ResponseStatus::Error);
+        assert!(result.data["message"]
+            .as_str()
+            .unwrap()
+            .contains("INVALID_STATE"));
+        assert!(result.data["message"]
+            .as_str()
+            .unwrap()
+            .contains("running agent"));
+
+        cleanup_db(&db_dir);
+    }
+
+    #[test]
+    fn test_handle_project_delete_with_running_agents_force() {
+        let (state, db_dir) = make_db_state("del_force");
+        let project_id = insert_test_project(&state, "force-project");
+
+        // Create a decomposition session, work item, and running agent
+        let conn = db::open_connection(&state.db_path).unwrap();
+        let session_id = uuid::Uuid::new_v4();
+        conn.execute(
+            "INSERT INTO decomposition_sessions (id, project_id, wave_number, status, created_at, updated_at)
+             VALUES (?1, ?2, 1, 'approved', '2024-01-01', '2024-01-01')",
+            rusqlite::params![session_id.to_string(), project_id.to_string()],
+        )
+        .unwrap();
+        let epic_id = uuid::Uuid::new_v4();
+        conn.execute(
+            "INSERT INTO work_items (id, decomposition_session_id, item_type, title, status, short_id, sort_order, created_at, updated_at)
+             VALUES (?1, ?2, 'epic', 'Epic', 'in_progress', 'E1', 0, '2024-01-01', '2024-01-01')",
+            rusqlite::params![epic_id.to_string(), session_id.to_string()],
+        )
+        .unwrap();
+        let agent_id = uuid::Uuid::new_v4();
+        conn.execute(
+            "INSERT INTO agent_runs (id, work_item_id, status, started_at)
+             VALUES (?1, ?2, 'running', '2024-01-01')",
+            rusqlite::params![agent_id.to_string(), epic_id.to_string()],
+        )
+        .unwrap();
+        drop(conn);
+
+        // With force: should succeed
+        let req = Request {
+            id: "24".to_string(),
+            command: "project.delete".to_string(),
+            params: serde_json::json!({ "name": "force-project", "force": true }),
+        };
+        let result = handle_project_delete(req, &state);
+        assert_eq!(
+            result.status,
+            crate::socket::ResponseStatus::Ok,
+            "Expected Ok but got error: {:?}",
+            result.data
+        );
+        assert_eq!(result.data["name"], "force-project");
+        assert_eq!(result.data["deleted"], true);
+
+        // Verify project is deleted
+        let conn = db::open_connection(&state.db_path).unwrap();
+        let project = db::projects::get_project_by_name(&conn, "force-project").unwrap();
+        assert!(project.is_none());
+        cleanup_db(&db_dir);
+    }
+
+    #[test]
+    fn test_handle_project_delete_cascades() {
+        let (state, db_dir) = make_db_state("del_cascade");
+        let project_id = insert_test_project(&state, "cascade-project");
+
+        // Add a spec to the project
+        let conn = db::open_connection(&state.db_path).unwrap();
+        conn.execute(
+            "INSERT INTO specs (id, project_id, name, file_path, status, session_active, created_at, updated_at)
+             VALUES (?1, ?2, 'spec1', '/tmp/spec.md', 'draft', 0, '2024-01-01', '2024-01-01')",
+            rusqlite::params![uuid::Uuid::new_v4().to_string(), project_id.to_string()],
+        )
+        .unwrap();
+        drop(conn);
+
+        let req = Request {
+            id: "25".to_string(),
+            command: "project.delete".to_string(),
+            params: serde_json::json!({ "name": "cascade-project" }),
+        };
+        let result = handle_project_delete(req, &state);
+        assert_eq!(
+            result.status,
+            crate::socket::ResponseStatus::Ok,
+            "Expected Ok but got error: {:?}",
+            result.data
+        );
+
+        // Verify specs are also deleted (cascaded)
+        let conn = db::open_connection(&state.db_path).unwrap();
+        let count: u32 = conn
+            .query_row("SELECT COUNT(*) FROM specs", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+        cleanup_db(&db_dir);
+    }
+
+    #[test]
+    fn test_dispatch_project_list() {
+        let (state, db_dir) = make_db_state("dispatch_list");
+        let req = Request {
+            id: "30".to_string(),
+            command: "project.list".to_string(),
+            params: serde_json::json!({}),
+        };
+        match dispatch(req, &state) {
+            HandlerResult::Single(resp) => {
+                assert_eq!(resp.status, crate::socket::ResponseStatus::Ok);
+            }
+            _ => panic!("expected Single response"),
+        }
+        cleanup_db(&db_dir);
+    }
+
+    #[test]
+    fn test_dispatch_project_delete() {
+        let (state, db_dir) = make_db_state("dispatch_del");
+        let req = Request {
+            id: "31".to_string(),
+            command: "project.delete".to_string(),
+            params: serde_json::json!({ "name": "nope" }),
+        };
+        match dispatch(req, &state) {
+            HandlerResult::Single(resp) => {
+                // Should be error (not found) but not "unknown command"
+                assert_eq!(resp.status, crate::socket::ResponseStatus::Error);
+                assert!(resp.data["message"].as_str().unwrap().contains("NOT_FOUND"));
+            }
+            _ => panic!("expected Single response"),
+        }
+        cleanup_db(&db_dir);
     }
 }

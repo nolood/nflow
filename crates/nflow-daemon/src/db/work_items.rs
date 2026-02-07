@@ -302,6 +302,49 @@ pub fn count_tasks_by_status(
     Ok(map)
 }
 
+/// Count stories for a project (across all decomposition sessions).
+pub fn count_stories_by_project(conn: &Connection, project_id: &Uuid) -> Result<u32> {
+    let count: u32 = conn.query_row(
+        "SELECT COUNT(*) FROM work_items w
+         JOIN decomposition_sessions ds ON w.decomposition_session_id = ds.id
+         WHERE ds.project_id = ?1 AND w.item_type = 'story'",
+        params![project_id.to_string()],
+        |row| row.get(0),
+    )?;
+    Ok(count)
+}
+
+/// List worktree paths for all stories in a project.
+pub fn list_worktree_paths_by_project(conn: &Connection, project_id: &Uuid) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT w.worktree_path FROM work_items w
+         JOIN decomposition_sessions ds ON w.decomposition_session_id = ds.id
+         WHERE ds.project_id = ?1 AND w.item_type = 'story' AND w.worktree_path IS NOT NULL",
+    )?;
+    let rows = stmt.query_map(params![project_id.to_string()], |row| {
+        let path: String = row.get(0)?;
+        Ok(path)
+    })?;
+    let mut paths = Vec::new();
+    for row in rows {
+        paths.push(row?);
+    }
+    Ok(paths)
+}
+
+/// Cancel all in-progress work items for a project.
+/// Returns the number of items cancelled.
+pub fn cancel_in_progress_items_by_project(conn: &Connection, project_id: &Uuid) -> Result<u64> {
+    let changed = conn.execute(
+        "UPDATE work_items SET status = 'cancelled', updated_at = ?1
+         WHERE decomposition_session_id IN (
+             SELECT id FROM decomposition_sessions WHERE project_id = ?2
+         ) AND status = 'in_progress'",
+        params![Utc::now().to_rfc3339(), project_id.to_string()],
+    )?;
+    Ok(changed as u64)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

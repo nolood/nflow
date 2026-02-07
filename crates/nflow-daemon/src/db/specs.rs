@@ -174,6 +174,15 @@ pub fn find_unassigned_approved_specs(conn: &Connection, project_id: &Uuid) -> R
     Ok(specs)
 }
 
+pub fn count_specs_by_project(conn: &Connection, project_id: &Uuid) -> Result<u32> {
+    let count: u32 = conn.query_row(
+        "SELECT COUNT(*) FROM specs WHERE project_id = ?1",
+        params![project_id.to_string()],
+        |row| row.get(0),
+    )?;
+    Ok(count)
+}
+
 pub fn reset_active_sessions(conn: &Connection, project_id: &Uuid) -> Result<u64> {
     let changed = conn.execute(
         "UPDATE specs SET session_active = 0, updated_at = ?1 WHERE project_id = ?2 AND session_active = 1",

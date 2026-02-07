@@ -96,6 +96,9 @@
 - Command handlers run via spawn_blocking to serialize with scheduler (no async in handlers)
 - Socket file permissions set to 0600 via std::os::unix::fs::PermissionsExt after binding
 - bind_socket removes stale socket file before binding — always clean up existing socket on start
+- DB count queries scoped by project_id require JOIN on decomposition_sessions (work_items don't have direct project_id FK)
+- Error response prefixes: NOT_FOUND, INVALID_STATE, ALREADY_EXISTS, INVALID_PARAMS — for client-side error classification
+- Sync worktree removal in handlers: use std::process::Command (not async nflow-git) since handlers run in spawn_blocking
 
 # Ralph Progress Log
 Started: Sat Feb  7 03:49:10 PM MSK 2026
@@ -1146,4 +1149,28 @@ Started: Sat Feb  7 03:49:10 PM MSK 2026
   - ProjectService::create() requires a name_exists closure — since we pre-check DB, pass a closure that returns false
   - create_project_dirs() uses crate::daemon::nflow_home() for consistent path resolution
   - cargo fmt reformats long format! args and temp_dir join chains
+---
+
+## 2026-02-07 - US-044
+- What was implemented: Command handlers for project list and delete in nflow-daemon
+  - handle_project_list: returns all projects with name, path, base_branch, git_provider, execution_enabled, spec_count, story_count
+  - handle_project_delete: receives { name, force? }, validates running agents, cascading delete
+  - Without force: error INVALID_STATE if project has running agents
+  - With force: cancels in-progress items and running agent runs, then deletes
+  - Deletes: DB record (cascades), ~/.nflow/projects/{name}/ directory, git worktrees via `git worktree remove --force`
+  - Added DB helpers: count_specs_by_project, count_stories_by_project, find_running_agent_runs_by_project, cancel_running_agent_runs_by_project, cancel_in_progress_items_by_project, list_worktree_paths_by_project
+  - Extracted git_provider_str() helper for JSON responses
+  - remove_worktree_sync() uses std::process::Command (sync context for spawn_blocking handlers)
+  - 11 new tests (729 workspace total) covering empty/full list, spec counts, missing name, not found, success, running agents without force, running agents with force, cascade deletes, dispatch routing
+- Files changed:
+  - crates/nflow-daemon/src/handlers.rs (handle_project_list, handle_project_delete, git_provider_str, remove_worktree_sync, remove_project_dirs + 11 tests)
+  - crates/nflow-daemon/src/db/specs.rs (count_specs_by_project)
+  - crates/nflow-daemon/src/db/work_items.rs (count_stories_by_project, list_worktree_paths_by_project, cancel_in_progress_items_by_project)
+  - crates/nflow-daemon/src/db/agent_runs.rs (find_running_agent_runs_by_project, cancel_running_agent_runs_by_project)
+- **Learnings for future iterations:**
+  - DB count queries use JOIN on decomposition_sessions to scope by project_id (work_items don't have direct project_id FK)
+  - Worktree removal in sync handlers uses std::process::Command (not async nflow-git) since handlers run in spawn_blocking
+  - Error response prefixes: NOT_FOUND, INVALID_STATE, ALREADY_EXISTS, INVALID_PARAMS for client error classification
+  - cargo fmt collapses 2-param DB functions to single line signatures
+  - make_db_state/cleanup_db test helpers reduce test boilerplate for DB-backed handler tests
 ---
