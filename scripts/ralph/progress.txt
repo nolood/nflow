@@ -1,4 +1,8 @@
 ## Codebase Patterns
+- Config files: global at ~/.nflow/config.toml, per-project at ~/.nflow/projects/{name}/config.toml — both use TOML format with PartialConfig struct
+- KNOWN_CONFIG_KEYS constant maps key names to expected types (integer/string/boolean) for validation
+- Tests modifying HOME env var must be consolidated into a single sequential test to avoid parallel race conditions
+- toml crate v0.8 for config file read/write; PartialConfig with Option<T> fields serializes cleanly (None omitted)
 - list_stories_with_worktree_by_project() returns Vec<(WorkItem, wave_number)> — joins work_items with decomposition_sessions to include wave context
 - clear_story_worktree() sets worktree_path to NULL after removal — always clear DB references when removing worktrees
 - parse_duration_secs() converts "7d", "24h", "30m", "10s" to seconds — reusable for any duration input
@@ -1710,4 +1714,27 @@ Started: Sat Feb  7 03:49:10 PM MSK 2026
   - Log directory path: nflow_home()/projects/{name}/agent-logs/ — only .log files are considered
   - Duration parsing: simple suffix-based (d/h/m/s) — no need for complex duration libs
   - DB queries joining work_items with decomposition_sessions are common for project-scoped operations
+---
+
+## 2026-02-07 - US-067
+- What was implemented: Command handlers for config.show and config.set in nflow-daemon
+  - config.show handler: returns effective config merged from defaults + global TOML + per-project TOML + env vars, with per-key layer attribution (default/global/project/env)
+  - config.set handler: receives { key, value, project_name? }, writes to global ~/.nflow/config.toml or per-project config.toml
+  - KNOWN_CONFIG_KEYS constant mapping all 10 config keys to expected types (integer/string/boolean) for validation
+  - Key validation: rejects unknown keys with helpful error listing known keys
+  - Type validation: rejects wrong JSON types (e.g., string for integer field, number for boolean field)
+  - Value validation: after writing, resolves full config and validates (rejects max_parallel=0, invalid git_provider, etc.)
+  - Helper functions: global_config_path(), project_config_path(), read_partial_config(), write_partial_config(), determine_layer(), has_value(), config_value(), set_partial_config_value()
+  - Added toml v0.8 dependency to nflow-daemon for TOML file reading/writing
+  - Dispatch routes: "config.show" and "config.set" added to dispatch()
+  - 12 new tests (423 nflow-daemon total, 908 workspace total)
+- Files changed:
+  - crates/nflow-daemon/Cargo.toml (added toml = "0.8")
+  - crates/nflow-daemon/src/handlers.rs (config.show/config.set handlers, helper functions, dispatch routes, 12 tests)
+- **Learnings for future iterations:**
+  - Tests modifying HOME env var must be consolidated into single sequential test to avoid parallel race conditions on the global env
+  - toml crate serializes PartialConfig with Option<None> fields by omitting them — no skip_serializing_if needed
+  - toml::to_string_pretty produces human-readable output suitable for config files
+  - Config layer detection: check env→project→global→default order (highest to lowest priority)
+  - Use std::io::Error::other() not std::io::Error::new(ErrorKind::Other, ...) per clippy io_other_error lint
 ---
