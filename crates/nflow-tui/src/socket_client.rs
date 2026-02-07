@@ -61,9 +61,13 @@ pub enum ResponseStatus {
 pub struct StreamingResponseLine {
     pub id: String,
     pub status: ResponseStatus,
+    #[serde(default)]
     pub data: serde_json::Value,
     #[serde(default)]
     pub done: bool,
+    /// Optional event payload (from daemon event subscription).
+    #[serde(default)]
+    pub event: Option<serde_json::Value>,
 }
 
 /// A connected socket client to the nflow daemon.

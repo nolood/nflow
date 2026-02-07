@@ -76,6 +76,9 @@ async fn run(args: Args) -> error::Result<()> {
     // Fetch execute tree data
     app.fetch_execute(&mut client).await.ok();
 
+    // Subscribe to daemon events for real-time updates
+    app.subscribe_events(&mut client).await.ok();
+
     // Set up terminal
     let mut tui = terminal::setup()?;
 
@@ -114,6 +117,12 @@ async fn event_loop(
         // If in execute view with streaming output, poll for execute streaming data
         if app.current_view == View::Execute && app.in_execute_streaming() {
             poll_execute_streaming_data(app, client).await;
+        }
+
+        // Poll for daemon events when subscribed and not actively streaming
+        // (when streaming, events arrive interleaved and are handled there)
+        if app.is_event_subscribed() && !app.in_execute_streaming() && !app.in_dialogue() {
+            poll_daemon_events(app, client).await;
         }
 
         // Poll for input events (16ms ≈ 60fps)
@@ -191,6 +200,12 @@ async fn poll_streaming_data(app: &mut App, client: &mut SocketClient) {
 
     match client.try_read_streaming_line(poll_timeout).await {
         Ok(Some(line)) => {
+            // Check if this is a daemon event rather than dialogue data
+            if line.event.is_some() {
+                handle_daemon_event(app, client, &line).await;
+                return;
+            }
+
             let dialogue = match &mut app.spec_dialogue {
                 Some(d) => d,
                 None => return,
@@ -559,6 +574,12 @@ async fn poll_execute_streaming_data(app: &mut App, client: &mut SocketClient) {
 
     match client.try_read_streaming_line(poll_timeout).await {
         Ok(Some(line)) => {
+            // Check if this is a daemon event (from subscription) rather than streaming data
+            if line.event.is_some() {
+                handle_daemon_event(app, client, &line).await;
+                return;
+            }
+
             if line.status == ResponseStatus::Error {
                 let msg = line
                     .data
@@ -587,6 +608,77 @@ async fn poll_execute_streaming_data(app: &mut App, client: &mut SocketClient) {
             app.execute_output
                 .append_line("[Connection lost]".to_string());
             app.execute_output.stop_streaming();
+        }
+    }
+}
+
+/// Poll for daemon events when not actively streaming (non-blocking).
+async fn poll_daemon_events(app: &mut App, client: &mut SocketClient) {
+    let poll_timeout = std::time::Duration::from_millis(10);
+
+    match client.try_read_streaming_line(poll_timeout).await {
+        Ok(Some(line)) => {
+            if line.event.is_some() {
+                handle_daemon_event(app, client, &line).await;
+            }
+            // Non-event lines while not streaming are unexpected; ignore them.
+        }
+        Ok(None) => {
+            // Timeout — no events available
+        }
+        Err(_) => {
+            // Connection error — mark as disconnected
+            app.event_subscription.subscribed = false;
+        }
+    }
+}
+
+/// Handle a daemon event received via the event subscription.
+async fn handle_daemon_event(
+    app: &mut App,
+    client: &mut SocketClient,
+    line: &socket_client::StreamingResponseLine,
+) {
+    let event = match &line.event {
+        Some(e) => e,
+        None => return,
+    };
+
+    let event_type = event.get("type").and_then(|v| v.as_str()).unwrap_or("");
+
+    match event_type {
+        "status_change" => {
+            let new_status = event
+                .get("new_status")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let item_type = event
+                .get("item_type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+
+            app.apply_status_change("", new_status, item_type);
+
+            // Refresh the execute tree to pick up the status change
+            app.fetch_execute(client).await.ok();
+        }
+        "agent_output" => {
+            let task_id = event.get("task_id").and_then(|v| v.as_str()).unwrap_or("");
+            let output_line = event.get("line").and_then(|v| v.as_str()).unwrap_or("");
+
+            app.apply_agent_output(task_id, output_line);
+        }
+        "story_completed" => {
+            let story_id = event.get("story_id").and_then(|v| v.as_str()).unwrap_or("");
+            let mr_url = event.get("mr_url").and_then(|v| v.as_str());
+
+            app.apply_story_completed(story_id, mr_url);
+
+            // Refresh the execute tree to pick up completion status
+            app.fetch_execute(client).await.ok();
+        }
+        _ => {
+            // Unknown event type — ignore
         }
     }
 }

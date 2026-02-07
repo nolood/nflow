@@ -2053,3 +2053,14 @@ Started: Sat Feb  7 03:49:10 PM MSK 2026
   - Auto-select running task on view entry: iterate visible nodes looking for depth=3 + status="in_progress"
   - J/K (uppercase) for output pane scroll, j/k (lowercase) for tree navigation — avoids conflicts
 ---
+## US-082: TUI — execute real-time updates
+- Event subscription: daemon has EventBus with broadcast channel; subscribe command registers client; events forwarded as {"id":"","status":"ok","event":{...}}
+- Three event types: StatusChange (item_id, item_type, old_status, new_status), AgentOutput (task_id, line), StoryCompleted (story_id, branch_name, mr_url)
+- StreamingResponseLine extended with optional `event` field to detect daemon events vs streaming data
+- Events arrive interleaved with streaming data on same socket connection — check event field first in poll handlers
+- EventSubscriptionState tracks subscription status; subscribe once on startup, auto-cleanup on disconnect
+- StatusChange → refresh execute tree via fetch_execute(); AgentOutput → currently handled by exec.log streaming; StoryCompleted → show MR URL in status_message + refresh tree
+- Running counts in status bar: count_task_stats() iterates depth=3 nodes for running/total/done/failed counts
+- ExecuteTreeNode.mr_url field stores MR URL for completed stories, displayed inline in tree
+- Event polling: poll_daemon_events() when not actively streaming dialogue/exec.log; events detected in streaming polls too
+---

@@ -513,12 +513,18 @@ fn render_execute_tree(app: &App, frame: &mut Frame, area: Rect) {
         };
         spans.push(Span::styled(&*node.title, title_style));
 
-        // Story progress
+        // Story progress and MR URL
         if node.depth == 2 {
             if let Some(ref progress) = node.progress {
                 spans.push(Span::styled(
                     format!(" ({})", progress),
                     Style::default().fg(Color::DarkGray),
+                ));
+            }
+            if let Some(ref mr_url) = node.mr_url {
+                spans.push(Span::styled(
+                    format!(" MR: {}", mr_url),
+                    Style::default().fg(Color::Green),
                 ));
             }
         }
@@ -817,17 +823,48 @@ fn render_status_bar(app: &App, frame: &mut Frame, area: Rect) {
         ));
     }
 
-    // Active agent count
-    spans.push(Span::raw(" | "));
-    let agent_style = if app.active_agent_count > 0 {
-        Style::default().fg(Color::Green)
+    // Running counts from execute tree
+    let (running, total, done, failed) = app.execute_tree.count_task_stats();
+    if total > 0 {
+        spans.push(Span::raw(" | "));
+        let running_style = if running > 0 {
+            Style::default().fg(Color::Cyan)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        spans.push(Span::styled(
+            format!("Running: {}/{}", running, total),
+            running_style,
+        ));
+
+        spans.push(Span::raw(" | "));
+        let done_style = if done > 0 {
+            Style::default().fg(Color::Green)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        spans.push(Span::styled(format!("Done: {}", done), done_style));
+
+        if failed > 0 {
+            spans.push(Span::raw(" | "));
+            spans.push(Span::styled(
+                format!("Failed: {}", failed),
+                Style::default().fg(Color::Red),
+            ));
+        }
     } else {
-        Style::default().fg(Color::DarkGray)
-    };
-    spans.push(Span::styled(
-        format!("Agents: {}", app.active_agent_count),
-        agent_style,
-    ));
+        // Fallback to agent count when no tasks
+        spans.push(Span::raw(" | "));
+        let agent_style = if app.active_agent_count > 0 {
+            Style::default().fg(Color::Green)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        spans.push(Span::styled(
+            format!("Agents: {}", app.active_agent_count),
+            agent_style,
+        ));
+    }
 
     // Keyboard hints
     spans.push(Span::raw(" | "));
