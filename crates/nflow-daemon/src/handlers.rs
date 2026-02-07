@@ -56,6 +56,7 @@ fn dispatch(req: Request, state: &HandlerState) -> HandlerResult {
         "exec.pause" => HandlerResult::Single(handle_exec_pause(req, state)),
         "exec.status" => HandlerResult::Single(handle_exec_status(req, state)),
         "exec.retry" => HandlerResult::Single(handle_exec_retry(req, state)),
+        "exec.skip" => HandlerResult::Single(handle_exec_skip(req, state)),
         _ => HandlerResult::Single(Response::error(
             req.id,
             &format!("unknown command: {}", req.command),
@@ -3400,6 +3401,383 @@ fn handle_exec_retry(req: Request, state: &HandlerState) -> Response {
     }
 
     Response::ok(id, response_data)
+}
+
+/// Handle "exec.skip" command.
+///
+/// Skips a failed task by marking it as done with skipped metadata.
+/// If impl task: also marks the paired verify task as skipped/cancelled.
+/// Resumes story execution from the next pending task, or triggers story completion.
+///
+/// Params:
+///   - task_id (required): wave-prefixed short ID (e.g., "W1-T1")
+fn handle_exec_skip(req: Request, state: &HandlerState) -> Response {
+    let id = req.id.clone();
+
+    let task_id_str = match req.params.get("task_id").and_then(|v| v.as_str()) {
+        Some(t) => t.to_string(),
+        None => return Response::error(id, "missing required parameter: task_id"),
+    };
+
+    let conn = match db::open_connection(&state.db_path) {
+        Ok(c) => c,
+        Err(e) => return Response::error(id, &format!("database error: {}", e)),
+    };
+
+    // 1. Find the task by wave-prefixed short ID
+    let task = match db::work_items::find_work_item_by_wave_short_id(&conn, &task_id_str) {
+        Ok(Some(t)) => t,
+        Ok(None) => {
+            return Response::error(id, &format!("NOT_FOUND: task '{}' not found", task_id_str))
+        }
+        Err(e) => return Response::error(id, &format!("database error: {}", e)),
+    };
+
+    // 2. Validate the task is in Failed state
+    if task.status != WorkItemStatus::Failed {
+        return Response::error(
+            id,
+            &format!(
+                "INVALID_STATE: task '{}' is in '{}' state, expected 'failed'",
+                task_id_str, task.status
+            ),
+        );
+    }
+
+    // Validate it's actually a task
+    if task.item_type != ItemType::Task {
+        return Response::error(
+            id,
+            &format!("INVALID_PARAMS: '{}' is not a task", task_id_str),
+        );
+    }
+
+    // 3. Find the parent story
+    let story_id = match task.parent_id {
+        Some(sid) => sid,
+        None => {
+            return Response::error(
+                id,
+                &format!("INVALID_STATE: task '{}' has no parent story", task_id_str),
+            )
+        }
+    };
+
+    let story = match db::work_items::get_work_item_by_id(&conn, &story_id) {
+        Ok(Some(s)) => s,
+        Ok(None) => {
+            return Response::error(
+                id,
+                &format!(
+                    "NOT_FOUND: parent story for task '{}' not found",
+                    task_id_str
+                ),
+            )
+        }
+        Err(e) => return Response::error(id, &format!("database error: {}", e)),
+    };
+
+    // 4. Mark the task as done (skipped) using nflow-core skip logic
+    // For impl tasks, also handle paired verify task
+    if let Err(e) = db::work_items::update_work_item_status(&conn, &task.id, WorkItemStatus::Done) {
+        return Response::error(id, &format!("database error: {}", e));
+    }
+
+    // Track which verify task was skipped (if any)
+    let mut skipped_verify_id: Option<String> = None;
+
+    if task.kind == Some(TaskKind::Impl) {
+        // Find and skip/cancel the paired verify task
+        let sibling_tasks = match db::work_items::list_work_items_by_parent(&conn, &story_id) {
+            Ok(t) => t,
+            Err(e) => return Response::error(id, &format!("database error: {}", e)),
+        };
+
+        let verify = sibling_tasks.iter().find(|t| {
+            t.item_type == ItemType::Task
+                && t.kind == Some(TaskKind::Verify)
+                && t.parent_id == task.parent_id
+                && t.sort_order == task.sort_order + 1
+        });
+
+        if let Some(verify_task) = verify {
+            let new_status = match verify_task.status {
+                WorkItemStatus::Pending => WorkItemStatus::Cancelled,
+                WorkItemStatus::Failed => WorkItemStatus::Done,
+                _ => verify_task.status,
+            };
+            if new_status != verify_task.status {
+                if let Err(e) =
+                    db::work_items::update_work_item_status(&conn, &verify_task.id, new_status)
+                {
+                    return Response::error(id, &format!("database error: {}", e));
+                }
+                skipped_verify_id = Some(verify_task.short_id.clone());
+            }
+        }
+    }
+
+    // 5. Determine what happens next for the story
+    // Re-read tasks after updates
+    let tasks = match db::work_items::list_work_items_by_parent(&conn, &story_id) {
+        Ok(t) => t,
+        Err(e) => return Response::error(id, &format!("database error: {}", e)),
+    };
+
+    let next_pending = nflow_core::work_item::get_next_pending_task(story_id, &tasks);
+
+    if let Some(next_task) = next_pending {
+        // Mark the next task as InProgress
+        if let Err(e) = db::work_items::update_work_item_status(
+            &conn,
+            &next_task.id,
+            WorkItemStatus::InProgress,
+        ) {
+            return Response::error(id, &format!("database error: {}", e));
+        }
+
+        // If story was failed, restore to in_progress
+        if story.status == WorkItemStatus::Failed {
+            if let Err(e) = db::work_items::update_work_item_status(
+                &conn,
+                &story_id,
+                WorkItemStatus::InProgress,
+            ) {
+                return Response::error(id, &format!("database error: {}", e));
+            }
+        }
+
+        // Spawn Claude agent for next task
+        let session = match db::decomposition_sessions::get_decomposition_session(
+            &conn,
+            &task.decomposition_session_id,
+        ) {
+            Ok(Some(s)) => s,
+            Ok(None) => return Response::error(id, "NOT_FOUND: decomposition session not found"),
+            Err(e) => return Response::error(id, &format!("database error: {}", e)),
+        };
+
+        let project = match db::projects::get_project_by_id(&conn, &session.project_id) {
+            Ok(Some(p)) => p,
+            Ok(None) => return Response::error(id, "NOT_FOUND: project not found"),
+            Err(e) => return Response::error(id, &format!("database error: {}", e)),
+        };
+
+        let worktree_path = match &story.worktree_path {
+            Some(p) => PathBuf::from(p),
+            None => {
+                // Build response without spawning agent
+                let mut data = serde_json::json!({
+                    "task_id": task_id_str,
+                    "next_task_id": next_task.short_id,
+                });
+                if let Some(ref vid) = skipped_verify_id {
+                    data["skipped_verify"] = serde_json::json!(vid);
+                }
+                return Response::ok(id, data);
+            }
+        };
+
+        let nflow_home = match crate::daemon::nflow_home() {
+            Ok(h) => h,
+            Err(e) => return Response::error(id, &format!("failed to get nflow home: {}", e)),
+        };
+
+        let is_verify = next_task.kind == Some(TaskKind::Verify);
+        let override_dir = nflow_home.join("prompts");
+        let override_path = if override_dir.is_dir() {
+            Some(override_dir)
+        } else {
+            None
+        };
+
+        let template_name = if is_verify {
+            "verify_task"
+        } else {
+            "task_execution"
+        };
+        let template =
+            match nflow_claude::prompt::load_template(template_name, override_path.as_deref()) {
+                Ok(t) => t,
+                Err(e) => {
+                    return Response::error(id, &format!("failed to load prompt template: {}", e))
+                }
+            };
+
+        let all_tasks = match db::work_items::list_work_items_by_parent(&conn, &story_id) {
+            Ok(t) => t,
+            Err(e) => return Response::error(id, &format!("database error: {}", e)),
+        };
+
+        let vars_map = if is_verify {
+            let impl_task = all_tasks
+                .iter()
+                .find(|t| {
+                    t.item_type == ItemType::Task
+                        && t.kind == Some(TaskKind::Impl)
+                        && t.parent_id == next_task.parent_id
+                        && t.sort_order == next_task.sort_order - 1
+                })
+                .unwrap_or(next_task);
+            nflow_claude::context::build_verify_context(next_task, impl_task, &project.name)
+        } else {
+            let completed: Vec<_> = all_tasks
+                .iter()
+                .filter(|t| {
+                    t.item_type == ItemType::Task
+                        && t.kind == Some(TaskKind::Impl)
+                        && t.status == WorkItemStatus::Done
+                        && t.id != next_task.id
+                })
+                .cloned()
+                .collect();
+
+            nflow_claude::context::build_task_context(next_task, &project.name, &completed, "")
+        };
+
+        let vars_ref: std::collections::HashMap<&str, &str> = vars_map
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+
+        let rendered_prompt = match nflow_claude::prompt::render_template(&template, &vars_ref) {
+            Ok(p) => p,
+            Err(e) => return Response::error(id, &format!("failed to render prompt: {}", e)),
+        };
+
+        let agent_logs_dir = nflow_home
+            .join("projects")
+            .join(&project.name)
+            .join("agent-logs");
+        if let Err(e) = std::fs::create_dir_all(&agent_logs_dir) {
+            return Response::error(id, &format!("failed to create agent-logs dir: {}", e));
+        }
+
+        let prompt_file_path = agent_logs_dir.join(format!("{}.prompt.md", next_task.short_id));
+        if let Err(e) = std::fs::write(&prompt_file_path, &rendered_prompt) {
+            return Response::error(id, &format!("failed to write prompt file: {}", e));
+        }
+
+        let task_prompt = format!(
+            "Implement the task as described in the system prompt file. Task: [{}] {}",
+            next_task.short_id, next_task.title
+        );
+
+        let mut run_config = if is_verify {
+            nflow_claude::runner::RunConfig::for_verify_task(task_prompt)
+        } else {
+            nflow_claude::runner::RunConfig::for_impl_task(task_prompt)
+        };
+        run_config.working_dir = Some(worktree_path);
+        run_config.system_prompt_file = Some(prompt_file_path);
+
+        let runner = nflow_claude::runner::ClaudeRunner::new();
+        let process = match runner.spawn(&run_config) {
+            Ok(p) => p,
+            Err(e) => {
+                // Revert next task to pending
+                let _ = db::work_items::update_work_item_status(
+                    &conn,
+                    &next_task.id,
+                    WorkItemStatus::Pending,
+                );
+                return Response::error(id, &format!("failed to spawn Claude agent: {}", e));
+            }
+        };
+
+        let pid = process.pid;
+        let pid_start_time = crate::recovery::read_process_start_time(pid);
+
+        let log_path = agent_logs_dir.join(format!("{}.log", next_task.short_id));
+        let log_path_str = log_path.to_string_lossy().to_string();
+
+        let agent_run = db::agent_runs::AgentRun {
+            id: uuid::Uuid::new_v4(),
+            work_item_id: next_task.id,
+            pid: Some(pid),
+            session_id: None,
+            pid_start_time,
+            status: db::agent_runs::AgentRunStatus::Running,
+            exit_code: None,
+            log_path: Some(log_path_str),
+            error_message: None,
+            started_at: chrono::Utc::now(),
+            finished_at: None,
+        };
+
+        if let Err(e) = db::agent_runs::insert_agent_run(&conn, &agent_run) {
+            return Response::error(id, &format!("database error: {}", e));
+        }
+
+        // Spawn background task to pipe stdout to log file
+        let mut stdout = process.stdout;
+        let _stderr = process.stderr;
+        let _child = process.child;
+
+        tokio::spawn(async move {
+            let log_file = match tokio::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&log_path)
+                .await
+            {
+                Ok(f) => f,
+                Err(_) => return,
+            };
+            let mut writer = tokio::io::BufWriter::new(log_file);
+
+            while let Ok(Some(line)) = stdout.next_line().await {
+                use tokio::io::AsyncWriteExt;
+                let _ = writer.write_all(line.as_bytes()).await;
+                let _ = writer.write_all(b"\n").await;
+                let _ = writer.flush().await;
+            }
+        });
+
+        let mut data = serde_json::json!({
+            "task_id": task_id_str,
+            "next_task_id": next_task.short_id,
+        });
+        if let Some(ref vid) = skipped_verify_id {
+            data["skipped_verify"] = serde_json::json!(vid);
+        }
+        return Response::ok(id, data);
+    }
+
+    // No more pending tasks — check if all tasks are done/cancelled
+    let all_finished = tasks
+        .iter()
+        .filter(|t| t.item_type == ItemType::Task)
+        .all(|t| t.status == WorkItemStatus::Done || t.status == WorkItemStatus::Cancelled);
+
+    if all_finished {
+        // Mark story as Done
+        if let Err(e) =
+            db::work_items::update_work_item_status(&conn, &story_id, WorkItemStatus::Done)
+        {
+            return Response::error(id, &format!("database error: {}", e));
+        }
+
+        // Trigger story completion (rebase, push, MR)
+        // This will be handled by the scheduler loop when it sees the story is Done
+        let mut data = serde_json::json!({
+            "task_id": task_id_str,
+            "story_completed": true,
+        });
+        if let Some(ref vid) = skipped_verify_id {
+            data["skipped_verify"] = serde_json::json!(vid);
+        }
+        return Response::ok(id, data);
+    }
+
+    // Fallback — task skipped but story state is unclear
+    let mut data = serde_json::json!({
+        "task_id": task_id_str,
+    });
+    if let Some(ref vid) = skipped_verify_id {
+        data["skipped_verify"] = serde_json::json!(vid);
+    }
+    Response::ok(id, data)
 }
 
 #[cfg(test)]
@@ -6905,6 +7283,263 @@ mod tests {
                 // Should fail either on INVALID_STATE (not failed) or INVALID_PARAMS (not a task)
                 let msg = resp.data["message"].as_str().unwrap();
                 assert!(msg.contains("INVALID") || msg.contains("not a task"));
+            }
+            _ => panic!("expected Single response"),
+        }
+        cleanup_db(&db_dir);
+    }
+
+    // --- exec.skip tests ---
+
+    #[test]
+    fn test_exec_skip_missing_task_id() {
+        let (state, db_dir) = make_db_state("exec_skip_missing");
+        let req = Request {
+            id: "500".to_string(),
+            command: "exec.skip".to_string(),
+            params: serde_json::json!({}),
+        };
+        match dispatch(req, &state) {
+            HandlerResult::Single(resp) => {
+                assert_eq!(resp.status, crate::socket::ResponseStatus::Error);
+                assert!(resp.data["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("missing required parameter"));
+            }
+            _ => panic!("expected Single response"),
+        }
+        cleanup_db(&db_dir);
+    }
+
+    #[test]
+    fn test_exec_skip_task_not_found() {
+        let (state, db_dir) = make_db_state("exec_skip_notfound");
+        let req = Request {
+            id: "501".to_string(),
+            command: "exec.skip".to_string(),
+            params: serde_json::json!({ "task_id": "W1-T99" }),
+        };
+        match dispatch(req, &state) {
+            HandlerResult::Single(resp) => {
+                assert_eq!(resp.status, crate::socket::ResponseStatus::Error);
+                assert!(resp.data["message"].as_str().unwrap().contains("NOT_FOUND"));
+            }
+            _ => panic!("expected Single response"),
+        }
+        cleanup_db(&db_dir);
+    }
+
+    #[test]
+    fn test_exec_skip_task_not_failed() {
+        let (state, db_dir) = make_db_state("exec_skip_notfailed");
+        let project_id = insert_test_project(&state, "skip-proj");
+        let conn = db::open_connection(&state.db_path).unwrap();
+
+        let session_id = uuid::Uuid::new_v4();
+        conn.execute(
+            "INSERT INTO decomposition_sessions (id, project_id, wave_number, status, created_at, updated_at)
+             VALUES (?1, ?2, 1, 'approved', '2024-01-01T00:00:00Z', '2024-01-01T00:00:00Z')",
+            rusqlite::params![session_id.to_string(), project_id.to_string()],
+        )
+        .unwrap();
+
+        let epic_id = uuid::Uuid::new_v4();
+        conn.execute(
+            "INSERT INTO work_items (id, decomposition_session_id, item_type, title, description, status, short_id, sort_order, created_at, updated_at)
+             VALUES (?1, ?2, 'epic', 'Epic', 'desc', 'in_progress', 'E1', 0, '2024-01-01T00:00:00Z', '2024-01-01T00:00:00Z')",
+            rusqlite::params![epic_id.to_string(), session_id.to_string()],
+        )
+        .unwrap();
+
+        let story_id = uuid::Uuid::new_v4();
+        conn.execute(
+            "INSERT INTO work_items (id, parent_id, decomposition_session_id, item_type, title, description, status, short_id, sort_order, created_at, updated_at)
+             VALUES (?1, ?2, ?3, 'story', 'Story', 'desc', 'in_progress', 'S1', 0, '2024-01-01T00:00:00Z', '2024-01-01T00:00:00Z')",
+            rusqlite::params![story_id.to_string(), epic_id.to_string(), session_id.to_string()],
+        )
+        .unwrap();
+
+        let task_id = uuid::Uuid::new_v4();
+        conn.execute(
+            "INSERT INTO work_items (id, parent_id, decomposition_session_id, item_type, kind, title, description, status, short_id, sort_order, created_at, updated_at)
+             VALUES (?1, ?2, ?3, 'task', 'impl', 'Task 1', 'desc', 'pending', 'T1', 0, '2024-01-01T00:00:00Z', '2024-01-01T00:00:00Z')",
+            rusqlite::params![task_id.to_string(), story_id.to_string(), session_id.to_string()],
+        )
+        .unwrap();
+        drop(conn);
+
+        let req = Request {
+            id: "502".to_string(),
+            command: "exec.skip".to_string(),
+            params: serde_json::json!({ "task_id": "W1-T1" }),
+        };
+        match dispatch(req, &state) {
+            HandlerResult::Single(resp) => {
+                assert_eq!(resp.status, crate::socket::ResponseStatus::Error);
+                assert!(resp.data["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("INVALID_STATE"));
+            }
+            _ => panic!("expected Single response"),
+        }
+        cleanup_db(&db_dir);
+    }
+
+    #[test]
+    fn test_exec_skip_not_a_task() {
+        let (state, db_dir) = make_db_state("exec_skip_notatask");
+        let project_id = insert_test_project(&state, "skip-proj2");
+        let conn = db::open_connection(&state.db_path).unwrap();
+
+        let session_id = uuid::Uuid::new_v4();
+        conn.execute(
+            "INSERT INTO decomposition_sessions (id, project_id, wave_number, status, created_at, updated_at)
+             VALUES (?1, ?2, 1, 'approved', '2024-01-01T00:00:00Z', '2024-01-01T00:00:00Z')",
+            rusqlite::params![session_id.to_string(), project_id.to_string()],
+        )
+        .unwrap();
+
+        let epic_id = uuid::Uuid::new_v4();
+        conn.execute(
+            "INSERT INTO work_items (id, decomposition_session_id, item_type, title, description, status, short_id, sort_order, created_at, updated_at)
+             VALUES (?1, ?2, 'epic', 'Epic', 'desc', 'failed', 'E1', 0, '2024-01-01T00:00:00Z', '2024-01-01T00:00:00Z')",
+            rusqlite::params![epic_id.to_string(), session_id.to_string()],
+        )
+        .unwrap();
+        drop(conn);
+
+        let req = Request {
+            id: "503".to_string(),
+            command: "exec.skip".to_string(),
+            params: serde_json::json!({ "task_id": "W1-E1" }),
+        };
+        match dispatch(req, &state) {
+            HandlerResult::Single(resp) => {
+                assert_eq!(resp.status, crate::socket::ResponseStatus::Error);
+                let msg = resp.data["message"].as_str().unwrap();
+                assert!(msg.contains("INVALID") || msg.contains("not a task"));
+            }
+            _ => panic!("expected Single response"),
+        }
+        cleanup_db(&db_dir);
+    }
+
+    #[test]
+    fn test_exec_skip_marks_task_done_and_cancels_verify() {
+        let (state, db_dir) = make_db_state("exec_skip_withverify");
+        let project_id = insert_test_project(&state, "skip-proj3");
+        let conn = db::open_connection(&state.db_path).unwrap();
+
+        let session_id = uuid::Uuid::new_v4();
+        conn.execute(
+            "INSERT INTO decomposition_sessions (id, project_id, wave_number, status, created_at, updated_at)
+             VALUES (?1, ?2, 1, 'approved', '2024-01-01T00:00:00Z', '2024-01-01T00:00:00Z')",
+            rusqlite::params![session_id.to_string(), project_id.to_string()],
+        )
+        .unwrap();
+
+        let epic_id = uuid::Uuid::new_v4();
+        conn.execute(
+            "INSERT INTO work_items (id, decomposition_session_id, item_type, title, description, status, short_id, sort_order, created_at, updated_at)
+             VALUES (?1, ?2, 'epic', 'Epic', 'desc', 'in_progress', 'E1', 0, '2024-01-01T00:00:00Z', '2024-01-01T00:00:00Z')",
+            rusqlite::params![epic_id.to_string(), session_id.to_string()],
+        )
+        .unwrap();
+
+        let story_id = uuid::Uuid::new_v4();
+        conn.execute(
+            "INSERT INTO work_items (id, parent_id, decomposition_session_id, item_type, title, description, status, short_id, sort_order, worktree_path, created_at, updated_at)
+             VALUES (?1, ?2, ?3, 'story', 'Story', 'desc', 'failed', 'S1', 0, '/tmp/fake-wt', '2024-01-01T00:00:00Z', '2024-01-01T00:00:00Z')",
+            rusqlite::params![story_id.to_string(), epic_id.to_string(), session_id.to_string()],
+        )
+        .unwrap();
+
+        // Failed impl task at sort_order 0
+        let task_id = uuid::Uuid::new_v4();
+        conn.execute(
+            "INSERT INTO work_items (id, parent_id, decomposition_session_id, item_type, kind, title, description, status, short_id, sort_order, created_at, updated_at)
+             VALUES (?1, ?2, ?3, 'task', 'impl', 'Task 1', 'desc', 'failed', 'T1', 0, '2024-01-01T00:00:00Z', '2024-01-01T00:00:00Z')",
+            rusqlite::params![task_id.to_string(), story_id.to_string(), session_id.to_string()],
+        )
+        .unwrap();
+
+        // Pending verify task at sort_order 1
+        let verify_id = uuid::Uuid::new_v4();
+        conn.execute(
+            "INSERT INTO work_items (id, parent_id, decomposition_session_id, item_type, kind, title, description, status, short_id, sort_order, created_at, updated_at)
+             VALUES (?1, ?2, ?3, 'task', 'verify', 'Verify T1', 'desc', 'pending', 'T1v', 1, '2024-01-01T00:00:00Z', '2024-01-01T00:00:00Z')",
+            rusqlite::params![verify_id.to_string(), story_id.to_string(), session_id.to_string()],
+        )
+        .unwrap();
+        drop(conn);
+
+        let req = Request {
+            id: "504".to_string(),
+            command: "exec.skip".to_string(),
+            params: serde_json::json!({ "task_id": "W1-T1" }),
+        };
+        match dispatch(req, &state) {
+            HandlerResult::Single(resp) => {
+                assert_eq!(resp.status, crate::socket::ResponseStatus::Ok);
+                assert_eq!(resp.data["task_id"].as_str().unwrap(), "W1-T1");
+                // Verify task should be reported as skipped
+                assert_eq!(resp.data["skipped_verify"].as_str().unwrap(), "T1v");
+                // Story should be completed (all tasks done/cancelled)
+                assert_eq!(resp.data["story_completed"].as_bool().unwrap(), true);
+            }
+            _ => panic!("expected Single response"),
+        }
+
+        // Verify DB state
+        let conn = db::open_connection(&state.db_path).unwrap();
+        let impl_status: String = conn
+            .query_row(
+                "SELECT status FROM work_items WHERE id = ?1",
+                rusqlite::params![task_id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(impl_status, "done");
+
+        let verify_status: String = conn
+            .query_row(
+                "SELECT status FROM work_items WHERE id = ?1",
+                rusqlite::params![verify_id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(verify_status, "cancelled");
+
+        let story_status: String = conn
+            .query_row(
+                "SELECT status FROM work_items WHERE id = ?1",
+                rusqlite::params![story_id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(story_status, "done");
+
+        cleanup_db(&db_dir);
+    }
+
+    #[test]
+    fn test_exec_skip_dispatch_route() {
+        let (state, db_dir) = make_db_state("dispatch_exec_skip");
+        let req = Request {
+            id: "510".to_string(),
+            command: "exec.skip".to_string(),
+            params: serde_json::json!({}),
+        };
+        // Should route to exec.skip (get error for missing param, not unknown command)
+        match dispatch(req, &state) {
+            HandlerResult::Single(resp) => {
+                assert_eq!(resp.status, crate::socket::ResponseStatus::Error);
+                assert!(resp.data["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("missing required parameter"));
             }
             _ => panic!("expected Single response"),
         }

@@ -1,6 +1,7 @@
 ## Codebase Patterns
 - Wave-prefixed short IDs: "W{wave}-{short_id}" format. Use find_work_item_by_wave_short_id() to look up by parsing wave number and joining on decomposition_sessions.
 - Handlers that need to spawn Claude agents must inline the spawning logic (not call start_task_execution) because Connection isn't Send across async boundaries. Use std::process::Command for sync git ops, ClaudeRunner::spawn() for sync process creation, tokio::spawn only for log piping.
+- exec.skip handler pattern: skip task (Done), skip/cancel verify, find next pending task → spawn agent, or trigger story completion if all tasks finished
 - Story completion lifecycle: rebase → push → MR creation → DB update → worktree cleanup → event broadcast (all in execute_complete_story)
 - On any failure during story completion (rebase/push/MR), story is rolled back to Failed status via fail_story_on_completion_error()
 - Wall-clock timeout: check_agent_timeouts() runs as Phase 0.5 in scheduler_tick (after reaping, before scheduling). Uses nix SIGTERM→sleep(10s)→SIGKILL pattern.
@@ -1597,4 +1598,24 @@ Started: Sat Feb  7 03:49:10 PM MSK 2026
   - Wave-prefixed short IDs stored as bare short_id in DB (e.g., "T1"), wave prefix comes from session's wave_number
   - Git worktree reset for retry: git reset --hard to previous impl task's commit_hash, or reflog last entry for base commit
   - read_process_start_time() from recovery.rs is reusable for agent PID tracking
+---
+
+## 2026-02-07 - US-062
+- What was implemented: Command handler — exec skip in nflow-daemon
+  - handle_exec_skip() handler dispatched via "exec.skip" command
+  - Validates task_id param (wave-prefixed short ID), task is Failed, and task is actually a task
+  - Marks failed task as Done (skipped) via DB update
+  - For impl tasks: finds and skips/cancels paired verify task (Pending→Cancelled, Failed→Done)
+  - Determines story progress: finds next pending task → marks InProgress + spawns Claude agent
+  - If no more pending tasks and all finished: marks story as Done (triggers completion)
+  - Returns { task_id, skipped_verify?: verify_short_id, next_task_id?, story_completed? }
+  - 6 tests: missing param, not found, not failed, not a task, skip with verify + story completion, dispatch route
+- Files changed:
+  - crates/nflow-daemon/src/handlers.rs (handle_exec_skip, dispatch route + 6 tests)
+- **Learnings for future iterations:**
+  - exec.skip is simpler than exec.retry: no worktree reset, no Claude agent for the skipped task itself
+  - Skip handler reuses agent spawning pattern from exec.retry for the next pending task after skip
+  - Verify task status determines action: Pending→Cancelled, Failed→Done (matching nflow-core skip_task semantics)
+  - Story completion after skip is determined by checking all_finished (Done|Cancelled) on remaining tasks
+  - When task is skipped but next task exists: restore story from Failed→InProgress before spawning agent
 ---
