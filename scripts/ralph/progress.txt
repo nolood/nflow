@@ -1086,4 +1086,32 @@ Started: Sat Feb  7 03:49:10 PM MSK 2026
   - serde(default) on `done: bool` makes it optional in JSON (defaults to false when missing)
   - Event uses #[serde(tag = "type", rename_all = "snake_case")] for discriminated union serialization
   - cargo fmt collapses handle_subscribe with 5 short params to single line
+- PROTOCOL_VERSION = 1; client must send `{protocol_version:1}` as first message before any commands
+- perform_handshake() runs before Arc<Mutex<OwnedWriteHalf>> wrapping — simpler ownership model
+- do_handshake() test helper: all socket integration tests MUST call it after connecting
+---
+
+## 2026-02-07 - US-042
+- What was implemented: NDJSON protocol handshake in nflow-daemon socket server
+  - Handshake struct: `{protocol_version: N}` sent by client as first message
+  - HandshakeResponse struct: `{protocol_version: N, status: ok|error, message?}` from daemon
+  - PROTOCOL_VERSION constant (1) for version matching
+  - perform_handshake() async function with 5-second timeout via tokio::time::timeout
+  - Handshake must complete before any commands are accepted (enforced in handle_client)
+  - Version mismatch → error response + connection closed
+  - Invalid JSON as handshake → error response + connection closed
+  - Client disconnect before handshake → handled gracefully (no crash)
+  - HandshakeResponse uses #[serde(skip_serializing_if = "Option::is_none")] on message field
+  - Updated all 15 existing server integration tests to include handshake via do_handshake() helper
+  - 7 new handshake tests: success, wrong version, invalid JSON, command-before-handshake, timeout, disconnect-before-handshake, serialization/deserialization
+  - 42 socket tests total, all passing
+- Files changed:
+  - crates/nflow-daemon/src/socket.rs (handshake types, perform_handshake function, handle_client updated, all tests updated + 7 new tests)
+- **Learnings for future iterations:**
+  - perform_handshake takes &mut writer (not Arc<Mutex>) since it runs before the writer is wrapped for concurrent access
+  - Handshake runs before Arc<Mutex<OwnedWriteHalf>> wrapping — simpler ownership since no event forwarder exists yet
+  - tokio::time::timeout returns Result<T, Elapsed> — Err means timeout, Ok wraps the inner Result
+  - When adding a protocol gate (like handshake), update ALL existing integration tests — easy to miss some
+  - do_handshake() test helper centralizes handshake logic — avoids duplication across 15+ tests
+  - cargo fmt collapses single-arg Error::other() calls but expands multi-word string args
 ---

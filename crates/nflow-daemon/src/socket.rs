@@ -9,6 +9,52 @@ use tracing::{error, info, warn};
 
 use crate::events::{ClientId, SharedEventBus};
 
+/// Current protocol version for the NDJSON handshake.
+pub const PROTOCOL_VERSION: u32 = 1;
+
+/// Handshake timeout duration (5 seconds).
+const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// A handshake message sent by the client as the first message on connect.
+///
+/// Format: `{"protocol_version": 1}`
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Handshake {
+    pub protocol_version: u32,
+}
+
+/// The daemon's response to a client handshake.
+///
+/// Format: `{"protocol_version": 1, "status": "ok"}` or
+/// `{"protocol_version": 1, "status": "error", "message": "..."}`
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct HandshakeResponse {
+    pub protocol_version: u32,
+    pub status: ResponseStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+impl HandshakeResponse {
+    /// Create a success handshake response.
+    pub fn ok() -> Self {
+        Self {
+            protocol_version: PROTOCOL_VERSION,
+            status: ResponseStatus::Ok,
+            message: None,
+        }
+    }
+
+    /// Create an error handshake response.
+    pub fn error(message: &str) -> Self {
+        Self {
+            protocol_version: PROTOCOL_VERSION,
+            status: ResponseStatus::Error,
+            message: Some(message.to_string()),
+        }
+    }
+}
+
 /// A request message from a client.
 ///
 /// Clients send NDJSON lines in the format: `{"id": "...", "command": "...", "params": {...}}`
@@ -262,11 +308,93 @@ async fn write_line(
     Ok(true)
 }
 
+/// Perform the protocol handshake with a client.
+///
+/// Reads the first line from the client, expects a Handshake message with
+/// protocol_version. If the version matches, sends back a success response.
+/// If the version is unsupported or the handshake times out (5 seconds),
+/// sends an error response and returns Err.
+async fn perform_handshake(
+    lines: &mut tokio::io::Lines<BufReader<tokio::net::unix::OwnedReadHalf>>,
+    writer: &mut tokio::net::unix::OwnedWriteHalf,
+) -> std::io::Result<()> {
+    let handshake_result = tokio::time::timeout(HANDSHAKE_TIMEOUT, lines.next_line()).await;
+
+    match handshake_result {
+        Err(_) => {
+            // Timeout
+            let resp = HandshakeResponse::error("handshake timeout");
+            let json = serde_json::to_string(&resp)
+                .map_err(|e| std::io::Error::other(format!("serialize error: {}", e)))?;
+            let _ = write_line(writer, &json).await;
+            Err(std::io::Error::other("handshake timeout"))
+        }
+        Ok(Err(e)) => {
+            // IO error reading from client
+            Err(e)
+        }
+        Ok(Ok(None)) => {
+            // Client disconnected before sending handshake
+            Err(std::io::Error::other(
+                "client disconnected before handshake",
+            ))
+        }
+        Ok(Ok(Some(line))) => {
+            let line = line.trim().to_string();
+            if line.is_empty() {
+                let resp = HandshakeResponse::error("expected handshake message");
+                let json = serde_json::to_string(&resp)
+                    .map_err(|e| std::io::Error::other(format!("serialize error: {}", e)))?;
+                let _ = write_line(writer, &json).await;
+                return Err(std::io::Error::other("empty handshake message"));
+            }
+
+            match serde_json::from_str::<Handshake>(&line) {
+                Ok(handshake) => {
+                    if handshake.protocol_version == PROTOCOL_VERSION {
+                        let resp = HandshakeResponse::ok();
+                        let json = serde_json::to_string(&resp).map_err(|e| {
+                            std::io::Error::other(format!("serialize error: {}", e))
+                        })?;
+                        write_line(writer, &json).await?;
+                        Ok(())
+                    } else {
+                        let resp = HandshakeResponse::error(&format!(
+                            "unsupported protocol version: {} (expected {})",
+                            handshake.protocol_version, PROTOCOL_VERSION
+                        ));
+                        let json = serde_json::to_string(&resp).map_err(|e| {
+                            std::io::Error::other(format!("serialize error: {}", e))
+                        })?;
+                        let _ = write_line(writer, &json).await;
+                        Err(std::io::Error::other(format!(
+                            "unsupported protocol version: {}",
+                            handshake.protocol_version
+                        )))
+                    }
+                }
+                Err(e) => {
+                    let resp =
+                        HandshakeResponse::error(&format!("invalid handshake message: {}", e));
+                    let json = serde_json::to_string(&resp)
+                        .map_err(|e| std::io::Error::other(format!("serialize error: {}", e)))?;
+                    let _ = write_line(writer, &json).await;
+                    Err(std::io::Error::other(format!(
+                        "invalid handshake message: {}",
+                        e
+                    )))
+                }
+            }
+        }
+    }
+}
+
 /// Handle a single client connection.
 ///
-/// Reads NDJSON lines, parses each as a Request, dispatches to the handler,
-/// and writes the Response back as NDJSON. Supports both single responses
-/// and streaming responses (multiple lines with `done: true` on the last one).
+/// First performs a protocol handshake (client must send `{protocol_version: 1}`
+/// within 5 seconds). Then reads NDJSON lines, parses each as a Request,
+/// dispatches to the handler, and writes the Response back as NDJSON.
+/// Supports both single responses and streaming responses.
 ///
 /// Handles the special "subscribe" command to register the client for event
 /// broadcasts. When a client subscribes, a background task forwards events
@@ -276,8 +404,16 @@ async fn handle_client(
     handler: std::sync::Arc<CommandHandler>,
     event_bus: Option<SharedEventBus>,
 ) -> std::io::Result<()> {
-    let (reader, writer) = stream.into_split();
+    let (reader, mut writer) = stream.into_split();
     let mut lines = BufReader::new(reader).lines();
+
+    // Perform protocol handshake before accepting commands
+    if let Err(e) = perform_handshake(&mut lines, &mut writer).await {
+        warn!(error = %e, "handshake failed");
+        return Ok(());
+    }
+
+    info!("handshake completed");
 
     // Wrap writer in Arc<Mutex> so both the request loop and event forwarder can write
     let writer = std::sync::Arc::new(tokio::sync::Mutex::new(writer));
@@ -485,6 +621,22 @@ mod tests {
         let _ = std::fs::remove_dir(path.parent().unwrap());
     }
 
+    /// Send the protocol handshake and verify success response.
+    async fn do_handshake(
+        writer: &mut tokio::net::unix::OwnedWriteHalf,
+        lines: &mut tokio::io::Lines<BufReader<tokio::net::unix::OwnedReadHalf>>,
+    ) {
+        let handshake = format!("{{\"protocol_version\":{}}}\n", PROTOCOL_VERSION);
+        writer.write_all(handshake.as_bytes()).await.unwrap();
+        writer.flush().await.unwrap();
+
+        let resp_line = lines.next_line().await.unwrap().unwrap();
+        let resp: HandshakeResponse = serde_json::from_str(&resp_line).unwrap();
+        assert_eq!(resp.protocol_version, PROTOCOL_VERSION);
+        assert_eq!(resp.status, ResponseStatus::Ok);
+        assert!(resp.message.is_none());
+    }
+
     #[tokio::test]
     async fn test_bind_socket_creates_file() {
         let path = temp_socket_path();
@@ -527,6 +679,8 @@ mod tests {
         let (reader, mut writer) = stream.into_split();
         let mut lines = BufReader::new(reader).lines();
 
+        do_handshake(&mut writer, &mut lines).await;
+
         let req = r#"{"id":"1","command":"test","params":{"foo":"bar"}}"#;
         writer
             .write_all(format!("{}\n", req).as_bytes())
@@ -560,6 +714,8 @@ mod tests {
         let stream = UnixStream::connect(&path).await.unwrap();
         let (reader, mut writer) = stream.into_split();
         let mut lines = BufReader::new(reader).lines();
+
+        do_handshake(&mut writer, &mut lines).await;
 
         for i in 1..=3 {
             let req = format!(
@@ -600,6 +756,8 @@ mod tests {
         let (reader, mut writer) = stream.into_split();
         let mut lines = BufReader::new(reader).lines();
 
+        do_handshake(&mut writer, &mut lines).await;
+
         writer.write_all(b"not json\n").await.unwrap();
         writer.flush().await.unwrap();
 
@@ -631,6 +789,8 @@ mod tests {
         let stream = UnixStream::connect(&path).await.unwrap();
         let (reader, mut writer) = stream.into_split();
         let mut lines = BufReader::new(reader).lines();
+
+        do_handshake(&mut writer, &mut lines).await;
 
         writer.write_all(b"\n\n").await.unwrap();
         let req = r#"{"id":"1","command":"test","params":{}}"#;
@@ -669,6 +829,8 @@ mod tests {
                 let stream = UnixStream::connect(&p).await.unwrap();
                 let (reader, mut writer) = stream.into_split();
                 let mut lines = BufReader::new(reader).lines();
+
+                do_handshake(&mut writer, &mut lines).await;
 
                 let req = format!(
                     r#"{{"id":"client-{}","command":"test","params":{{"c":{}}}}}"#,
@@ -711,6 +873,7 @@ mod tests {
 
         {
             let _stream = UnixStream::connect(&path).await.unwrap();
+            // Client disconnects without completing handshake — server should handle gracefully
         }
 
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -718,6 +881,8 @@ mod tests {
         let stream = UnixStream::connect(&path).await.unwrap();
         let (reader, mut writer) = stream.into_split();
         let mut lines = BufReader::new(reader).lines();
+
+        do_handshake(&mut writer, &mut lines).await;
 
         let req = r#"{"id":"after-disconnect","command":"test","params":{}}"#;
         writer
@@ -790,6 +955,8 @@ mod tests {
         let stream = UnixStream::connect(&path).await.unwrap();
         let (reader, mut writer) = stream.into_split();
         let mut lines = BufReader::new(reader).lines();
+
+        do_handshake(&mut writer, &mut lines).await;
 
         let req = r#"{"id":"err1","command":"unknown","params":{}}"#;
         writer
@@ -956,6 +1123,8 @@ mod tests {
         let (reader, mut writer) = stream.into_split();
         let mut lines = BufReader::new(reader).lines();
 
+        do_handshake(&mut writer, &mut lines).await;
+
         let req = r#"{"id":"stream1","command":"log.follow","params":{}}"#;
         writer
             .write_all(format!("{}\n", req).as_bytes())
@@ -1005,6 +1174,8 @@ mod tests {
         let stream = UnixStream::connect(&path).await.unwrap();
         let (reader, mut writer) = stream.into_split();
         let mut lines = BufReader::new(reader).lines();
+
+        do_handshake(&mut writer, &mut lines).await;
 
         // Subscribe to events
         let req = r#"{"id":"sub1","command":"subscribe","params":{}}"#;
@@ -1068,6 +1239,8 @@ mod tests {
         let (reader, mut writer) = stream.into_split();
         let mut lines = BufReader::new(reader).lines();
 
+        do_handshake(&mut writer, &mut lines).await;
+
         let req = r#"{"id":"sub1","command":"subscribe","params":{}}"#;
         writer
             .write_all(format!("{}\n", req).as_bytes())
@@ -1109,6 +1282,8 @@ mod tests {
             let stream = UnixStream::connect(&path).await.unwrap();
             let (reader, mut writer) = stream.into_split();
             let mut lines = BufReader::new(reader).lines();
+
+            do_handshake(&mut writer, &mut lines).await;
 
             let req = r#"{"id":"sub1","command":"subscribe","params":{}}"#;
             writer
@@ -1155,6 +1330,8 @@ mod tests {
         let stream = UnixStream::connect(&path).await.unwrap();
         let (reader, mut writer) = stream.into_split();
         let mut lines = BufReader::new(reader).lines();
+
+        do_handshake(&mut writer, &mut lines).await;
 
         // Subscribe
         let req = r#"{"id":"sub","command":"subscribe","params":{}}"#;
@@ -1226,6 +1403,8 @@ mod tests {
         let (reader, mut writer) = stream.into_split();
         let mut lines = BufReader::new(reader).lines();
 
+        do_handshake(&mut writer, &mut lines).await;
+
         // Subscribe first time
         let req = r#"{"id":"sub1","command":"subscribe","params":{}}"#;
         writer
@@ -1247,6 +1426,306 @@ mod tests {
         let resp_line2 = lines.next_line().await.unwrap().unwrap();
         let resp2: Response = serde_json::from_str(&resp_line2).unwrap();
         assert_eq!(resp2.data["already_subscribed"], true);
+
+        handle.shutdown();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        cleanup(&path);
+    }
+
+    // --- Handshake tests ---
+
+    #[test]
+    fn test_handshake_serialization() {
+        let h = Handshake {
+            protocol_version: 1,
+        };
+        let json = serde_json::to_string(&h).unwrap();
+        assert!(json.contains(r#""protocol_version":1"#));
+    }
+
+    #[test]
+    fn test_handshake_deserialization() {
+        let json = r#"{"protocol_version":1}"#;
+        let h: Handshake = serde_json::from_str(json).unwrap();
+        assert_eq!(h.protocol_version, 1);
+    }
+
+    #[test]
+    fn test_handshake_response_ok() {
+        let resp = HandshakeResponse::ok();
+        assert_eq!(resp.protocol_version, PROTOCOL_VERSION);
+        assert_eq!(resp.status, ResponseStatus::Ok);
+        assert!(resp.message.is_none());
+
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(!json.contains("message")); // skip_serializing_if = None
+    }
+
+    #[test]
+    fn test_handshake_response_error() {
+        let resp = HandshakeResponse::error("unsupported version");
+        assert_eq!(resp.protocol_version, PROTOCOL_VERSION);
+        assert_eq!(resp.status, ResponseStatus::Error);
+        assert_eq!(resp.message.as_deref(), Some("unsupported version"));
+
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains(r#""message":"unsupported version""#));
+    }
+
+    #[tokio::test]
+    async fn test_handshake_success() {
+        let path = temp_socket_path();
+        let config = SocketServerConfig {
+            socket_path: path.clone(),
+            handler: echo_handler(),
+            event_bus: None,
+        };
+
+        let handle = start_server(config).unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let stream = UnixStream::connect(&path).await.unwrap();
+        let (reader, mut writer) = stream.into_split();
+        let mut lines = BufReader::new(reader).lines();
+
+        // Send handshake
+        writer
+            .write_all(b"{\"protocol_version\":1}\n")
+            .await
+            .unwrap();
+        writer.flush().await.unwrap();
+
+        // Receive handshake response
+        let resp_line = lines.next_line().await.unwrap().unwrap();
+        let resp: HandshakeResponse = serde_json::from_str(&resp_line).unwrap();
+        assert_eq!(resp.protocol_version, PROTOCOL_VERSION);
+        assert_eq!(resp.status, ResponseStatus::Ok);
+        assert!(resp.message.is_none());
+
+        // Verify commands work after successful handshake
+        let req = r#"{"id":"1","command":"test","params":{"ok":true}}"#;
+        writer
+            .write_all(format!("{}\n", req).as_bytes())
+            .await
+            .unwrap();
+        writer.flush().await.unwrap();
+
+        let cmd_line = lines.next_line().await.unwrap().unwrap();
+        let cmd_resp: Response = serde_json::from_str(&cmd_line).unwrap();
+        assert_eq!(cmd_resp.id, "1");
+        assert_eq!(cmd_resp.status, ResponseStatus::Ok);
+
+        handle.shutdown();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        cleanup(&path);
+    }
+
+    #[tokio::test]
+    async fn test_handshake_wrong_version() {
+        let path = temp_socket_path();
+        let config = SocketServerConfig {
+            socket_path: path.clone(),
+            handler: echo_handler(),
+            event_bus: None,
+        };
+
+        let handle = start_server(config).unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let stream = UnixStream::connect(&path).await.unwrap();
+        let (reader, mut writer) = stream.into_split();
+        let mut lines = BufReader::new(reader).lines();
+
+        // Send handshake with wrong version
+        writer
+            .write_all(b"{\"protocol_version\":99}\n")
+            .await
+            .unwrap();
+        writer.flush().await.unwrap();
+
+        let resp_line = lines.next_line().await.unwrap().unwrap();
+        let resp: HandshakeResponse = serde_json::from_str(&resp_line).unwrap();
+        assert_eq!(resp.status, ResponseStatus::Error);
+        assert!(resp
+            .message
+            .as_deref()
+            .unwrap()
+            .contains("unsupported protocol version"));
+
+        // Connection should be closed — no more responses
+        let next = lines.next_line().await.unwrap();
+        assert!(
+            next.is_none(),
+            "connection should be closed after failed handshake"
+        );
+
+        handle.shutdown();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        cleanup(&path);
+    }
+
+    #[tokio::test]
+    async fn test_handshake_invalid_json() {
+        let path = temp_socket_path();
+        let config = SocketServerConfig {
+            socket_path: path.clone(),
+            handler: echo_handler(),
+            event_bus: None,
+        };
+
+        let handle = start_server(config).unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let stream = UnixStream::connect(&path).await.unwrap();
+        let (reader, mut writer) = stream.into_split();
+        let mut lines = BufReader::new(reader).lines();
+
+        // Send invalid JSON as handshake
+        writer.write_all(b"not a handshake\n").await.unwrap();
+        writer.flush().await.unwrap();
+
+        let resp_line = lines.next_line().await.unwrap().unwrap();
+        let resp: HandshakeResponse = serde_json::from_str(&resp_line).unwrap();
+        assert_eq!(resp.status, ResponseStatus::Error);
+        assert!(resp
+            .message
+            .as_deref()
+            .unwrap()
+            .contains("invalid handshake"));
+
+        // Connection should be closed
+        let next = lines.next_line().await.unwrap();
+        assert!(
+            next.is_none(),
+            "connection should be closed after invalid handshake"
+        );
+
+        handle.shutdown();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        cleanup(&path);
+    }
+
+    #[tokio::test]
+    async fn test_handshake_command_before_handshake_rejected() {
+        let path = temp_socket_path();
+        let config = SocketServerConfig {
+            socket_path: path.clone(),
+            handler: echo_handler(),
+            event_bus: None,
+        };
+
+        let handle = start_server(config).unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let stream = UnixStream::connect(&path).await.unwrap();
+        let (reader, mut writer) = stream.into_split();
+        let mut lines = BufReader::new(reader).lines();
+
+        // Send a command without completing handshake first
+        let req = r#"{"id":"1","command":"test","params":{}}"#;
+        writer
+            .write_all(format!("{}\n", req).as_bytes())
+            .await
+            .unwrap();
+        writer.flush().await.unwrap();
+
+        // The server should reject this as an invalid handshake message
+        let resp_line = lines.next_line().await.unwrap().unwrap();
+        let resp: HandshakeResponse = serde_json::from_str(&resp_line).unwrap();
+        assert_eq!(resp.status, ResponseStatus::Error);
+        assert!(resp
+            .message
+            .as_deref()
+            .unwrap()
+            .contains("invalid handshake"));
+
+        // Connection should be closed
+        let next = lines.next_line().await.unwrap();
+        assert!(
+            next.is_none(),
+            "connection should be closed without handshake"
+        );
+
+        handle.shutdown();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        cleanup(&path);
+    }
+
+    #[tokio::test]
+    async fn test_handshake_timeout() {
+        let path = temp_socket_path();
+        let config = SocketServerConfig {
+            socket_path: path.clone(),
+            handler: echo_handler(),
+            event_bus: None,
+        };
+
+        let handle = start_server(config).unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let stream = UnixStream::connect(&path).await.unwrap();
+        let (reader, _writer) = stream.into_split();
+        let mut lines = BufReader::new(reader).lines();
+
+        // Don't send anything — wait for timeout response (5 seconds)
+        let resp = tokio::time::timeout(std::time::Duration::from_secs(7), lines.next_line())
+            .await
+            .expect("should receive timeout response within 7 seconds");
+
+        match resp {
+            Ok(Some(line)) => {
+                let resp: HandshakeResponse = serde_json::from_str(&line).unwrap();
+                assert_eq!(resp.status, ResponseStatus::Error);
+                assert!(resp.message.as_deref().unwrap().contains("timeout"));
+            }
+            Ok(None) => {
+                // Connection closed by server after timeout — also acceptable
+            }
+            Err(e) => panic!("IO error waiting for timeout response: {}", e),
+        }
+
+        handle.shutdown();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        cleanup(&path);
+    }
+
+    #[tokio::test]
+    async fn test_handshake_disconnect_before_handshake() {
+        let path = temp_socket_path();
+        let config = SocketServerConfig {
+            socket_path: path.clone(),
+            handler: echo_handler(),
+            event_bus: None,
+        };
+
+        let handle = start_server(config).unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Connect and immediately disconnect
+        {
+            let _stream = UnixStream::connect(&path).await.unwrap();
+        }
+
+        // Server should handle gracefully — verify it still accepts new connections
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let stream = UnixStream::connect(&path).await.unwrap();
+        let (reader, mut writer) = stream.into_split();
+        let mut lines = BufReader::new(reader).lines();
+
+        do_handshake(&mut writer, &mut lines).await;
+
+        let req = r#"{"id":"1","command":"test","params":{"alive":true}}"#;
+        writer
+            .write_all(format!("{}\n", req).as_bytes())
+            .await
+            .unwrap();
+        writer.flush().await.unwrap();
+
+        let resp_line = lines.next_line().await.unwrap().unwrap();
+        let resp: Response = serde_json::from_str(&resp_line).unwrap();
+        assert_eq!(resp.id, "1");
+        assert_eq!(resp.status, ResponseStatus::Ok);
 
         handle.shutdown();
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
