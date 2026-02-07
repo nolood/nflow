@@ -2097,3 +2097,25 @@ Started: Sat Feb  7 03:49:10 PM MSK 2026
   - poll_logs_streaming_data follows same pattern as poll_execute_streaming_data but writes to logs_view instead of execute_output
   - in_logs_streaming() checked in event loop for streaming polling, and in daemon event guard (prevent double-polling)
 ---
+
+## 2026-02-08 - US-085
+- What was implemented: TUI help overlay with view-specific keybindings
+  - render_help_overlay now takes current_view parameter and shows view-specific keybindings plus global section
+  - View-specific keybindings for all 4 views: Specs (n/r/v/a/d/j/k), Plan (j/k/Space/Enter/h/g/f/a/d), Execute (j/k/J/K/Space/h/Enter/r/s/c/e), Logs (j/k/Enter/Esc)
+  - Dimmed background behind overlay (iterates buffer cells, sets DarkGray foreground for semi-transparent effect)
+  - Any key press dismisses the help overlay (new check in handle_key_event after Esc handler)
+  - Help overlay title shows current view name: "Help - Specs", "Help - Plan", etc.
+  - "Press any key to dismiss" hint at bottom
+  - Helper functions: help_key(), help_section(), view_keybindings() for clean code structure
+  - New test: test_any_key_dismisses_help_overlay
+  - Updated test_specs_keys_blocked_with_overlay to reflect new dismiss behavior
+  - 150 tests passing, clippy clean, fmt clean
+- Files changed:
+  - crates/nflow-tui/src/ui.rs (render_overlay signature, render_help_overlay rewrite with view-specific sections and dim background)
+  - crates/nflow-tui/src/event.rs (any-key dismiss logic, new test, updated test)
+- **Learnings for future iterations:**
+  - frame.buffer_mut() gives mutable access to the terminal buffer for per-cell styling (dim effect)
+  - cell.set_style() overwrites the cell's style — use DarkGray foreground for dimming
+  - Help overlay "any key dismiss" check must come after Esc handler (Esc already handled) and before the main match block
+  - When changing overlay dismiss behavior, update dependent tests that assumed keys were blocked while overlay was open
+---
