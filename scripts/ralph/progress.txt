@@ -798,3 +798,18 @@ Started: Sat Feb  7 03:49:10 PM MSK 2026
   - Same auth error classification pattern works for both gh and glab (authentication/not logged in/auth login keywords)
   - cargo fmt collapses single-line map_err closures when they fit — don't manually break them
 ---
+
+## 2026-02-07 - US-032
+- What was implemented: Commit validation functions in nflow-git
+  - has_new_commit(worktree_path, previous_head) -> Result<bool>: compares current HEAD to a previously captured commit hash
+  - validate_commit_message(worktree_path, expected_prefix) -> Result<bool>: checks latest commit message contains [{prefix}]
+  - Both return false (not error) when validation fails — caller decides how to handle
+  - Built on existing get_head_commit() and get_commit_message() primitives in branch.rs
+  - 8 new tests (87 nflow-git total) covering success, failure, wrong prefix, missing brackets, not-a-repo
+- Files changed:
+  - crates/nflow-git/src/branch.rs (added has_new_commit, validate_commit_message functions + 8 tests)
+- **Learnings for future iterations:**
+  - Commit validation functions are thin wrappers around get_head_commit/get_commit_message — keep them simple
+  - validate_commit_message checks for `[{prefix}]` with brackets — prefix without brackets is a validation failure
+  - has_new_commit uses string comparison of full 40-char SHA hashes — no git operations beyond rev-parse
+---

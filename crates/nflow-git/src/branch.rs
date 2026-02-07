@@ -90,6 +90,24 @@ pub async fn get_commit_message(worktree_path: &Path) -> Result<String> {
     Ok(output.trim().to_string())
 }
 
+/// Checks whether the current HEAD differs from a previously captured commit hash.
+///
+/// Returns `false` (not an error) when no new commit was produced — the caller decides how to handle it.
+pub async fn has_new_commit(worktree_path: &Path, previous_head: &str) -> Result<bool> {
+    let current_head = get_head_commit(worktree_path).await?;
+    Ok(current_head != previous_head)
+}
+
+/// Validates that the latest commit message contains `[{expected_prefix}]`.
+///
+/// `expected_prefix` is the wave-prefixed task short ID (e.g., `W1-T1`).
+/// Returns `false` (not an error) when validation fails — the caller decides how to handle it.
+pub async fn validate_commit_message(worktree_path: &Path, expected_prefix: &str) -> Result<bool> {
+    let message = get_commit_message(worktree_path).await?;
+    let tag = format!("[{expected_prefix}]");
+    Ok(message.contains(&tag))
+}
+
 /// Fetches the latest changes from origin and rebases the current branch onto `origin/{base_branch}`.
 ///
 /// On rebase conflict: aborts the rebase and returns `GitError::RebaseConflict`.
@@ -722,6 +740,110 @@ mod tests {
             result.unwrap_err(),
             GitError::NotAGitRepository(_)
         ));
+    }
+
+    // --- has_new_commit tests ---
+
+    #[tokio::test]
+    async fn test_has_new_commit_true() {
+        let (_dir, repo) = setup_repo().await;
+
+        let before = get_head_commit(&repo).await.unwrap();
+
+        // Make a new commit
+        std::fs::write(repo.join("new.txt"), "content").unwrap();
+        run_git_command(&repo, &["add", "."]).await.unwrap();
+        run_git_command(&repo, &["commit", "-m", "second commit"])
+            .await
+            .unwrap();
+
+        let result = has_new_commit(&repo, &before).await.unwrap();
+        assert!(result, "Expected new commit detected");
+    }
+
+    #[tokio::test]
+    async fn test_has_new_commit_false() {
+        let (_dir, repo) = setup_repo().await;
+
+        let head = get_head_commit(&repo).await.unwrap();
+
+        // No new commit — HEAD is the same
+        let result = has_new_commit(&repo, &head).await.unwrap();
+        assert!(!result, "Expected no new commit");
+    }
+
+    #[tokio::test]
+    async fn test_has_new_commit_not_a_repo() {
+        let dir = TempDir::new().unwrap();
+        let fake = dir.path().join("not-a-repo");
+        std::fs::create_dir_all(&fake).unwrap();
+
+        let result = has_new_commit(&fake, "abc123").await;
+        assert!(result.is_err());
+    }
+
+    // --- validate_commit_message tests ---
+
+    #[tokio::test]
+    async fn test_validate_commit_message_valid() {
+        let (_dir, repo) = setup_repo().await;
+
+        std::fs::write(repo.join("file.txt"), "data").unwrap();
+        run_git_command(&repo, &["add", "."]).await.unwrap();
+        run_git_command(&repo, &["commit", "-m", "feat: [W1-T1] Implement feature"])
+            .await
+            .unwrap();
+
+        let result = validate_commit_message(&repo, "W1-T1").await.unwrap();
+        assert!(result, "Expected commit message to contain [W1-T1]");
+    }
+
+    #[tokio::test]
+    async fn test_validate_commit_message_missing_prefix() {
+        let (_dir, repo) = setup_repo().await;
+
+        // The initial commit message is "initial commit" — no prefix
+        let result = validate_commit_message(&repo, "W1-T1").await.unwrap();
+        assert!(!result, "Expected validation to fail for missing prefix");
+    }
+
+    #[tokio::test]
+    async fn test_validate_commit_message_wrong_prefix() {
+        let (_dir, repo) = setup_repo().await;
+
+        std::fs::write(repo.join("file.txt"), "data").unwrap();
+        run_git_command(&repo, &["add", "."]).await.unwrap();
+        run_git_command(&repo, &["commit", "-m", "feat: [W1-T2] Wrong task"])
+            .await
+            .unwrap();
+
+        let result = validate_commit_message(&repo, "W1-T1").await.unwrap();
+        assert!(!result, "Expected validation to fail for wrong prefix");
+    }
+
+    #[tokio::test]
+    async fn test_validate_commit_message_prefix_without_brackets() {
+        let (_dir, repo) = setup_repo().await;
+
+        std::fs::write(repo.join("file.txt"), "data").unwrap();
+        run_git_command(&repo, &["add", "."]).await.unwrap();
+        run_git_command(&repo, &["commit", "-m", "feat: W1-T1 no brackets"])
+            .await
+            .unwrap();
+
+        // Must have brackets around prefix
+        let result = validate_commit_message(&repo, "W1-T1").await.unwrap();
+        assert!(!result, "Expected validation to fail without brackets");
+    }
+
+    #[tokio::test]
+    async fn test_validate_commit_message_not_a_repo() {
+        let dir = TempDir::new().unwrap();
+        let fake = dir.path().join("not-a-repo");
+        std::fs::create_dir_all(&fake).unwrap();
+
+        let result = validate_commit_message(&fake, "W1-T1").await;
+        assert!(result.is_err());
     }
 
     #[tokio::test]
