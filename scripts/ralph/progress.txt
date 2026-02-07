@@ -10,6 +10,11 @@
 - NflowError enum in error.rs: Validation, NotFound, Conflict, InvalidState, InvalidTransition, Serialization
 - State machines use `&mut self` methods returning `Result<()>` with InvalidTransition errors
 - SpecStatus has Display impl for use in error messages
+- WorkItemStatus is a unified enum (Pending, Ready, InProgress, Done, Failed, Cancelled) — not all states valid for all item types
+- Use `assert_story()` / `assert_task()` guards at the top of type-specific state machine methods
+- propagate_epic_status() takes a slice of statuses, not full WorkItems — keeps it simple
+- Use `contains()` instead of `iter().any(|s| *s == ...)` for clippy compliance (manual_contains lint)
+- Dependency is story-level only — validated by convention, not struct constraints
 
 # Ralph Progress Log
 Started: Sat Feb  7 03:49:10 PM MSK 2026
@@ -68,4 +73,26 @@ Started: Sat Feb  7 03:49:10 PM MSK 2026
   - State machine methods use `&mut self` and return `Result<()>` with InvalidTransition errors
   - cargo fmt auto-collapses single-arg error constructors to one line (don't manually break them)
   - SpecStatus implements Display for human-readable error messages in InvalidTransition
+---
+
+## 2026-02-07 - US-004
+- What was implemented: Work item model — epics and stories in nflow-core
+  - ItemType enum (Epic, Story, Task) with Display impl
+  - TaskKind enum (Impl, Verify) with Display impl
+  - WorkItemStatus enum (Pending, Ready, InProgress, Done, Failed, Cancelled) with Display impl
+  - WorkItem struct with all 16 required fields (id, parent_id, decomposition_session_id, item_type, kind, title, description, acceptance_criteria, status, short_id, sort_order, branch_name, worktree_path, mr_url, commit_hash, created_at, updated_at)
+  - Epic constructors: new_epic()
+  - Story constructors: new_story() with parent_id
+  - Story state machine: story_mark_ready(all_blockers_done), story_start(), story_complete(), story_fail(), story_cancel()
+  - Story transitions: ready requires pending+all_blockers_done, in_progress from ready|failed(retry), cancelled from pending|ready|in_progress
+  - propagate_epic_status() function computing materialized epic status from child story statuses
+  - Dependency struct with blocker_id and blocked_id (story-level only)
+  - 34 unit tests covering all acceptance criteria
+- Files changed:
+  - crates/nflow-core/src/work_item.rs (full work item model with state machine and tests)
+- **Learnings for future iterations:**
+  - Use a unified WorkItemStatus enum — type-specific validation is done in state machine methods via assert_story()/assert_task() guards
+  - propagate_epic_status() rules: all_pending→Pending, all_cancelled→Cancelled, any_in_progress/ready→InProgress, any_failed(no in_progress)→Failed, all_done/cancelled→Done
+  - clippy warns about `iter().any(|s| *s == val)` — use `contains(&val)` instead (manual_contains lint)
+  - cargo fmt collapses short assert_eq! calls to single lines — don't fight it
 ---
