@@ -1,5 +1,10 @@
 ## Codebase Patterns
 - recovery.rs uses db::Result (DbError), not error::Result (DaemonError) — DB-centric modules should use the db error type
+- Command handlers in handlers.rs: HandlerState holds db_path, create_handler() returns a CommandHandler closure, dispatch() routes by command string
+- Handlers run in spawn_blocking (sync context) — use std::process::Command for git, not tokio::process
+- Use `git symbolic-ref --short HEAD` for branch detection (works in repos with no commits, unlike `git rev-parse --abbrev-ref HEAD`)
+- ProjectService::create() name_exists checker: pass a closure that always returns false since we pre-check with DB
+- Error responses use "ALREADY_EXISTS:" and "INVALID_PARAMS:" prefixes for error classification by clients
 - /proc/{pid}/stat field 22 (starttime) is 1-indexed; after skipping comm field (past last ')'), it's at index 19 in the remaining fields
 - nix crate needs features = ["signal", "process", "fs"] for dup2/setsid/signal handling in daemon
 - Tests sharing filesystem state (PID files) must be serialized in a single test to avoid parallel race conditions
@@ -1114,4 +1119,31 @@ Started: Sat Feb  7 03:49:10 PM MSK 2026
   - When adding a protocol gate (like handshake), update ALL existing integration tests — easy to miss some
   - do_handshake() test helper centralizes handshake logic — avoids duplication across 15+ tests
   - cargo fmt collapses single-arg Error::other() calls but expands multi-word string args
+---
+
+## 2026-02-07 - US-043
+- What was implemented: Command handler — project init in nflow-daemon
+  - Created handlers.rs module with full command handler architecture
+  - HandlerState struct with db_path for shared state across handlers
+  - create_handler() factory function returning CommandHandler closure
+  - dispatch() function routing commands by string (e.g., "project.init")
+  - handle_project_init(): parses name/path/base_branch/git_provider from Request params
+  - Synchronous git validation: is_git_repo() uses `git rev-parse --is-inside-work-tree`
+  - Synchronous remote URL detection: get_remote_url() via `git remote get-url origin`
+  - Synchronous branch detection: get_head_ref() via `git symbolic-ref --short HEAD` (works without commits)
+  - Uses ProjectService::create() for business logic validation
+  - Creates ~/.nflow/projects/{name}/specs/ and agent-logs/ directories
+  - Inserts project into SQLite via db::projects::insert_project()
+  - Returns { project_id, name, path, base_branch, git_provider } on success
+  - Error responses: ALREADY_EXISTS for duplicate names, INVALID_PARAMS for non-git paths
+  - 14 new tests (247 nflow-daemon, 718 workspace total) covering success, missing params, not-a-repo, duplicate name, explicit provider, explicit base branch, unknown command
+- Files changed:
+  - crates/nflow-daemon/src/handlers.rs (new — full command handler module with dispatch, project.init handler, git helpers, tests)
+  - crates/nflow-daemon/src/main.rs (added handlers module)
+- **Learnings for future iterations:**
+  - Handlers run in spawn_blocking (sync context) — use std::process::Command for git, not tokio::process::Command
+  - `git symbolic-ref --short HEAD` works even in repos with no commits; `git rev-parse --abbrev-ref HEAD` fails
+  - ProjectService::create() requires a name_exists closure — since we pre-check DB, pass a closure that returns false
+  - create_project_dirs() uses crate::daemon::nflow_home() for consistent path resolution
+  - cargo fmt reformats long format! args and temp_dir join chains
 ---

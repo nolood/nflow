@@ -2,6 +2,7 @@ mod daemon;
 mod db;
 pub mod error;
 pub mod events;
+pub mod handlers;
 mod recovery;
 mod shutdown;
 pub mod socket;
