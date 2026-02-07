@@ -7,7 +7,7 @@
 - Binary crates use `[[bin]]` in Cargo.toml with explicit path
 - uuid and chrono crates need `serde` feature enabled for Serialize/Deserialize derives
 - Use `impl Fn` closures for external checks to keep nflow-core pure (no IO traits)
-- NflowError enum in error.rs: Validation, NotFound, Conflict, InvalidState, InvalidTransition, Serialization
+- NflowError enum in error.rs: Validation, NotFound, Conflict, InvalidState, InvalidTransition, Serialization, CyclicDependency
 - State machines use `&mut self` methods returning `Result<()>` with InvalidTransition errors
 - SpecStatus has Display impl for use in error messages
 - WorkItemStatus is a unified enum (Pending, Ready, InProgress, Done, Failed, Cancelled) — not all states valid for all item types
@@ -23,6 +23,11 @@
 - ShortIdRegistry maps (wave, short_id) -> UUID; resolve() accepts "W1-S1" or bare "S1" with optional context_wave
 - parse_wave_prefixed() and parse_short_id() are pure parsing functions — no registry needed
 - assign_short_ids() updates generator counters from existing IDs to avoid collisions
+- Dag struct stores forward (blocker→blocked) and reverse (blocked→blockers) adjacency lists as HashMap<Uuid, HashSet<Uuid>>
+- build_dag() filters non-story items, validates same-session, validates dep references, checks for cycles
+- find_ready_stories/find_blocked_stories treat Cancelled same as Done for unblocking
+- detect_cycle() uses DFS with White/Gray/Black coloring; topological_sort() uses Kahn's algorithm
+- Sort Uuid collections for deterministic test output (HashSet iteration is non-deterministic)
 
 # Ralph Progress Log
 Started: Sat Feb  7 03:49:10 PM MSK 2026
@@ -146,4 +151,28 @@ Started: Sat Feb  7 03:49:10 PM MSK 2026
   - parse_wave_prefixed returns None for invalid formats — callers treat as bare short ID
   - assign_short_ids() scans existing IDs to advance counters — prevents ID collisions when some items are pre-assigned
   - cargo fmt breaks long function call args into multi-line format — don't fight it in tests
+---
+
+## 2026-02-07 - US-007
+- What was implemented: DAG construction and validation in nflow-core
+  - Dag struct with forward/reverse adjacency lists and nodes set
+  - build_dag(stories, dependencies) -> Result<Dag> with full validation:
+    - Filters non-story items (epics, tasks)
+    - Validates all stories in same decomposition session
+    - Validates all dependency references exist in story set
+    - Detects circular dependencies via DFS (White/Gray/Black coloring)
+  - topological_sort(dag) -> Result<Vec<Uuid>> using Kahn's algorithm
+  - find_ready_stories(dag, statuses) -> Vec<Uuid> — stories with all blockers done|cancelled
+  - find_blocked_stories(dag, statuses) -> Vec<Uuid> — stories with incomplete blockers
+  - Cancelled stories treated same as Done for unblocking (per AC)
+  - Added CyclicDependency { cycle: Vec<Uuid> } variant to NflowError
+  - 33 new tests (178 total) covering all acceptance criteria
+- Files changed:
+  - crates/nflow-core/src/error.rs (added CyclicDependency variant)
+  - crates/nflow-core/src/dag.rs (full DAG module with construction, validation, queries, tests)
+- **Learnings for future iterations:**
+  - HashSet iteration order is non-deterministic — sort Vec<Uuid> results for test stability
+  - cargo fmt collapses short multi-arg build_dag calls to single lines — don't fight it
+  - DFS cycle detection with coloring is cleaner than tracking visited sets
+  - Kahn's algorithm handles cycle detection as a side effect (remaining nodes = cycle members)
 ---

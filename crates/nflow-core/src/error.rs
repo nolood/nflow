@@ -19,6 +19,9 @@ pub enum NflowError {
 
     #[error("Serialization error: {0}")]
     Serialization(String),
+
+    #[error("Cyclic dependency detected: {cycle:?}")]
+    CyclicDependency { cycle: Vec<uuid::Uuid> },
 }
 
 pub type Result<T> = std::result::Result<T, NflowError>;
