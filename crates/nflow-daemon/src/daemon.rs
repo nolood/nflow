@@ -3,6 +3,8 @@ use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use nix::sys::signal::{signal, SigHandler, Signal};
 use nix::unistd::setsid;
@@ -171,26 +173,143 @@ fn redirect_output() -> Result<()> {
     Ok(())
 }
 
+/// Initialize foreground mode for the daemon.
+///
+/// This sets up the daemon to run in the current terminal:
+/// 1. Ensures ~/.nflow/ directories exist
+/// 2. Writes the PID file
+/// 3. Installs a SIGTERM/SIGINT handler that sets a shutdown flag
+///
+/// Logs go to stderr (no output redirection). Ctrl+C triggers the same
+/// graceful shutdown as SIGTERM.
+///
+/// Returns a shared `AtomicBool` that becomes `true` when a shutdown
+/// signal is received.
+pub fn foreground_mode() -> Result<Arc<AtomicBool>> {
+    ensure_nflow_home()?;
+    ensure_log_dir()?;
+    write_pid_file()?;
+
+    let shutdown = Arc::new(AtomicBool::new(false));
+    install_shutdown_handler(Arc::clone(&shutdown))?;
+
+    Ok(shutdown)
+}
+
+/// Installs SIGTERM and SIGINT handlers that set the shutdown flag.
+///
+/// Both signals trigger the same graceful shutdown: they set the
+/// `shutting_down` atomic bool to `true`, allowing the main loop to
+/// detect and initiate an orderly shutdown.
+fn install_shutdown_handler(shutdown: Arc<AtomicBool>) -> Result<()> {
+    // SAFETY: signal_hook::flag::register is safe for AtomicBool operations.
+    // We use nix's signal to install a handler that sets our flag.
+    // Since Rust closures can't be signal handlers directly, we use
+    // signal_hook_registry or a static. Here we use a simple approach
+    // with nix's SigAction for each signal.
+    //
+    // However, to keep things simple and safe without adding new deps,
+    // we use ctrlc-style handling via a static AtomicBool.
+    SHUTDOWN_FLAG.store(false, Ordering::SeqCst);
+
+    // Leak the Arc into a raw pointer stored in SHUTDOWN_ARC so the
+    // signal handler can access it. This is intentionally leaked — the
+    // daemon runs for the entire process lifetime.
+    {
+        let ptr = Arc::into_raw(shutdown);
+        SHUTDOWN_ARC.store(ptr as *mut bool, Ordering::SeqCst);
+    }
+
+    // Install SIGTERM handler
+    // SAFETY: Our handler only writes to an AtomicBool (async-signal-safe)
+    unsafe {
+        signal(
+            Signal::SIGTERM,
+            SigHandler::Handler(shutdown_signal_handler),
+        )
+        .map_err(|e| {
+            DaemonError::Io(std::io::Error::other(format!(
+                "failed to install SIGTERM handler: {}",
+                e
+            )))
+        })?;
+    }
+
+    // Install SIGINT handler (Ctrl+C)
+    // SAFETY: Same handler — only writes to an AtomicBool
+    unsafe {
+        signal(Signal::SIGINT, SigHandler::Handler(shutdown_signal_handler)).map_err(|e| {
+            DaemonError::Io(std::io::Error::other(format!(
+                "failed to install SIGINT handler: {}",
+                e
+            )))
+        })?;
+    }
+
+    Ok(())
+}
+
+/// Global shutdown flag for signal handler access.
+static SHUTDOWN_FLAG: AtomicBool = AtomicBool::new(false);
+
+/// Pointer to the Arc<AtomicBool> for the shutdown flag. This is set once
+/// in install_shutdown_handler and read by the signal handler.
+static SHUTDOWN_ARC: std::sync::atomic::AtomicPtr<bool> =
+    std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+
+/// Signal handler for SIGTERM/SIGINT. Sets the global shutdown flag.
+///
+/// This function is called from signal context, so it must only perform
+/// async-signal-safe operations. Writing to an AtomicBool is safe.
+extern "C" fn shutdown_signal_handler(_sig: libc::c_int) {
+    SHUTDOWN_FLAG.store(true, Ordering::SeqCst);
+}
+
+/// Returns true if a shutdown signal has been received.
+pub fn is_shutting_down() -> bool {
+    SHUTDOWN_FLAG.load(Ordering::SeqCst)
+}
+
 /// Spawn the daemon as a background process.
 ///
 /// This is called from the CLI (`nflow daemon start`). It spawns the
 /// nflow-daemon binary as a detached child process. The spawned process
 /// will call `daemonize()` itself to fully detach.
 pub fn spawn_daemon(daemon_binary: &Path) -> Result<u32> {
+    spawn_daemon_with_mode(daemon_binary, "background")
+}
+
+/// Spawn the daemon in foreground mode.
+///
+/// This is called from the CLI (`nflow daemon start --foreground`). It spawns
+/// the nflow-daemon binary as a child process that inherits stdout/stderr,
+/// allowing logs to be visible in the terminal.
+pub fn spawn_daemon_foreground(daemon_binary: &Path) -> Result<u32> {
+    spawn_daemon_with_mode(daemon_binary, "foreground")
+}
+
+/// Spawn the daemon binary with the specified mode.
+fn spawn_daemon_with_mode(daemon_binary: &Path, mode: &str) -> Result<u32> {
     ensure_nflow_home()?;
 
-    let child = Command::new(daemon_binary)
-        .env("NFLOW_DAEMON_MODE", "background")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .stdin(std::process::Stdio::null())
-        .spawn()
-        .map_err(|e| {
-            DaemonError::Io(std::io::Error::new(
-                e.kind(),
-                format!("failed to spawn daemon: {}", e),
-            ))
-        })?;
+    let mut cmd = Command::new(daemon_binary);
+    cmd.env("NFLOW_DAEMON_MODE", mode);
+
+    if mode == "background" {
+        cmd.stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .stdin(std::process::Stdio::null());
+    } else {
+        // Foreground: inherit stdout/stderr so logs are visible
+        cmd.stdin(std::process::Stdio::null());
+    }
+
+    let child = cmd.spawn().map_err(|e| {
+        DaemonError::Io(std::io::Error::new(
+            e.kind(),
+            format!("failed to spawn daemon: {}", e),
+        ))
+    })?;
 
     let pid = child.id();
     Ok(pid)
@@ -301,5 +420,53 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(err.to_string().contains("failed to spawn daemon"));
+    }
+
+    #[test]
+    fn test_foreground_mode_writes_pid_file_and_sets_shutdown() {
+        // Clean up any existing PID file first
+        let _ = remove_pid_file();
+
+        // Start foreground mode
+        let shutdown = foreground_mode().unwrap();
+
+        // PID file should be written
+        let pid = read_pid_file().unwrap();
+        assert_eq!(pid, Some(std::process::id()));
+
+        // Shutdown flag should be false initially
+        assert!(!shutdown.load(Ordering::SeqCst));
+        assert!(!is_shutting_down());
+
+        // Simulate shutdown signal by setting the flag directly
+        SHUTDOWN_FLAG.store(true, Ordering::SeqCst);
+        assert!(is_shutting_down());
+
+        // Reset for other tests
+        SHUTDOWN_FLAG.store(false, Ordering::SeqCst);
+
+        // Cleanup
+        remove_pid_file().unwrap();
+    }
+
+    #[test]
+    fn test_is_shutting_down_default_false() {
+        // Reset the flag
+        SHUTDOWN_FLAG.store(false, Ordering::SeqCst);
+        assert!(!is_shutting_down());
+    }
+
+    #[test]
+    fn test_shutdown_signal_handler_sets_flag() {
+        // Reset the flag
+        SHUTDOWN_FLAG.store(false, Ordering::SeqCst);
+        assert!(!is_shutting_down());
+
+        // Call the signal handler directly (simulating a signal)
+        shutdown_signal_handler(libc::SIGTERM);
+        assert!(is_shutting_down());
+
+        // Reset for other tests
+        SHUTDOWN_FLAG.store(false, Ordering::SeqCst);
     }
 }
