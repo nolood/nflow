@@ -426,6 +426,43 @@ pub fn list_stories_by_session(conn: &Connection, session_id: &Uuid) -> Result<V
     Ok(items)
 }
 
+/// List stories with active worktrees for a project.
+/// Returns stories that have a non-null worktree_path, with wave_number from their session.
+pub fn list_stories_with_worktree_by_project(
+    conn: &Connection,
+    project_id: &Uuid,
+) -> Result<Vec<(WorkItem, u32)>> {
+    let mut stmt = conn.prepare(
+        "SELECT w.id, w.parent_id, w.decomposition_session_id, w.item_type, w.kind, w.title,
+                w.description, w.acceptance_criteria, w.status, w.short_id, w.sort_order,
+                w.branch_name, w.worktree_path, w.mr_url, w.commit_hash, w.created_at, w.updated_at,
+                ds.wave_number
+         FROM work_items w
+         JOIN decomposition_sessions ds ON w.decomposition_session_id = ds.id
+         WHERE ds.project_id = ?1 AND w.item_type = 'story' AND w.worktree_path IS NOT NULL
+         ORDER BY ds.wave_number, w.sort_order",
+    )?;
+    let rows = stmt.query_map(params![project_id.to_string()], |row| {
+        let item = row_to_work_item(row)?;
+        let wave: u32 = row.get(17)?;
+        Ok((item, wave))
+    })?;
+    let mut items = Vec::new();
+    for row in rows {
+        items.push(row?);
+    }
+    Ok(items)
+}
+
+/// Clear worktree_path for a story.
+pub fn clear_story_worktree(conn: &Connection, id: &Uuid) -> Result<()> {
+    conn.execute(
+        "UPDATE work_items SET worktree_path = NULL, updated_at = ?1 WHERE id = ?2",
+        params![Utc::now().to_rfc3339(), id.to_string()],
+    )?;
+    Ok(())
+}
+
 /// Cancel all in-progress work items for a project.
 /// Returns the number of items cancelled.
 pub fn cancel_in_progress_items_by_project(conn: &Connection, project_id: &Uuid) -> Result<u64> {

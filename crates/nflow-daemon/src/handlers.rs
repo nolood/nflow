@@ -61,6 +61,9 @@ fn dispatch(req: Request, state: &HandlerState) -> HandlerResult {
         "exec.stop" => HandlerResult::Single(handle_exec_stop(req, state)),
         "exec.cancel" => HandlerResult::Single(handle_exec_cancel(req, state)),
         "exec.log" => handle_exec_log(req, state),
+        "worktree.list" => HandlerResult::Single(handle_worktree_list(req, state)),
+        "worktree.clean" => HandlerResult::Single(handle_worktree_clean(req, state)),
+        "cleanup.logs" => HandlerResult::Single(handle_cleanup_logs(req, state)),
         _ => HandlerResult::Single(Response::error(
             req.id,
             &format!("unknown command: {}", req.command),
@@ -5004,6 +5007,322 @@ fn parse_single_log_event(line: &str) -> serde_json::Value {
     }
 }
 
+/// Handle "worktree.list" command.
+///
+/// Receives: { project }
+/// Returns: { worktrees: [{ path, branch, story_id, status }] }
+fn handle_worktree_list(req: Request, state: &HandlerState) -> Response {
+    let id = req.id.clone();
+
+    let project_name = match req.params.get("project").and_then(|v| v.as_str()) {
+        Some(n) => n.to_string(),
+        None => {
+            return Response::error(id, "missing required parameter: project");
+        }
+    };
+
+    let conn = match db::open_connection(&state.db_path) {
+        Ok(c) => c,
+        Err(e) => return Response::error(id, &format!("database error: {}", e)),
+    };
+
+    let project = match db::projects::get_project_by_name(&conn, &project_name) {
+        Ok(Some(p)) => p,
+        Ok(None) => {
+            return Response::error(
+                id,
+                &format!("NOT_FOUND: project '{}' not found", project_name),
+            );
+        }
+        Err(e) => return Response::error(id, &format!("database error: {}", e)),
+    };
+
+    let stories_with_waves =
+        match db::work_items::list_stories_with_worktree_by_project(&conn, &project.id) {
+            Ok(s) => s,
+            Err(e) => return Response::error(id, &format!("database error: {}", e)),
+        };
+
+    let worktrees: Vec<serde_json::Value> = stories_with_waves
+        .iter()
+        .map(|(story, wave)| {
+            serde_json::json!({
+                "path": story.worktree_path.as_deref().unwrap_or(""),
+                "branch": story.branch_name.as_deref().unwrap_or(""),
+                "story_id": format!("W{}-{}", wave, story.short_id),
+                "status": story.status.to_string().to_lowercase(),
+            })
+        })
+        .collect();
+
+    Response::ok(
+        id,
+        serde_json::json!({
+            "project": project_name,
+            "worktrees": worktrees,
+            "count": worktrees.len(),
+        }),
+    )
+}
+
+/// Handle "worktree.clean" command.
+///
+/// Receives: { project, all? }
+/// Without --all: removes worktrees for done/cancelled stories
+/// With --all: removes all nflow worktrees (with warning)
+/// Returns: { removed: [{ path, story_id }], count }
+fn handle_worktree_clean(req: Request, state: &HandlerState) -> Response {
+    let id = req.id.clone();
+
+    let project_name = match req.params.get("project").and_then(|v| v.as_str()) {
+        Some(n) => n.to_string(),
+        None => {
+            return Response::error(id, "missing required parameter: project");
+        }
+    };
+
+    let all = req
+        .params
+        .get("all")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    let conn = match db::open_connection(&state.db_path) {
+        Ok(c) => c,
+        Err(e) => return Response::error(id, &format!("database error: {}", e)),
+    };
+
+    let project = match db::projects::get_project_by_name(&conn, &project_name) {
+        Ok(Some(p)) => p,
+        Ok(None) => {
+            return Response::error(
+                id,
+                &format!("NOT_FOUND: project '{}' not found", project_name),
+            );
+        }
+        Err(e) => return Response::error(id, &format!("database error: {}", e)),
+    };
+
+    let stories_with_waves =
+        match db::work_items::list_stories_with_worktree_by_project(&conn, &project.id) {
+            Ok(s) => s,
+            Err(e) => return Response::error(id, &format!("database error: {}", e)),
+        };
+
+    let to_clean: Vec<&(WorkItem, u32)> = if all {
+        stories_with_waves.iter().collect()
+    } else {
+        stories_with_waves
+            .iter()
+            .filter(|(story, _)| {
+                story.status == WorkItemStatus::Done || story.status == WorkItemStatus::Cancelled
+            })
+            .collect()
+    };
+
+    let mut removed = Vec::new();
+    for (story, wave) in &to_clean {
+        if let Some(ref wt_path) = story.worktree_path {
+            remove_worktree_sync(Path::new(&project.path), Path::new(wt_path));
+            if let Err(e) = db::work_items::clear_story_worktree(&conn, &story.id) {
+                return Response::error(
+                    id,
+                    &format!("database error clearing worktree for story: {}", e),
+                );
+            }
+            removed.push(serde_json::json!({
+                "path": wt_path,
+                "story_id": format!("W{}-{}", wave, story.short_id),
+            }));
+        }
+    }
+
+    let count = removed.len();
+    let mut resp = serde_json::json!({
+        "project": project_name,
+        "removed": removed,
+        "count": count,
+    });
+
+    if all
+        && stories_with_waves
+            .iter()
+            .any(|(s, _)| s.status != WorkItemStatus::Done && s.status != WorkItemStatus::Cancelled)
+    {
+        resp["warning"] = serde_json::json!("removed worktrees for stories that are still active");
+    }
+
+    Response::ok(id, resp)
+}
+
+/// Handle "cleanup.logs" command.
+///
+/// Receives: { project, older_than?, all?, dry_run? }
+/// older_than: duration string like "7d", "24h", "30m"
+/// Returns: { files: [{ path, size }], count, total_size }
+fn handle_cleanup_logs(req: Request, state: &HandlerState) -> Response {
+    let id = req.id.clone();
+
+    let project_name = match req.params.get("project").and_then(|v| v.as_str()) {
+        Some(n) => n.to_string(),
+        None => {
+            return Response::error(id, "missing required parameter: project");
+        }
+    };
+
+    let older_than = req
+        .params
+        .get("older_than")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let all = req
+        .params
+        .get("all")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let dry_run = req
+        .params
+        .get("dry_run")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    if !all && older_than.is_none() {
+        return Response::error(
+            id,
+            "INVALID_PARAMS: must specify either 'older_than' or 'all'",
+        );
+    }
+
+    // Parse older_than duration if provided
+    let max_age_secs = if let Some(ref dur_str) = older_than {
+        match parse_duration_secs(dur_str) {
+            Some(s) => Some(s),
+            None => {
+                return Response::error(
+                    id,
+                    &format!(
+                        "INVALID_PARAMS: invalid duration '{}'. Use format like '7d', '24h', '30m'",
+                        dur_str
+                    ),
+                );
+            }
+        }
+    } else {
+        None
+    };
+
+    // Resolve log directory: ~/.nflow/projects/{name}/agent-logs/
+    let logs_dir = match crate::daemon::nflow_home() {
+        Ok(home) => home.join("projects").join(&project_name).join("agent-logs"),
+        Err(e) => return Response::error(id, &format!("failed to resolve nflow home: {}", e)),
+    };
+
+    if !logs_dir.exists() {
+        return Response::ok(
+            id,
+            serde_json::json!({
+                "project": project_name,
+                "files": [],
+                "count": 0,
+                "total_size": 0,
+                "dry_run": dry_run,
+            }),
+        );
+    }
+
+    let entries = match std::fs::read_dir(&logs_dir) {
+        Ok(e) => e,
+        Err(e) => return Response::error(id, &format!("failed to read logs directory: {}", e)),
+    };
+
+    let now = std::time::SystemTime::now();
+    let mut files = Vec::new();
+    let mut total_size: u64 = 0;
+
+    for entry in entries {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        // Only process .log files
+        if path.extension().and_then(|e| e.to_str()) != Some("log") {
+            continue;
+        }
+
+        let metadata = match std::fs::metadata(&path) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        let size = metadata.len();
+
+        // Check age filter
+        let should_remove = if all {
+            true
+        } else if let Some(max_secs) = max_age_secs {
+            match metadata.modified() {
+                Ok(modified) => match now.duration_since(modified) {
+                    Ok(age) => age.as_secs() >= max_secs,
+                    Err(_) => false,
+                },
+                Err(_) => false,
+            }
+        } else {
+            false
+        };
+
+        if should_remove {
+            let file_name = path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
+
+            if !dry_run {
+                let _ = std::fs::remove_file(&path);
+            }
+
+            files.push(serde_json::json!({
+                "path": file_name,
+                "size": size,
+            }));
+            total_size += size;
+        }
+    }
+
+    let count = files.len();
+    Response::ok(
+        id,
+        serde_json::json!({
+            "project": project_name,
+            "files": files,
+            "count": count,
+            "total_size": total_size,
+            "dry_run": dry_run,
+        }),
+    )
+}
+
+/// Parse a duration string like "7d", "24h", "30m" into seconds.
+fn parse_duration_secs(s: &str) -> Option<u64> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let (num_str, suffix) = s.split_at(s.len() - 1);
+    let num: u64 = num_str.parse().ok()?;
+    match suffix {
+        "d" => Some(num * 86400),
+        "h" => Some(num * 3600),
+        "m" => Some(num * 60),
+        "s" => Some(num),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -8757,6 +9076,410 @@ mod tests {
             params: serde_json::json!({}),
         };
         // Should route to exec.skip (get error for missing param, not unknown command)
+        match dispatch(req, &state) {
+            HandlerResult::Single(resp) => {
+                assert_eq!(resp.status, crate::socket::ResponseStatus::Error);
+                assert!(resp.data["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("missing required parameter"));
+            }
+            _ => panic!("expected Single response"),
+        }
+        cleanup_db(&db_dir);
+    }
+
+    // --- worktree.list tests ---
+
+    #[test]
+    fn test_worktree_list_missing_project() {
+        let (state, db_dir) = make_db_state("wt_list_missing");
+        let req = Request {
+            id: "600".to_string(),
+            command: "worktree.list".to_string(),
+            params: serde_json::json!({}),
+        };
+        match dispatch(req, &state) {
+            HandlerResult::Single(resp) => {
+                assert_eq!(resp.status, crate::socket::ResponseStatus::Error);
+                assert!(resp.data["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("missing required parameter"));
+            }
+            _ => panic!("expected Single response"),
+        }
+        cleanup_db(&db_dir);
+    }
+
+    #[test]
+    fn test_worktree_list_project_not_found() {
+        let (state, db_dir) = make_db_state("wt_list_notfound");
+        let req = Request {
+            id: "601".to_string(),
+            command: "worktree.list".to_string(),
+            params: serde_json::json!({ "project": "no-such-project" }),
+        };
+        match dispatch(req, &state) {
+            HandlerResult::Single(resp) => {
+                assert_eq!(resp.status, crate::socket::ResponseStatus::Error);
+                assert!(resp.data["message"].as_str().unwrap().contains("NOT_FOUND"));
+            }
+            _ => panic!("expected Single response"),
+        }
+        cleanup_db(&db_dir);
+    }
+
+    #[test]
+    fn test_worktree_list_returns_active_worktrees() {
+        let (state, db_dir) = make_db_state("wt_list_active");
+        let project_id = insert_test_project(&state, "wt-list-proj");
+        let conn = db::open_connection(&state.db_path).unwrap();
+
+        let session_id = uuid::Uuid::new_v4();
+        conn.execute(
+            "INSERT INTO decomposition_sessions (id, project_id, wave_number, status, created_at, updated_at)
+             VALUES (?1, ?2, 1, 'approved', '2024-01-01T00:00:00Z', '2024-01-01T00:00:00Z')",
+            rusqlite::params![session_id.to_string(), project_id.to_string()],
+        )
+        .unwrap();
+
+        // Story with worktree
+        let story1_id = uuid::Uuid::new_v4();
+        conn.execute(
+            "INSERT INTO work_items (id, decomposition_session_id, item_type, title, description, status, short_id, sort_order, branch_name, worktree_path, created_at, updated_at)
+             VALUES (?1, ?2, 'story', 'Story 1', 'desc', 'in_progress', 'S1', 0, 'feat/s1', '/tmp/wt/s1', '2024-01-01T00:00:00Z', '2024-01-01T00:00:00Z')",
+            rusqlite::params![story1_id.to_string(), session_id.to_string()],
+        )
+        .unwrap();
+
+        // Story without worktree (pending)
+        let story2_id = uuid::Uuid::new_v4();
+        conn.execute(
+            "INSERT INTO work_items (id, decomposition_session_id, item_type, title, description, status, short_id, sort_order, created_at, updated_at)
+             VALUES (?1, ?2, 'story', 'Story 2', 'desc', 'pending', 'S2', 1, '2024-01-01T00:00:00Z', '2024-01-01T00:00:00Z')",
+            rusqlite::params![story2_id.to_string(), session_id.to_string()],
+        )
+        .unwrap();
+
+        // Story with worktree (done)
+        let story3_id = uuid::Uuid::new_v4();
+        conn.execute(
+            "INSERT INTO work_items (id, decomposition_session_id, item_type, title, description, status, short_id, sort_order, branch_name, worktree_path, created_at, updated_at)
+             VALUES (?1, ?2, 'story', 'Story 3', 'desc', 'done', 'S3', 2, 'feat/s3', '/tmp/wt/s3', '2024-01-01T00:00:00Z', '2024-01-01T00:00:00Z')",
+            rusqlite::params![story3_id.to_string(), session_id.to_string()],
+        )
+        .unwrap();
+        drop(conn);
+
+        let req = Request {
+            id: "602".to_string(),
+            command: "worktree.list".to_string(),
+            params: serde_json::json!({ "project": "wt-list-proj" }),
+        };
+        match dispatch(req, &state) {
+            HandlerResult::Single(resp) => {
+                assert_eq!(resp.status, crate::socket::ResponseStatus::Ok);
+                let worktrees = resp.data["worktrees"].as_array().unwrap();
+                assert_eq!(worktrees.len(), 2);
+                assert_eq!(resp.data["count"].as_u64().unwrap(), 2);
+                // Should include S1 and S3 (both have worktree_path)
+                let paths: Vec<&str> = worktrees
+                    .iter()
+                    .map(|w| w["path"].as_str().unwrap())
+                    .collect();
+                assert!(paths.contains(&"/tmp/wt/s1"));
+                assert!(paths.contains(&"/tmp/wt/s3"));
+            }
+            _ => panic!("expected Single response"),
+        }
+        cleanup_db(&db_dir);
+    }
+
+    // --- worktree.clean tests ---
+
+    #[test]
+    fn test_worktree_clean_missing_project() {
+        let (state, db_dir) = make_db_state("wt_clean_missing");
+        let req = Request {
+            id: "610".to_string(),
+            command: "worktree.clean".to_string(),
+            params: serde_json::json!({}),
+        };
+        match dispatch(req, &state) {
+            HandlerResult::Single(resp) => {
+                assert_eq!(resp.status, crate::socket::ResponseStatus::Error);
+                assert!(resp.data["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("missing required parameter"));
+            }
+            _ => panic!("expected Single response"),
+        }
+        cleanup_db(&db_dir);
+    }
+
+    #[test]
+    fn test_worktree_clean_no_worktrees() {
+        let (state, db_dir) = make_db_state("wt_clean_none");
+        insert_test_project(&state, "wt-clean-proj");
+
+        let req = Request {
+            id: "611".to_string(),
+            command: "worktree.clean".to_string(),
+            params: serde_json::json!({ "project": "wt-clean-proj" }),
+        };
+        match dispatch(req, &state) {
+            HandlerResult::Single(resp) => {
+                assert_eq!(resp.status, crate::socket::ResponseStatus::Ok);
+                assert_eq!(resp.data["count"].as_u64().unwrap(), 0);
+                assert_eq!(resp.data["removed"].as_array().unwrap().len(), 0);
+            }
+            _ => panic!("expected Single response"),
+        }
+        cleanup_db(&db_dir);
+    }
+
+    #[test]
+    fn test_worktree_clean_only_done_cancelled() {
+        let (state, db_dir) = make_db_state("wt_clean_done");
+        let project_id = insert_test_project(&state, "wt-clean-proj2");
+        let conn = db::open_connection(&state.db_path).unwrap();
+
+        let session_id = uuid::Uuid::new_v4();
+        conn.execute(
+            "INSERT INTO decomposition_sessions (id, project_id, wave_number, status, created_at, updated_at)
+             VALUES (?1, ?2, 1, 'approved', '2024-01-01T00:00:00Z', '2024-01-01T00:00:00Z')",
+            rusqlite::params![session_id.to_string(), project_id.to_string()],
+        )
+        .unwrap();
+
+        // in_progress story with worktree — should NOT be cleaned
+        let story1_id = uuid::Uuid::new_v4();
+        conn.execute(
+            "INSERT INTO work_items (id, decomposition_session_id, item_type, title, description, status, short_id, sort_order, branch_name, worktree_path, created_at, updated_at)
+             VALUES (?1, ?2, 'story', 'Story 1', 'desc', 'in_progress', 'S1', 0, 'feat/s1', '/tmp/wt/s1', '2024-01-01T00:00:00Z', '2024-01-01T00:00:00Z')",
+            rusqlite::params![story1_id.to_string(), session_id.to_string()],
+        )
+        .unwrap();
+
+        // done story with worktree — should be cleaned
+        let story2_id = uuid::Uuid::new_v4();
+        conn.execute(
+            "INSERT INTO work_items (id, decomposition_session_id, item_type, title, description, status, short_id, sort_order, branch_name, worktree_path, created_at, updated_at)
+             VALUES (?1, ?2, 'story', 'Story 2', 'desc', 'done', 'S2', 1, 'feat/s2', '/tmp/wt/s2', '2024-01-01T00:00:00Z', '2024-01-01T00:00:00Z')",
+            rusqlite::params![story2_id.to_string(), session_id.to_string()],
+        )
+        .unwrap();
+
+        // cancelled story with worktree — should be cleaned
+        let story3_id = uuid::Uuid::new_v4();
+        conn.execute(
+            "INSERT INTO work_items (id, decomposition_session_id, item_type, title, description, status, short_id, sort_order, branch_name, worktree_path, created_at, updated_at)
+             VALUES (?1, ?2, 'story', 'Story 3', 'desc', 'cancelled', 'S3', 2, 'feat/s3', '/tmp/wt/s3', '2024-01-01T00:00:00Z', '2024-01-01T00:00:00Z')",
+            rusqlite::params![story3_id.to_string(), session_id.to_string()],
+        )
+        .unwrap();
+        drop(conn);
+
+        let req = Request {
+            id: "612".to_string(),
+            command: "worktree.clean".to_string(),
+            params: serde_json::json!({ "project": "wt-clean-proj2" }),
+        };
+        match dispatch(req, &state) {
+            HandlerResult::Single(resp) => {
+                assert_eq!(resp.status, crate::socket::ResponseStatus::Ok);
+                // Only done and cancelled stories should be cleaned (2 of 3)
+                assert_eq!(resp.data["count"].as_u64().unwrap(), 2);
+                let removed = resp.data["removed"].as_array().unwrap();
+                let story_ids: Vec<&str> = removed
+                    .iter()
+                    .map(|r| r["story_id"].as_str().unwrap())
+                    .collect();
+                assert!(story_ids.contains(&"W1-S2"));
+                assert!(story_ids.contains(&"W1-S3"));
+                assert!(!story_ids.contains(&"W1-S1"));
+            }
+            _ => panic!("expected Single response"),
+        }
+
+        // Verify DB: cleared worktree_path for done/cancelled but not in_progress
+        let conn = db::open_connection(&state.db_path).unwrap();
+        let s1_wt: Option<String> = conn
+            .query_row(
+                "SELECT worktree_path FROM work_items WHERE id = ?1",
+                rusqlite::params![story1_id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(s1_wt.is_some()); // still present
+
+        let s2_wt: Option<String> = conn
+            .query_row(
+                "SELECT worktree_path FROM work_items WHERE id = ?1",
+                rusqlite::params![story2_id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(s2_wt.is_none()); // cleared
+
+        cleanup_db(&db_dir);
+    }
+
+    // --- cleanup.logs tests ---
+
+    #[test]
+    fn test_cleanup_logs_missing_project() {
+        let (state, db_dir) = make_db_state("logs_missing");
+        let req = Request {
+            id: "620".to_string(),
+            command: "cleanup.logs".to_string(),
+            params: serde_json::json!({}),
+        };
+        match dispatch(req, &state) {
+            HandlerResult::Single(resp) => {
+                assert_eq!(resp.status, crate::socket::ResponseStatus::Error);
+                assert!(resp.data["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("missing required parameter"));
+            }
+            _ => panic!("expected Single response"),
+        }
+        cleanup_db(&db_dir);
+    }
+
+    #[test]
+    fn test_cleanup_logs_requires_filter() {
+        let (state, db_dir) = make_db_state("logs_nofilter");
+        insert_test_project(&state, "logs-proj");
+
+        let req = Request {
+            id: "621".to_string(),
+            command: "cleanup.logs".to_string(),
+            params: serde_json::json!({ "project": "logs-proj" }),
+        };
+        match dispatch(req, &state) {
+            HandlerResult::Single(resp) => {
+                assert_eq!(resp.status, crate::socket::ResponseStatus::Error);
+                assert!(resp.data["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("INVALID_PARAMS"));
+            }
+            _ => panic!("expected Single response"),
+        }
+        cleanup_db(&db_dir);
+    }
+
+    #[test]
+    fn test_cleanup_logs_invalid_duration() {
+        let (state, db_dir) = make_db_state("logs_baddur");
+        insert_test_project(&state, "logs-proj2");
+
+        let req = Request {
+            id: "622".to_string(),
+            command: "cleanup.logs".to_string(),
+            params: serde_json::json!({ "project": "logs-proj2", "older_than": "abc" }),
+        };
+        match dispatch(req, &state) {
+            HandlerResult::Single(resp) => {
+                assert_eq!(resp.status, crate::socket::ResponseStatus::Error);
+                assert!(resp.data["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("invalid duration"));
+            }
+            _ => panic!("expected Single response"),
+        }
+        cleanup_db(&db_dir);
+    }
+
+    #[test]
+    fn test_cleanup_logs_no_dir() {
+        let (state, db_dir) = make_db_state("logs_nodir");
+        insert_test_project(&state, "logs-proj3");
+
+        // With all=true but no logs directory exists — should return empty result
+        let req = Request {
+            id: "623".to_string(),
+            command: "cleanup.logs".to_string(),
+            params: serde_json::json!({ "project": "logs-proj3", "all": true }),
+        };
+        match dispatch(req, &state) {
+            HandlerResult::Single(resp) => {
+                assert_eq!(resp.status, crate::socket::ResponseStatus::Ok);
+                assert_eq!(resp.data["count"].as_u64().unwrap(), 0);
+            }
+            _ => panic!("expected Single response"),
+        }
+        cleanup_db(&db_dir);
+    }
+
+    #[test]
+    fn test_parse_duration_secs() {
+        assert_eq!(parse_duration_secs("7d"), Some(7 * 86400));
+        assert_eq!(parse_duration_secs("24h"), Some(24 * 3600));
+        assert_eq!(parse_duration_secs("30m"), Some(30 * 60));
+        assert_eq!(parse_duration_secs("10s"), Some(10));
+        assert_eq!(parse_duration_secs(""), None);
+        assert_eq!(parse_duration_secs("abc"), None);
+        assert_eq!(parse_duration_secs("x"), None);
+    }
+
+    // --- dispatch route tests ---
+
+    #[test]
+    fn test_worktree_list_dispatch_route() {
+        let (state, db_dir) = make_db_state("dispatch_wt_list");
+        let req = Request {
+            id: "630".to_string(),
+            command: "worktree.list".to_string(),
+            params: serde_json::json!({}),
+        };
+        match dispatch(req, &state) {
+            HandlerResult::Single(resp) => {
+                assert_eq!(resp.status, crate::socket::ResponseStatus::Error);
+                assert!(resp.data["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("missing required parameter"));
+            }
+            _ => panic!("expected Single response"),
+        }
+        cleanup_db(&db_dir);
+    }
+
+    #[test]
+    fn test_worktree_clean_dispatch_route() {
+        let (state, db_dir) = make_db_state("dispatch_wt_clean");
+        let req = Request {
+            id: "631".to_string(),
+            command: "worktree.clean".to_string(),
+            params: serde_json::json!({}),
+        };
+        match dispatch(req, &state) {
+            HandlerResult::Single(resp) => {
+                assert_eq!(resp.status, crate::socket::ResponseStatus::Error);
+                assert!(resp.data["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("missing required parameter"));
+            }
+            _ => panic!("expected Single response"),
+        }
+        cleanup_db(&db_dir);
+    }
+
+    #[test]
+    fn test_cleanup_logs_dispatch_route() {
+        let (state, db_dir) = make_db_state("dispatch_cleanup_logs");
+        let req = Request {
+            id: "632".to_string(),
+            command: "cleanup.logs".to_string(),
+            params: serde_json::json!({}),
+        };
         match dispatch(req, &state) {
             HandlerResult::Single(resp) => {
                 assert_eq!(resp.status, crate::socket::ResponseStatus::Error);

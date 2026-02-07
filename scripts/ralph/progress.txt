@@ -1,4 +1,8 @@
 ## Codebase Patterns
+- list_stories_with_worktree_by_project() returns Vec<(WorkItem, wave_number)> — joins work_items with decomposition_sessions to include wave context
+- clear_story_worktree() sets worktree_path to NULL after removal — always clear DB references when removing worktrees
+- parse_duration_secs() converts "7d", "24h", "30m", "10s" to seconds — reusable for any duration input
+- cleanup.logs resolves log dir via nflow_home().join("projects/{name}/agent-logs/") — filters .log files only
 - Wave-prefixed short IDs: "W{wave}-{short_id}" format. Use find_work_item_by_wave_short_id() to look up by parsing wave number and joining on decomposition_sessions.
 - Handlers that need to spawn Claude agents must inline the spawning logic (not call start_task_execution) because Connection isn't Send across async boundaries. Use std::process::Command for sync git ops, ClaudeRunner::spawn() for sync process creation, tokio::spawn only for log piping.
 - exec.skip handler pattern: skip task (Done), skip/cancel verify, find next pending task → spawn agent, or trigger story completion if all tasks finished
@@ -1686,4 +1690,24 @@ Started: Sat Feb  7 03:49:10 PM MSK 2026
   - Streaming dispatch route calls handle_exec_log() directly (not wrapped in HandlerResult::Single)
   - File tailing in async Rust: open file, read existing lines, then re-open and seek to end for new content polling
   - StreamingResponseLine::data() for intermediate lines, StreamingResponseLine::done() for final line
+---
+
+## 2026-02-07 - US-066
+- What was implemented: Command handlers for worktree management and log cleanup
+  - worktree.list: returns all active worktrees with path, branch, story_id (wave-prefixed), and status
+  - worktree.clean: removes worktrees for done/cancelled stories; with all=true removes all worktrees (with warning for active ones)
+  - cleanup.logs: removes agent log files with older_than duration filter, all flag, and dry_run mode; returns file list with sizes
+  - DB function list_stories_with_worktree_by_project(): joins work_items with decomposition_sessions for wave context
+  - DB function clear_story_worktree(): nulls worktree_path after worktree removal
+  - Helper parse_duration_secs(): parses "7d", "24h", "30m", "10s" into seconds
+  - 15 new tests covering all handlers, dispatch routing, validation, and edge cases
+- Files changed:
+  - crates/nflow-daemon/src/handlers.rs (3 new handlers, dispatch entries, parse_duration_secs helper, 15 tests)
+  - crates/nflow-daemon/src/db/work_items.rs (list_stories_with_worktree_by_project, clear_story_worktree)
+- **Learnings for future iterations:**
+  - Worktree cleanup handlers use remove_worktree_sync() (sync git commands) since handlers run in spawn_blocking
+  - Always clear DB worktree_path after physical removal to keep DB consistent
+  - Log directory path: nflow_home()/projects/{name}/agent-logs/ — only .log files are considered
+  - Duration parsing: simple suffix-based (d/h/m/s) — no need for complex duration libs
+  - DB queries joining work_items with decomposition_sessions are common for project-scoped operations
 ---
