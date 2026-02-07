@@ -174,6 +174,73 @@ impl SpecDialogueState {
     }
 }
 
+/// State for the spec content pager sub-view.
+#[derive(Debug)]
+pub struct SpecPagerState {
+    /// The spec name displayed in the header.
+    pub spec_name: String,
+    /// The full spec content (plain text / markdown).
+    #[allow(dead_code)] // Kept for potential future use (e.g., search)
+    pub content: String,
+    /// Lines of content split for rendering.
+    pub lines: Vec<String>,
+    /// Current scroll offset (0 = top of document).
+    pub scroll_offset: u16,
+    /// Total number of lines in the content.
+    pub total_lines: u16,
+}
+
+impl SpecPagerState {
+    /// Create a new pager state with the given spec name and content.
+    pub fn new(spec_name: String, content: String) -> Self {
+        let lines: Vec<String> = content.lines().map(|l| l.to_string()).collect();
+        let total_lines = lines.len() as u16;
+        Self {
+            spec_name,
+            content,
+            lines,
+            scroll_offset: 0,
+            total_lines,
+        }
+    }
+
+    /// Scroll down by one line.
+    pub fn scroll_down(&mut self, visible_height: u16) {
+        let max_scroll = self.total_lines.saturating_sub(visible_height);
+        if self.scroll_offset < max_scroll {
+            self.scroll_offset += 1;
+        }
+    }
+
+    /// Scroll up by one line.
+    pub fn scroll_up(&mut self) {
+        self.scroll_offset = self.scroll_offset.saturating_sub(1);
+    }
+
+    /// Scroll down by a page (half the visible height).
+    pub fn page_down(&mut self, visible_height: u16) {
+        let half = visible_height / 2;
+        let max_scroll = self.total_lines.saturating_sub(visible_height);
+        self.scroll_offset = (self.scroll_offset + half).min(max_scroll);
+    }
+
+    /// Scroll up by a page (half the visible height).
+    pub fn page_up(&mut self, visible_height: u16) {
+        let half = visible_height / 2;
+        self.scroll_offset = self.scroll_offset.saturating_sub(half);
+    }
+
+    /// Jump to the top of the document.
+    pub fn scroll_to_top(&mut self) {
+        self.scroll_offset = 0;
+    }
+
+    /// Jump to the bottom of the document.
+    pub fn scroll_to_bottom(&mut self, visible_height: u16) {
+        self.scroll_offset = self.total_lines.saturating_sub(visible_height);
+    }
+}
+
 /// Overlay that can be displayed on top of the current view.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Overlay {
@@ -265,6 +332,8 @@ pub struct App {
     pub specs_list: SpecsListState,
     /// Active spec dialogue state (if in dialogue sub-view).
     pub spec_dialogue: Option<SpecDialogueState>,
+    /// Active spec pager state (if in pager sub-view).
+    pub spec_pager: Option<SpecPagerState>,
 }
 
 impl App {
@@ -281,6 +350,7 @@ impl App {
             active_agent_count: 0,
             specs_list: SpecsListState::new(),
             spec_dialogue: None,
+            spec_pager: None,
         }
     }
 
@@ -352,6 +422,21 @@ impl App {
     /// Exit spec dialogue mode and return to specs list.
     pub fn exit_dialogue(&mut self) {
         self.spec_dialogue = None;
+    }
+
+    /// Returns true if the spec content pager is active.
+    pub fn in_pager(&self) -> bool {
+        self.spec_pager.is_some()
+    }
+
+    /// Enter spec pager mode with the given spec name and content.
+    pub fn enter_pager(&mut self, spec_name: String, content: String) {
+        self.spec_pager = Some(SpecPagerState::new(spec_name, content));
+    }
+
+    /// Exit spec pager mode and return to specs list.
+    pub fn exit_pager(&mut self) {
+        self.spec_pager = None;
     }
 
     /// Attempt to connect to the daemon and fetch initial state.
@@ -751,6 +836,123 @@ mod tests {
         state.add_claude_message("New message".to_string());
         // Auto-scroll resets offset to 0
         assert_eq!(state.scroll_offset, 0);
+    }
+
+    // --- SpecPagerState tests ---
+
+    #[test]
+    fn test_pager_initial_state() {
+        let state = SpecPagerState::new("test-spec".to_string(), "line1\nline2\nline3".to_string());
+        assert_eq!(state.spec_name, "test-spec");
+        assert_eq!(state.lines.len(), 3);
+        assert_eq!(state.total_lines, 3);
+        assert_eq!(state.scroll_offset, 0);
+    }
+
+    #[test]
+    fn test_pager_scroll_down() {
+        let mut state = SpecPagerState::new("test".to_string(), "a\nb\nc\nd\ne".to_string());
+        assert_eq!(state.scroll_offset, 0);
+
+        state.scroll_down(3); // 5 lines, 3 visible → max_scroll = 2
+        assert_eq!(state.scroll_offset, 1);
+
+        state.scroll_down(3);
+        assert_eq!(state.scroll_offset, 2);
+
+        // Can't scroll past max
+        state.scroll_down(3);
+        assert_eq!(state.scroll_offset, 2);
+    }
+
+    #[test]
+    fn test_pager_scroll_up() {
+        let mut state = SpecPagerState::new("test".to_string(), "a\nb\nc\nd\ne".to_string());
+        state.scroll_offset = 2;
+
+        state.scroll_up();
+        assert_eq!(state.scroll_offset, 1);
+
+        state.scroll_up();
+        assert_eq!(state.scroll_offset, 0);
+
+        // Can't go below 0
+        state.scroll_up();
+        assert_eq!(state.scroll_offset, 0);
+    }
+
+    #[test]
+    fn test_pager_page_down() {
+        let mut state = SpecPagerState::new(
+            "test".to_string(),
+            (0..20)
+                .map(|i| format!("line {}", i))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+
+        state.page_down(10); // half of 10 = 5
+        assert_eq!(state.scroll_offset, 5);
+
+        state.page_down(10);
+        assert_eq!(state.scroll_offset, 10); // max_scroll = 20-10 = 10
+    }
+
+    #[test]
+    fn test_pager_page_up() {
+        let mut state = SpecPagerState::new(
+            "test".to_string(),
+            (0..20)
+                .map(|i| format!("line {}", i))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+        state.scroll_offset = 10;
+
+        state.page_up(10); // half of 10 = 5
+        assert_eq!(state.scroll_offset, 5);
+
+        state.page_up(10);
+        assert_eq!(state.scroll_offset, 0);
+    }
+
+    #[test]
+    fn test_pager_scroll_to_top() {
+        let mut state = SpecPagerState::new("test".to_string(), "a\nb\nc".to_string());
+        state.scroll_offset = 2;
+
+        state.scroll_to_top();
+        assert_eq!(state.scroll_offset, 0);
+    }
+
+    #[test]
+    fn test_pager_scroll_to_bottom() {
+        let mut state = SpecPagerState::new("test".to_string(), "a\nb\nc\nd\ne".to_string());
+
+        state.scroll_to_bottom(3); // 5 lines, 3 visible → scroll to 2
+        assert_eq!(state.scroll_offset, 2);
+    }
+
+    #[test]
+    fn test_pager_empty_content() {
+        let state = SpecPagerState::new("test".to_string(), String::new());
+        assert_eq!(state.total_lines, 0);
+        assert!(state.lines.is_empty());
+    }
+
+    #[test]
+    fn test_app_pager_lifecycle() {
+        let mut app = App::new("test".to_string());
+        assert!(!app.in_pager());
+        assert!(app.spec_pager.is_none());
+
+        app.enter_pager("my-spec".to_string(), "content here".to_string());
+        assert!(app.in_pager());
+        assert_eq!(app.spec_pager.as_ref().unwrap().spec_name, "my-spec");
+
+        app.exit_pager();
+        assert!(!app.in_pager());
+        assert!(app.spec_pager.is_none());
     }
 
     #[test]

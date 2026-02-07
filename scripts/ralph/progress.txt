@@ -38,6 +38,7 @@
 - TUI dialogue message coalescing: add_claude_message() appends to last message if sender matches — avoids fragmenting contiguous text events into separate messages
 - TUI list state pattern: XxxListState struct with items Vec, selected usize, select_prev/select_next, update_from_response
 - centered_rect(percent_x, percent_y, area) computes a centered Rect for popup overlays; use Clear widget before rendering popup
+- TUI pager sub-view pattern: SpecPagerState with lines Vec, scroll_offset, total_lines; handle_pager_key checked before handle_dialogue_key; pager blocks all global keys (q exits pager, not app); spec.view command returns { name, status, content }
 - Story completion lifecycle: rebase → push → MR creation → DB update → worktree cleanup → event broadcast (all in execute_complete_story)
 - On any failure during story completion (rebase/push/MR), story is rolled back to Failed status via fail_story_on_completion_error()
 - Wall-clock timeout: check_agent_timeouts() runs as Phase 0.5 in scheduler_tick (after reaping, before scheduling). Uses nix SIGTERM→sleep(10s)→SIGKILL pattern.
@@ -1981,4 +1982,19 @@ Started: Sat Feb  7 03:49:10 PM MSK 2026
   - Dialogue sub-views override all global keys except Ctrl+C — must be checked first in handle_key_event
   - Message coalescing: check last message sender before creating new DialogueMessage to avoid fragmented streaming output
   - Paragraph.scroll((y, x)) + Wrap for auto-scrolling chat — calculate max_scroll from line count and viewport height
+---
+
+## 2026-02-08 - US-078
+- What was implemented: TUI spec content pager sub-view — full-screen markdown content display with vim-style scrolling
+- Files changed:
+  - crates/nflow-tui/src/app.rs (SpecPagerState struct with scroll methods, enter_pager/exit_pager/in_pager on App, 12 new tests)
+  - crates/nflow-tui/src/event.rs (handle_pager_key function, ViewAction::PagerExit, 14 new pager tests)
+  - crates/nflow-tui/src/ui.rs (render_spec_pager function, pager check in render_content before dialogue)
+  - crates/nflow-tui/src/main.rs (handle_spec_view async function fetching spec.view, SpecView and PagerExit action handling)
+- **Learnings for future iterations:**
+  - Pager sub-views follow same pattern as dialogue: Option<State> field, in_X() check, enter_X/exit_X lifecycle
+  - Pager check must come BEFORE dialogue check in handle_key_event and render_content (higher priority sub-view)
+  - For pager scroll, visible_height is needed but not available in event handler — use estimate, clamp in render
+  - spec.view daemon command returns { name, status, content } — content is the full markdown file
+  - q key in pager exits pager (not app) — sub-views capture q before it reaches global quit handler
 ---

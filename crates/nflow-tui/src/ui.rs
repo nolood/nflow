@@ -65,7 +65,9 @@ fn render_header(app: &App, frame: &mut Frame, area: Rect) {
 fn render_content(app: &App, frame: &mut Frame, area: Rect) {
     match app.current_view {
         View::Specs => {
-            if app.spec_dialogue.is_some() {
+            if app.spec_pager.is_some() {
+                render_spec_pager(app, frame, area);
+            } else if app.spec_dialogue.is_some() {
                 render_spec_dialogue(app, frame, area);
             } else {
                 render_specs_list(app, frame, area);
@@ -208,6 +210,40 @@ fn render_specs_list(app: &App, frame: &mut Frame, area: Rect) {
         .column_spacing(1);
 
     frame.render_widget(table, area);
+}
+
+/// Render the spec content pager sub-view.
+fn render_spec_pager(app: &App, frame: &mut Frame, area: Rect) {
+    let pager = match &app.spec_pager {
+        Some(p) => p,
+        None => return,
+    };
+
+    let title = format!(
+        "Spec: {} (q/Esc to close, j/k scroll, Ctrl+d/u page, g/G top/bottom)",
+        pager.spec_name
+    );
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(title)
+        .title_style(Style::default().add_modifier(Modifier::BOLD));
+
+    // Calculate visible height (area minus border)
+    let inner_height = area.height.saturating_sub(2);
+
+    // Clamp scroll offset to valid range
+    let max_scroll = pager.total_lines.saturating_sub(inner_height);
+    let scroll = pager.scroll_offset.min(max_scroll);
+
+    // Build lines with wrapping support
+    let content_lines: Vec<Line> = pager.lines.iter().map(|l| Line::from(l.as_str())).collect();
+
+    let paragraph = Paragraph::new(content_lines)
+        .block(block)
+        .wrap(Wrap { trim: false })
+        .scroll((scroll, 0));
+
+    frame.render_widget(paragraph, area);
 }
 
 /// Render the spec dialogue sub-view with chat history and input field.

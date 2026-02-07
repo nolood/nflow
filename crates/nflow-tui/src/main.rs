@@ -131,6 +131,12 @@ async fn event_loop(
                     // Refresh specs list after dialogue
                     app.fetch_specs(client).await.ok();
                 }
+                event::ViewAction::SpecView => {
+                    handle_spec_view(app, client).await;
+                }
+                event::ViewAction::PagerExit => {
+                    app.exit_pager();
+                }
                 _ => {}
             }
 
@@ -332,6 +338,48 @@ fn handle_dialogue_end(app: &mut App) {
     if let Some(dialogue) = &mut app.spec_dialogue {
         dialogue.add_claude_message("[Session ended by user]".to_string());
         dialogue.session_state = DialogueSessionState::Completed;
+    }
+}
+
+/// Handle viewing a spec's content in the pager.
+async fn handle_spec_view(app: &mut App, client: &mut SocketClient) {
+    let spec_name = app
+        .specs_list
+        .selected_item()
+        .map(|s| s.name.clone())
+        .unwrap_or_default();
+
+    if spec_name.is_empty() {
+        app.status_message = "No spec selected".to_string();
+        return;
+    }
+
+    let params = serde_json::json!({
+        "project_name": &app.project,
+        "spec_name": &spec_name,
+    });
+
+    match client.send_command("spec.view", params).await {
+        Ok(resp) if resp.status == ResponseStatus::Ok => {
+            let content = resp
+                .data
+                .get("content")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            app.enter_pager(spec_name, content);
+        }
+        Ok(resp) => {
+            let msg = resp
+                .data
+                .get("message")
+                .and_then(|v| v.as_str())
+                .unwrap_or("Failed to load spec");
+            app.status_message = msg.to_string();
+        }
+        Err(e) => {
+            app.status_message = format!("Error: {}", e);
+        }
     }
 }
 

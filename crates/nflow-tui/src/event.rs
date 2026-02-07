@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 
-use crate::app::{App, DialogueSessionState, Overlay, View};
+use crate::app::{App, DialogueSessionState, Overlay, SpecPagerState, View};
 
 /// Poll for a crossterm event with the given timeout.
 ///
@@ -37,6 +37,8 @@ pub enum ViewAction {
     DialogueEndSession,
     /// User exited dialogue back to specs list (Esc).
     DialogueExit,
+    /// User exited pager back to specs list.
+    PagerExit,
 }
 
 /// Handle a key event, returning true if the app should continue, false to quit.
@@ -46,6 +48,12 @@ pub fn handle_key_event(app: &mut App, key: KeyEvent) -> (bool, ViewAction) {
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
         app.should_quit = true;
         return (false, ViewAction::None);
+    }
+
+    // If in pager mode, handle pager keys exclusively
+    if app.in_pager() {
+        let action = handle_pager_key(app, key);
+        return (true, action);
     }
 
     // If in dialogue mode, handle dialogue keys exclusively
@@ -121,6 +129,58 @@ pub fn handle_key_event(app: &mut App, key: KeyEvent) -> (bool, ViewAction) {
 
         _ => (true, ViewAction::None),
     }
+}
+
+/// Handle key events in the spec content pager sub-view.
+fn handle_pager_key(app: &mut App, key: KeyEvent) -> ViewAction {
+    let pager = match &mut app.spec_pager {
+        Some(p) => p,
+        None => return ViewAction::None,
+    };
+
+    // q or Esc exits the pager
+    match key.code {
+        KeyCode::Char('q') | KeyCode::Esc => {
+            return ViewAction::PagerExit;
+        }
+        // Single line down
+        KeyCode::Char('j') | KeyCode::Down => {
+            pager.scroll_down(pager_visible_height(pager));
+        }
+        // Single line up
+        KeyCode::Char('k') | KeyCode::Up => {
+            pager.scroll_up();
+        }
+        // Page down (Ctrl+d)
+        KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            pager.page_down(pager_visible_height(pager));
+        }
+        // Page up (Ctrl+u)
+        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            pager.page_up(pager_visible_height(pager));
+        }
+        // Jump to bottom
+        KeyCode::Char('G') => {
+            pager.scroll_to_bottom(pager_visible_height(pager));
+        }
+        // Jump to top
+        KeyCode::Char('g') => {
+            pager.scroll_to_top();
+        }
+        _ => {}
+    }
+
+    ViewAction::None
+}
+
+/// Estimate the visible height for pager scroll calculations.
+/// This is approximate — the actual height depends on terminal size.
+/// We use a reasonable default; the rendering code handles clamping.
+fn pager_visible_height(_pager: &SpecPagerState) -> u16 {
+    // We don't have access to the terminal area here, so we estimate.
+    // The render function will properly clamp scroll_offset.
+    // This estimate covers header(3) + border(2) + status(1) = 6 lines overhead.
+    20
 }
 
 /// Handle key events in the spec dialogue sub-view.
@@ -634,5 +694,123 @@ mod tests {
             app.spec_dialogue.as_ref().unwrap().session_state,
             DialogueSessionState::Streaming
         );
+    }
+
+    // --- Pager sub-view keybindings ---
+
+    fn app_in_pager() -> App {
+        let mut app = App::new("test".to_string());
+        let content = (0..30)
+            .map(|i| format!("line {}", i))
+            .collect::<Vec<_>>()
+            .join("\n");
+        app.enter_pager("test-spec".to_string(), content);
+        app
+    }
+
+    #[test]
+    fn test_pager_esc_returns_exit_action() {
+        let mut app = app_in_pager();
+        let (cont, action) = handle_key_event(&mut app, make_key(KeyCode::Esc));
+        assert!(cont);
+        assert_eq!(action, ViewAction::PagerExit);
+    }
+
+    #[test]
+    fn test_pager_q_returns_exit_action() {
+        let mut app = app_in_pager();
+        let (cont, action) = handle_key_event(&mut app, make_key(KeyCode::Char('q')));
+        assert!(cont);
+        assert_eq!(action, ViewAction::PagerExit);
+    }
+
+    #[test]
+    fn test_pager_j_scrolls_down() {
+        let mut app = app_in_pager();
+        handle_key_event(&mut app, make_key(KeyCode::Char('j')));
+        assert_eq!(app.spec_pager.as_ref().unwrap().scroll_offset, 1);
+    }
+
+    #[test]
+    fn test_pager_k_scrolls_up() {
+        let mut app = app_in_pager();
+        app.spec_pager.as_mut().unwrap().scroll_offset = 5;
+        handle_key_event(&mut app, make_key(KeyCode::Char('k')));
+        assert_eq!(app.spec_pager.as_ref().unwrap().scroll_offset, 4);
+    }
+
+    #[test]
+    fn test_pager_arrow_down_scrolls() {
+        let mut app = app_in_pager();
+        handle_key_event(&mut app, make_key(KeyCode::Down));
+        assert_eq!(app.spec_pager.as_ref().unwrap().scroll_offset, 1);
+    }
+
+    #[test]
+    fn test_pager_arrow_up_scrolls() {
+        let mut app = app_in_pager();
+        app.spec_pager.as_mut().unwrap().scroll_offset = 3;
+        handle_key_event(&mut app, make_key(KeyCode::Up));
+        assert_eq!(app.spec_pager.as_ref().unwrap().scroll_offset, 2);
+    }
+
+    #[test]
+    fn test_pager_ctrl_d_pages_down() {
+        let mut app = app_in_pager();
+        handle_key_event(
+            &mut app,
+            make_key_with_mod(KeyCode::Char('d'), KeyModifiers::CONTROL),
+        );
+        assert!(app.spec_pager.as_ref().unwrap().scroll_offset > 0);
+    }
+
+    #[test]
+    fn test_pager_ctrl_u_pages_up() {
+        let mut app = app_in_pager();
+        app.spec_pager.as_mut().unwrap().scroll_offset = 15;
+        handle_key_event(
+            &mut app,
+            make_key_with_mod(KeyCode::Char('u'), KeyModifiers::CONTROL),
+        );
+        assert!(app.spec_pager.as_ref().unwrap().scroll_offset < 15);
+    }
+
+    #[test]
+    fn test_pager_g_scrolls_to_top() {
+        let mut app = app_in_pager();
+        app.spec_pager.as_mut().unwrap().scroll_offset = 10;
+        handle_key_event(&mut app, make_key(KeyCode::Char('g')));
+        assert_eq!(app.spec_pager.as_ref().unwrap().scroll_offset, 0);
+    }
+
+    #[test]
+    fn test_pager_shift_g_scrolls_to_bottom() {
+        let mut app = app_in_pager();
+        handle_key_event(&mut app, make_key(KeyCode::Char('G')));
+        assert!(app.spec_pager.as_ref().unwrap().scroll_offset > 0);
+    }
+
+    #[test]
+    fn test_pager_blocks_global_keys() {
+        let mut app = app_in_pager();
+
+        // Number keys should not switch views
+        handle_key_event(&mut app, make_key(KeyCode::Char('2')));
+        assert_eq!(app.current_view, View::Specs);
+
+        // Tab should not switch views
+        handle_key_event(&mut app, make_key(KeyCode::Tab));
+        assert_eq!(app.current_view, View::Specs);
+    }
+
+    #[test]
+    fn test_pager_ctrl_c_still_quits() {
+        let mut app = app_in_pager();
+        let (cont, _) = handle_key_event(
+            &mut app,
+            make_key_with_mod(KeyCode::Char('c'), KeyModifiers::CONTROL),
+        );
+        assert!(!cont);
+        assert!(app.should_quit);
     }
 }
