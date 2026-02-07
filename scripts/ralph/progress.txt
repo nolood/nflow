@@ -466,6 +466,8 @@ Started: Sat Feb  7 03:49:10 PM MSK 2026
 - tokio::process::Command + Stdio::piped for stdout/stderr + Stdio::null for stdin
 - Lines<BufReader<ChildStdout>> for line-by-line async streaming from spawned process
 - GitError enum in nflow-git/src/error.rs: PathAlreadyExists, NotAGitRepository, CommandFailed, Io
+- `git worktree list --porcelain` outputs: "worktree /path\nHEAD abc\nbranch refs/heads/main\n\n" per entry
+- `git worktree remove --force` for worktrees with possible uncommitted changes; graceful fallback to prune for stale entries
 - Use CLI (`git rev-parse --is-inside-work-tree`) for repo validation — git2 requires OpenSSL which may not be available
 - run_git_command() is an async helper: runs git CLI, returns stdout on success, GitError::CommandFailed on failure
 - Use `--initial-branch=main` when creating bare repos in tests to ensure consistent branch naming
@@ -676,4 +678,23 @@ Started: Sat Feb  7 03:49:10 PM MSK 2026
   - `git init --bare` defaults to "master" branch unless `--initial-branch=main` is specified — use in tests for consistency
   - `git worktree add` auto-creates parent directories — no need to mkdir -p beforehand
   - tokio test requires macros + rt-multi-thread features in dev-dependencies
+---
+
+## 2026-02-07 - US-026
+- What was implemented: Worktree removal and cleanup in nflow-git
+  - WorktreeInfo struct with path, head, branch, is_bare fields for parsed worktree list output
+  - remove_worktree(repo_path, worktree_path) runs `git worktree remove --force`, handles already-removed paths gracefully
+  - list_worktrees(repo_path) parses `git worktree list --porcelain` into Vec<WorktreeInfo>
+  - prune_worktrees(repo_path) runs `git worktree prune` to clean stale entries
+  - cleanup_all(repo_path, worktree_dir) removes all worktrees under a directory, returns removed paths
+  - Graceful handling: nonexistent paths → prune + Ok, stale entries → prune + Ok
+  - 12 new tests (507 total) covering all acceptance criteria
+- Files changed:
+  - crates/nflow-git/src/worktree.rs (added WorktreeInfo, remove_worktree, list_worktrees, prune_worktrees, cleanup_all + tests)
+- **Learnings for future iterations:**
+  - `git worktree list --porcelain` outputs blocks separated by blank lines: "worktree /path", "HEAD abc123", "branch refs/heads/main"
+  - `git worktree remove --force` needed to remove worktrees with uncommitted changes
+  - For already-removed worktrees (path deleted manually), just run `git worktree prune` instead of trying to remove
+  - cleanup_all uses starts_with(worktree_dir) to filter — only removes worktrees under the specified directory
+  - WorktreeInfo.is_bare is true for bare repos (the "bare" line in porcelain output)
 ---

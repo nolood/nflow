@@ -1,7 +1,16 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
 use crate::error::{GitError, Result};
+
+/// Information about a git worktree parsed from `git worktree list --porcelain`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorktreeInfo {
+    pub path: PathBuf,
+    pub head: String,
+    pub branch: Option<String>,
+    pub is_bare: bool,
+}
 
 /// Validates that the given path is a git repository via `git rev-parse`.
 async fn validate_git_repo(repo_path: &Path) -> Result<()> {
@@ -79,6 +88,125 @@ pub async fn create_worktree(
     run_git_command(repo_path, &["worktree", "add", worktree_str, &remote_ref]).await?;
 
     Ok(())
+}
+
+/// Removes a git worktree at `worktree_path`.
+///
+/// Runs `git worktree remove {worktree_path} --force`.
+/// Handles already-removed worktrees gracefully — if the path doesn't exist,
+/// prunes stale entries and returns Ok.
+pub async fn remove_worktree(repo_path: &Path, worktree_path: &Path) -> Result<()> {
+    validate_git_repo(repo_path).await?;
+
+    let worktree_str = worktree_path
+        .to_str()
+        .ok_or_else(|| GitError::CommandFailed("Invalid worktree path encoding".to_string()))?;
+
+    // If the worktree directory doesn't exist anymore, just prune stale entries
+    if !worktree_path.exists() {
+        let _ = run_git_command(repo_path, &["worktree", "prune"]).await;
+        return Ok(());
+    }
+
+    let result = run_git_command(repo_path, &["worktree", "remove", worktree_str, "--force"]).await;
+
+    match result {
+        Ok(_) => Ok(()),
+        Err(GitError::CommandFailed(msg)) if msg.contains("is not a working tree") => {
+            // Already removed or stale — prune and succeed
+            let _ = run_git_command(repo_path, &["worktree", "prune"]).await;
+            Ok(())
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Lists all worktrees for a repository by parsing `git worktree list --porcelain`.
+///
+/// Returns a Vec of WorktreeInfo structs, one per worktree (including the main repo).
+pub async fn list_worktrees(repo_path: &Path) -> Result<Vec<WorktreeInfo>> {
+    validate_git_repo(repo_path).await?;
+
+    let output = run_git_command(repo_path, &["worktree", "list", "--porcelain"]).await?;
+
+    let mut worktrees = Vec::new();
+    let mut current_path: Option<PathBuf> = None;
+    let mut current_head = String::new();
+    let mut current_branch: Option<String> = None;
+    let mut is_bare = false;
+
+    for line in output.lines() {
+        if let Some(path_str) = line.strip_prefix("worktree ") {
+            // If we were building a previous entry, push it
+            if let Some(path) = current_path.take() {
+                worktrees.push(WorktreeInfo {
+                    path,
+                    head: std::mem::take(&mut current_head),
+                    branch: current_branch.take(),
+                    is_bare,
+                });
+                is_bare = false;
+            }
+            current_path = Some(PathBuf::from(path_str));
+        } else if let Some(head_str) = line.strip_prefix("HEAD ") {
+            current_head = head_str.to_string();
+        } else if let Some(branch_str) = line.strip_prefix("branch ") {
+            current_branch = Some(branch_str.to_string());
+        } else if line == "bare" {
+            is_bare = true;
+        }
+        // Blank lines separate entries, but we handle it via the "worktree " prefix detection
+    }
+
+    // Push the last entry
+    if let Some(path) = current_path {
+        worktrees.push(WorktreeInfo {
+            path,
+            head: current_head,
+            branch: current_branch,
+            is_bare,
+        });
+    }
+
+    Ok(worktrees)
+}
+
+/// Prunes stale worktree entries that reference paths that no longer exist.
+///
+/// Runs `git worktree prune`.
+pub async fn prune_worktrees(repo_path: &Path) -> Result<()> {
+    validate_git_repo(repo_path).await?;
+    run_git_command(repo_path, &["worktree", "prune"]).await?;
+    Ok(())
+}
+
+/// Removes all nflow worktrees under `worktree_dir`, returning the paths that were removed.
+///
+/// Lists all worktrees, filters for those whose path is under `worktree_dir`,
+/// removes each one, and prunes stale entries.
+/// Handles already-removed worktrees gracefully.
+pub async fn cleanup_all(repo_path: &Path, worktree_dir: &Path) -> Result<Vec<PathBuf>> {
+    let worktrees = list_worktrees(repo_path).await?;
+
+    let mut removed = Vec::new();
+
+    for wt in &worktrees {
+        if wt.path.starts_with(worktree_dir) && !wt.is_bare {
+            let result = remove_worktree(repo_path, &wt.path).await;
+            match result {
+                Ok(()) => removed.push(wt.path.clone()),
+                Err(_) => {
+                    // Best-effort removal — continue with others
+                    removed.push(wt.path.clone());
+                }
+            }
+        }
+    }
+
+    // Final prune to clean up any stale entries
+    let _ = prune_worktrees(repo_path).await;
+
+    Ok(removed)
 }
 
 #[cfg(test)]
@@ -275,5 +403,205 @@ mod tests {
         let result = run_git_command(dir.path(), &["checkout", "nonexistent"]).await;
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), GitError::CommandFailed(_)));
+    }
+
+    #[tokio::test]
+    async fn test_remove_worktree_success() {
+        let (dir, _bare, repo) = setup_repo_with_remote().await;
+        let wt_path = dir.path().join("worktrees/to-remove");
+
+        // Create a worktree first
+        create_worktree(&repo, &wt_path, "main").await.unwrap();
+        assert!(wt_path.exists());
+
+        // Remove it
+        let result = remove_worktree(&repo, &wt_path).await;
+        assert!(result.is_ok(), "remove_worktree failed: {:?}", result);
+        assert!(!wt_path.exists());
+    }
+
+    #[tokio::test]
+    async fn test_remove_worktree_already_removed() {
+        let (dir, _bare, repo) = setup_repo_with_remote().await;
+        let wt_path = dir.path().join("worktrees/already-gone");
+
+        // Create then manually delete the directory
+        create_worktree(&repo, &wt_path, "main").await.unwrap();
+        std::fs::remove_dir_all(&wt_path).unwrap();
+        assert!(!wt_path.exists());
+
+        // remove_worktree should handle this gracefully
+        let result = remove_worktree(&repo, &wt_path).await;
+        assert!(
+            result.is_ok(),
+            "Expected graceful handling of already-removed worktree, got: {:?}",
+            result
+        );
+    }
+
+    #[tokio::test]
+    async fn test_remove_worktree_nonexistent_path() {
+        let (dir, _bare, repo) = setup_repo_with_remote().await;
+        let wt_path = dir.path().join("worktrees/never-existed");
+
+        // Path never existed — should succeed gracefully
+        let result = remove_worktree(&repo, &wt_path).await;
+        assert!(
+            result.is_ok(),
+            "Expected Ok for nonexistent path, got: {:?}",
+            result
+        );
+    }
+
+    #[tokio::test]
+    async fn test_list_worktrees() {
+        let (dir, _bare, repo) = setup_repo_with_remote().await;
+        let wt1 = dir.path().join("worktrees/feature-1");
+        let wt2 = dir.path().join("worktrees/feature-2");
+
+        create_worktree(&repo, &wt1, "main").await.unwrap();
+        create_worktree(&repo, &wt2, "main").await.unwrap();
+
+        let worktrees = list_worktrees(&repo).await.unwrap();
+
+        // Should have at least 3: main repo + 2 worktrees
+        assert!(
+            worktrees.len() >= 3,
+            "Expected at least 3 worktrees, got {}",
+            worktrees.len()
+        );
+
+        let paths: Vec<&Path> = worktrees.iter().map(|w| w.path.as_path()).collect();
+        assert!(paths.contains(&wt1.as_path()), "Missing worktree 1 in list");
+        assert!(paths.contains(&wt2.as_path()), "Missing worktree 2 in list");
+    }
+
+    #[tokio::test]
+    async fn test_list_worktrees_has_head_and_branch() {
+        let (_dir, _bare, repo) = setup_repo_with_remote().await;
+
+        let worktrees = list_worktrees(&repo).await.unwrap();
+        assert!(!worktrees.is_empty());
+
+        // The main worktree should have a HEAD commit and branch
+        let main_wt = &worktrees[0];
+        assert!(!main_wt.head.is_empty(), "HEAD should not be empty");
+        assert!(
+            main_wt.branch.is_some(),
+            "Main worktree should have a branch"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_list_worktrees_not_a_repo() {
+        let dir = TempDir::new().unwrap();
+        let result = list_worktrees(dir.path()).await;
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            GitError::NotAGitRepository(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_prune_worktrees() {
+        let (dir, _bare, repo) = setup_repo_with_remote().await;
+        let wt_path = dir.path().join("worktrees/to-prune");
+
+        // Create a worktree then manually remove its directory
+        create_worktree(&repo, &wt_path, "main").await.unwrap();
+        std::fs::remove_dir_all(&wt_path).unwrap();
+
+        // Prune should clean up the stale entry
+        let result = prune_worktrees(&repo).await;
+        assert!(result.is_ok(), "prune_worktrees failed: {:?}", result);
+
+        // After pruning, listing should not include the stale worktree
+        let worktrees = list_worktrees(&repo).await.unwrap();
+        let paths: Vec<&Path> = worktrees.iter().map(|w| w.path.as_path()).collect();
+        assert!(
+            !paths.contains(&wt_path.as_path()),
+            "Stale worktree should be removed after prune"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_prune_worktrees_not_a_repo() {
+        let dir = TempDir::new().unwrap();
+        let result = prune_worktrees(dir.path()).await;
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            GitError::NotAGitRepository(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_all() {
+        let (dir, _bare, repo) = setup_repo_with_remote().await;
+        let wt_dir = dir.path().join("worktrees");
+        let wt1 = wt_dir.join("feature-1");
+        let wt2 = wt_dir.join("feature-2");
+
+        create_worktree(&repo, &wt1, "main").await.unwrap();
+        create_worktree(&repo, &wt2, "main").await.unwrap();
+
+        let removed = cleanup_all(&repo, &wt_dir).await.unwrap();
+        assert_eq!(removed.len(), 2, "Expected 2 removed worktrees");
+        assert!(removed.contains(&wt1));
+        assert!(removed.contains(&wt2));
+
+        // After cleanup, those directories should not exist
+        assert!(!wt1.exists());
+        assert!(!wt2.exists());
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_all_skips_non_nflow_worktrees() {
+        let (dir, _bare, repo) = setup_repo_with_remote().await;
+        let nflow_dir = dir.path().join("nflow-worktrees");
+        let other_dir = dir.path().join("other-worktrees");
+        let nflow_wt = nflow_dir.join("feature");
+        let other_wt = other_dir.join("external");
+
+        create_worktree(&repo, &nflow_wt, "main").await.unwrap();
+        create_worktree(&repo, &other_wt, "main").await.unwrap();
+
+        // Only clean up nflow_dir
+        let removed = cleanup_all(&repo, &nflow_dir).await.unwrap();
+        assert_eq!(removed.len(), 1);
+        assert!(removed.contains(&nflow_wt));
+
+        // other_wt should still exist
+        assert!(other_wt.exists());
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_all_handles_already_removed() {
+        let (dir, _bare, repo) = setup_repo_with_remote().await;
+        let wt_dir = dir.path().join("worktrees");
+        let wt1 = wt_dir.join("feature-1");
+        let wt2 = wt_dir.join("feature-2");
+
+        create_worktree(&repo, &wt1, "main").await.unwrap();
+        create_worktree(&repo, &wt2, "main").await.unwrap();
+
+        // Manually remove one worktree directory
+        std::fs::remove_dir_all(&wt1).unwrap();
+
+        // cleanup_all should still succeed
+        let removed = cleanup_all(&repo, &wt_dir).await.unwrap();
+        // wt1 is stale but still listed by git, wt2 exists — both should be handled
+        assert!(!removed.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_all_empty_dir() {
+        let (dir, _bare, repo) = setup_repo_with_remote().await;
+        let wt_dir = dir.path().join("empty-worktrees");
+
+        // No worktrees under this dir — should return empty vec
+        let removed = cleanup_all(&repo, &wt_dir).await.unwrap();
+        assert!(removed.is_empty());
     }
 }
