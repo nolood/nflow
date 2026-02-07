@@ -71,6 +71,18 @@ pub fn insert_spec(conn: &Connection, spec: &Spec) -> Result<()> {
     Ok(())
 }
 
+pub fn get_spec_by_id(conn: &Connection, id: &Uuid) -> Result<Option<Spec>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, project_id, name, file_path, status, session_active, claude_session_id, created_at, updated_at
+         FROM specs WHERE id = ?1",
+    )?;
+    let mut rows = stmt.query_map(params![id.to_string()], row_to_spec)?;
+    match rows.next() {
+        Some(row) => Ok(Some(row?)),
+        None => Ok(None),
+    }
+}
+
 pub fn get_spec_by_name(conn: &Connection, project_id: &Uuid, name: &str) -> Result<Option<Spec>> {
     let mut stmt = conn.prepare(
         "SELECT id, project_id, name, file_path, status, session_active, claude_session_id, created_at, updated_at

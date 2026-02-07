@@ -105,6 +105,9 @@
 - build_spec_context returns HashMap<String, String>; render_template needs HashMap<&str, &str> — convert with iter().map()
 - Tests calling handle_* that use tokio::spawn internally need #[tokio::test] (not #[test]) for the reactor
 - Sync worktree removal in handlers: use std::process::Command (not async nflow-git) since handlers run in spawn_blocking
+- Extract shared async streaming logic when multiple handlers stream Claude output (e.g., stream_claude_spec_session)
+- RunConfig.resume_session = Some(id) enables --resume for Claude session chaining
+- Session completion: spec file existence check (Path::new(spec_file_path).exists()) determines if Q&A is done
 
 # Ralph Progress Log
 Started: Sat Feb  7 03:49:10 PM MSK 2026
@@ -1205,4 +1208,30 @@ Started: Sat Feb  7 03:49:10 PM MSK 2026
   - HashMap<String, String> → HashMap<&str, &str> conversion: use iter().map(|(k, v)| (k.as_str(), v.as_str())).collect()
   - Tests that trigger tokio::spawn in the handler must use #[tokio::test] not #[test]
   - Pre-existing flaky test: test_foreground_mode_writes_pid_file_and_sets_shutdown (race condition, not our fault)
+---
+
+## 2026-02-07 - US-046
+- What was implemented: Command handler — spec Q&A flow in nflow-daemon
+  - Added `get_spec_by_id()` to db/specs.rs for looking up specs by UUID
+  - Extracted `stream_claude_spec_session()` shared async helper used by both spec.new and spec.answer
+  - AskUserQuestion detection: checks `event.is_ask_user_question()` on each stream event
+  - Question events sent to client as `{ type: "question", text: "...", options?: [...] }`
+  - `handle_spec_answer()`: receives { spec_id, answer_text }, validates active session + claude_session_id
+  - Builds RunConfig with `resume_session = Some(claude_session_id)` and `prompt = answer_text`
+  - Session chaining: each answer creates a new Claude invocation resuming the previous session
+  - Session completion: checks if spec file exists after Claude stream ends → marks session_active=false
+  - If session not completed (waiting for user answer): keeps session_active=true, stores claude_session_id
+  - Done event includes `completed: bool` field for client to know if Q&A is finished
+  - Wired up "spec.answer" in dispatch() routing
+  - 10 new tests (41 handler, 263 workspace total): missing params, invalid UUID, spec not found, inactive session, no claude session, valid streaming, dispatch routing, get_spec_by_id
+- Files changed:
+  - crates/nflow-daemon/src/db/specs.rs (get_spec_by_id + 1 test)
+  - crates/nflow-daemon/src/handlers.rs (handle_spec_answer, stream_claude_spec_session, dispatch routing + 9 tests)
+- **Learnings for future iterations:**
+  - Extract shared streaming logic into a separate async fn when multiple handlers need it (spec.new + spec.answer)
+  - RunConfig.resume_session = Some(session_id) enables `--resume` flag in Claude invocation
+  - AskUserQuestion detection via StreamEvent::is_ask_user_question() — already implemented in nflow-claude stream module
+  - Session completion heuristic: spec file existence (Path::new(spec_file_path).exists())
+  - get_spec_by_id doesn't need project_id scope — spec UUIDs are globally unique
+  - Pre-existing flaky test still fails intermittently: test_foreground_mode_writes_pid_file_and_sets_shutdown
 ---

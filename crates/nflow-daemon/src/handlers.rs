@@ -36,6 +36,7 @@ fn dispatch(req: Request, state: &HandlerState) -> HandlerResult {
         "project.list" => HandlerResult::Single(handle_project_list(req, state)),
         "project.delete" => HandlerResult::Single(handle_project_delete(req, state)),
         "spec.new" => handle_spec_new(req, state),
+        "spec.answer" => handle_spec_answer(req, state),
         _ => HandlerResult::Single(Response::error(
             req.id,
             &format!("unknown command: {}", req.command),
@@ -435,9 +436,10 @@ fn handle_spec_new(req: Request, state: &HandlerState) -> HandlerResult {
     run_config.working_dir = Some(working_dir);
     run_config.system_prompt_file = override_path.map(|d| d.join("spec_session.md"));
 
-    // Create streaming channel
+    // Create streaming channel and spawn Claude streaming
     let (tx, rx) = tokio::sync::mpsc::channel(64);
     let spec_id = spec.id;
+    let spec_file_path_str = spec.file_path.clone();
     let db_path = state.db_path.clone();
 
     // Send initial response with spec info
@@ -455,31 +457,193 @@ fn handle_spec_new(req: Request, state: &HandlerState) -> HandlerResult {
             ))
             .await;
 
-        // Spawn Claude process
-        let runner = nflow_claude::runner::ClaudeRunner::default();
-        let process = match runner.spawn(&run_config) {
-            Ok(p) => p,
-            Err(e) => {
-                let _ = tx
-                    .send(StreamingResponseLine::error(
-                        initial_id,
-                        &format!("failed to spawn Claude: {}", e),
-                    ))
-                    .await;
-                // Mark session as inactive on failure
-                if let Ok(conn) = db::open_connection(&db_path) {
-                    let _ = db::specs::update_spec_session(&conn, &spec_id, false, None);
-                }
-                return;
-            }
-        };
+        stream_claude_spec_session(
+            tx,
+            initial_id,
+            run_config,
+            spec_id,
+            &spec_file_path_str,
+            &db_path,
+        )
+        .await;
+    });
 
-        // Stream Claude output
-        let mut parser = nflow_claude::stream::StreamParser::new(process.stdout);
-        loop {
-            match parser.next_event().await {
-                Ok(Some(event)) => {
-                    let event_json = match &event {
+    HandlerResult::Streaming(rx)
+}
+
+/// Handle "spec.answer" command — answer a question from spec Q&A flow.
+///
+/// Receives: { spec_id, answer_text }
+/// Spawns new Claude with --resume {session_id} and -p {answer_text}.
+fn handle_spec_answer(req: Request, state: &HandlerState) -> HandlerResult {
+    let id = req.id.clone();
+
+    // Parse required params
+    let spec_id_str = match req.params.get("spec_id").and_then(|v| v.as_str()) {
+        Some(s) => s.to_string(),
+        None => {
+            return HandlerResult::Single(Response::error(
+                id,
+                "missing required parameter: spec_id",
+            ));
+        }
+    };
+
+    let answer_text = match req.params.get("answer_text").and_then(|v| v.as_str()) {
+        Some(a) => a.to_string(),
+        None => {
+            return HandlerResult::Single(Response::error(
+                id,
+                "missing required parameter: answer_text",
+            ));
+        }
+    };
+
+    let spec_id = match uuid::Uuid::parse_str(&spec_id_str) {
+        Ok(id) => id,
+        Err(_) => {
+            return HandlerResult::Single(Response::error(
+                id,
+                "INVALID_PARAMS: invalid spec_id format",
+            ));
+        }
+    };
+
+    // Open DB connection
+    let conn = match db::open_connection(&state.db_path) {
+        Ok(c) => c,
+        Err(e) => {
+            return HandlerResult::Single(Response::error(id, &format!("database error: {}", e)));
+        }
+    };
+
+    // Look up the spec
+    let spec = match db::specs::get_spec_by_id(&conn, &spec_id) {
+        Ok(Some(s)) => s,
+        Ok(None) => {
+            return HandlerResult::Single(Response::error(
+                id,
+                &format!("NOT_FOUND: spec '{}' not found", spec_id_str),
+            ));
+        }
+        Err(e) => {
+            return HandlerResult::Single(Response::error(id, &format!("database error: {}", e)));
+        }
+    };
+
+    // Validate session is active
+    if !spec.session_active {
+        return HandlerResult::Single(Response::error(
+            id,
+            "INVALID_STATE: no active session for this spec",
+        ));
+    }
+
+    // Must have a claude_session_id to resume
+    let claude_session_id = match &spec.claude_session_id {
+        Some(sid) => sid.clone(),
+        None => {
+            return HandlerResult::Single(Response::error(
+                id,
+                "INVALID_STATE: spec has no claude session to resume",
+            ));
+        }
+    };
+
+    // Build RunConfig for resumed spec session — uses answer_text as prompt, resumes previous session
+    let mut run_config = nflow_claude::runner::RunConfig::for_spec(answer_text, true);
+    run_config.resume_session = Some(claude_session_id);
+
+    // Find the project for working_dir
+    let project = match db::projects::get_project_by_id(&conn, &spec.project_id) {
+        Ok(Some(p)) => p,
+        Ok(None) => {
+            return HandlerResult::Single(Response::error(
+                id,
+                "NOT_FOUND: project for this spec not found",
+            ));
+        }
+        Err(e) => {
+            return HandlerResult::Single(Response::error(id, &format!("database error: {}", e)));
+        }
+    };
+    run_config.working_dir = Some(PathBuf::from(&project.path));
+
+    // Create streaming channel and spawn Claude streaming
+    let (tx, rx) = tokio::sync::mpsc::channel(64);
+    let spec_file_path_str = spec.file_path.clone();
+    let db_path = state.db_path.clone();
+
+    let initial_id = id.clone();
+    tokio::spawn(async move {
+        stream_claude_spec_session(
+            tx,
+            initial_id,
+            run_config,
+            spec_id,
+            &spec_file_path_str,
+            &db_path,
+        )
+        .await;
+    });
+
+    HandlerResult::Streaming(rx)
+}
+
+/// Shared streaming logic for spec sessions (used by both spec.new and spec.answer).
+///
+/// Spawns Claude, streams output detecting AskUserQuestion events, and handles
+/// session completion (exit code 0 + spec file exists).
+async fn stream_claude_spec_session(
+    tx: tokio::sync::mpsc::Sender<StreamingResponseLine>,
+    req_id: String,
+    run_config: nflow_claude::runner::RunConfig,
+    spec_id: uuid::Uuid,
+    spec_file_path: &str,
+    db_path: &Path,
+) {
+    // Spawn Claude process
+    let runner = nflow_claude::runner::ClaudeRunner::default();
+    let process = match runner.spawn(&run_config) {
+        Ok(p) => p,
+        Err(e) => {
+            let _ = tx
+                .send(StreamingResponseLine::error(
+                    req_id,
+                    &format!("failed to spawn Claude: {}", e),
+                ))
+                .await;
+            // Mark session as inactive on failure
+            if let Ok(conn) = db::open_connection(db_path) {
+                let _ = db::specs::update_spec_session(&conn, &spec_id, false, None);
+            }
+            return;
+        }
+    };
+
+    // Stream Claude output
+    let mut parser = nflow_claude::stream::StreamParser::new(process.stdout);
+    loop {
+        match parser.next_event().await {
+            Ok(Some(event)) => {
+                // Detect AskUserQuestion tool calls and send as question event
+                let event_json = if event.is_ask_user_question() {
+                    if let nflow_claude::stream::StreamEvent::ToolUse { input, .. } = &event {
+                        let question = input.get("question").and_then(|v| v.as_str()).unwrap_or("");
+                        let options = input.get("options");
+                        let mut q = serde_json::json!({
+                            "type": "question",
+                            "text": question,
+                        });
+                        if let Some(opts) = options {
+                            q["options"] = opts.clone();
+                        }
+                        q
+                    } else {
+                        serde_json::json!({"type": "tool_use", "name": "AskUserQuestion", "input": {}})
+                    }
+                } else {
+                    match &event {
                         nflow_claude::stream::StreamEvent::TextDelta { text } => {
                             serde_json::json!({"type": "text", "text": text})
                         }
@@ -498,45 +662,58 @@ fn handle_spec_new(req: Request, state: &HandlerState) -> HandlerResult {
                         nflow_claude::stream::StreamEvent::ParseError { line, reason } => {
                             serde_json::json!({"type": "parse_error", "line": line, "reason": reason})
                         }
-                    };
-
-                    if tx
-                        .send(StreamingResponseLine::data(initial_id.clone(), event_json))
-                        .await
-                        .is_err()
-                    {
-                        break; // Client disconnected
                     }
-                }
-                Ok(None) => break, // Stream ended
-                Err(e) => {
-                    let _ = tx
-                        .send(StreamingResponseLine::error(
-                            initial_id.clone(),
-                            &format!("stream error: {}", e),
-                        ))
-                        .await;
-                    break;
+                };
+
+                if tx
+                    .send(StreamingResponseLine::data(req_id.clone(), event_json))
+                    .await
+                    .is_err()
+                {
+                    break; // Client disconnected
                 }
             }
+            Ok(None) => break, // Stream ended
+            Err(e) => {
+                let _ = tx
+                    .send(StreamingResponseLine::error(
+                        req_id.clone(),
+                        &format!("stream error: {}", e),
+                    ))
+                    .await;
+                break;
+            }
         }
+    }
 
-        // Get session ID from parser
-        let session_id = parser.session_id().map(|s| s.to_string());
+    // Get session ID from parser
+    let session_id = parser.session_id().map(|s| s.to_string());
 
-        // Send done line
-        let _ = tx
-            .send(StreamingResponseLine::done(
-                initial_id,
-                serde_json::json!({
-                    "spec_id": spec_id.to_string(),
-                    "session_id": session_id,
-                }),
-            ))
-            .await;
-    });
+    // Check session completion: spec file exists means Claude finished writing the spec
+    let spec_file_exists = Path::new(spec_file_path).exists();
+    let session_completed = spec_file_exists;
 
-    HandlerResult::Streaming(rx)
+    // Update DB: store claude_session_id; if completed, mark session inactive
+    if let Ok(conn) = db::open_connection(db_path) {
+        if session_completed {
+            let _ = db::specs::update_spec_session(&conn, &spec_id, false, session_id.as_deref());
+        } else {
+            // Session still active (waiting for user answer), just store the session ID
+            let _ = db::specs::update_spec_session(&conn, &spec_id, true, session_id.as_deref());
+        }
+    }
+
+    // Send done line
+    let _ = tx
+        .send(StreamingResponseLine::done(
+            req_id,
+            serde_json::json!({
+                "spec_id": spec_id.to_string(),
+                "session_id": session_id,
+                "completed": session_completed,
+            }),
+        ))
+        .await;
 }
 
 /// Check if a path is a git repository using synchronous git command.
@@ -1596,6 +1773,269 @@ mod tests {
             }
             _ => panic!("expected Single response for missing param"),
         }
+        cleanup_db(&db_dir);
+    }
+
+    // --- spec.answer tests ---
+
+    #[test]
+    fn test_handle_spec_answer_missing_spec_id() {
+        let state = make_test_state();
+        let req = Request {
+            id: "60".to_string(),
+            command: "spec.answer".to_string(),
+            params: serde_json::json!({ "answer_text": "Rust" }),
+        };
+        match handle_spec_answer(req, &state) {
+            HandlerResult::Single(resp) => {
+                assert_eq!(resp.status, crate::socket::ResponseStatus::Error);
+                assert!(resp.data["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("missing required parameter: spec_id"));
+            }
+            _ => panic!("expected Single response for error"),
+        }
+    }
+
+    #[test]
+    fn test_handle_spec_answer_missing_answer_text() {
+        let state = make_test_state();
+        let req = Request {
+            id: "61".to_string(),
+            command: "spec.answer".to_string(),
+            params: serde_json::json!({ "spec_id": uuid::Uuid::new_v4().to_string() }),
+        };
+        match handle_spec_answer(req, &state) {
+            HandlerResult::Single(resp) => {
+                assert_eq!(resp.status, crate::socket::ResponseStatus::Error);
+                assert!(resp.data["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("missing required parameter: answer_text"));
+            }
+            _ => panic!("expected Single response for error"),
+        }
+    }
+
+    #[test]
+    fn test_handle_spec_answer_invalid_spec_id_format() {
+        let state = make_test_state();
+        let req = Request {
+            id: "62".to_string(),
+            command: "spec.answer".to_string(),
+            params: serde_json::json!({
+                "spec_id": "not-a-uuid",
+                "answer_text": "Rust",
+            }),
+        };
+        match handle_spec_answer(req, &state) {
+            HandlerResult::Single(resp) => {
+                assert_eq!(resp.status, crate::socket::ResponseStatus::Error);
+                assert!(resp.data["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("INVALID_PARAMS"));
+            }
+            _ => panic!("expected Single response for error"),
+        }
+    }
+
+    #[test]
+    fn test_handle_spec_answer_spec_not_found() {
+        let (state, db_dir) = make_db_state("spec_answer_notfound");
+        let req = Request {
+            id: "63".to_string(),
+            command: "spec.answer".to_string(),
+            params: serde_json::json!({
+                "spec_id": uuid::Uuid::new_v4().to_string(),
+                "answer_text": "Rust",
+            }),
+        };
+        match handle_spec_answer(req, &state) {
+            HandlerResult::Single(resp) => {
+                assert_eq!(resp.status, crate::socket::ResponseStatus::Error);
+                assert!(resp.data["message"].as_str().unwrap().contains("NOT_FOUND"));
+            }
+            _ => panic!("expected Single response for error"),
+        }
+        cleanup_db(&db_dir);
+    }
+
+    #[test]
+    fn test_handle_spec_answer_no_active_session() {
+        let (state, db_dir) = make_db_state("spec_answer_inactive");
+        let project_id = insert_test_project(&state, "answer-project");
+
+        // Create a spec with session_active=false
+        let conn = db::open_connection(&state.db_path).unwrap();
+        let spec_id = uuid::Uuid::new_v4();
+        conn.execute(
+            "INSERT INTO specs (id, project_id, name, file_path, status, session_active, created_at, updated_at)
+             VALUES (?1, ?2, 'my-spec', '/tmp/spec.md', 'draft', 0, '2024-01-01', '2024-01-01')",
+            rusqlite::params![spec_id.to_string(), project_id.to_string()],
+        )
+        .unwrap();
+        drop(conn);
+
+        let req = Request {
+            id: "64".to_string(),
+            command: "spec.answer".to_string(),
+            params: serde_json::json!({
+                "spec_id": spec_id.to_string(),
+                "answer_text": "Rust",
+            }),
+        };
+        match handle_spec_answer(req, &state) {
+            HandlerResult::Single(resp) => {
+                assert_eq!(resp.status, crate::socket::ResponseStatus::Error);
+                assert!(resp.data["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("INVALID_STATE"));
+                assert!(resp.data["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("no active session"));
+            }
+            _ => panic!("expected Single response for error"),
+        }
+        cleanup_db(&db_dir);
+    }
+
+    #[test]
+    fn test_handle_spec_answer_no_claude_session_id() {
+        let (state, db_dir) = make_db_state("spec_answer_nosession");
+        let project_id = insert_test_project(&state, "nosession-project");
+
+        // Create a spec with session_active=true but no claude_session_id
+        let conn = db::open_connection(&state.db_path).unwrap();
+        let spec_id = uuid::Uuid::new_v4();
+        conn.execute(
+            "INSERT INTO specs (id, project_id, name, file_path, status, session_active, created_at, updated_at)
+             VALUES (?1, ?2, 'my-spec', '/tmp/spec.md', 'draft', 1, '2024-01-01', '2024-01-01')",
+            rusqlite::params![spec_id.to_string(), project_id.to_string()],
+        )
+        .unwrap();
+        drop(conn);
+
+        let req = Request {
+            id: "65".to_string(),
+            command: "spec.answer".to_string(),
+            params: serde_json::json!({
+                "spec_id": spec_id.to_string(),
+                "answer_text": "Rust",
+            }),
+        };
+        match handle_spec_answer(req, &state) {
+            HandlerResult::Single(resp) => {
+                assert_eq!(resp.status, crate::socket::ResponseStatus::Error);
+                assert!(resp.data["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("INVALID_STATE"));
+                assert!(resp.data["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("no claude session"));
+            }
+            _ => panic!("expected Single response for error"),
+        }
+        cleanup_db(&db_dir);
+    }
+
+    #[tokio::test]
+    async fn test_handle_spec_answer_with_valid_session_returns_streaming() {
+        let (state, db_dir) = make_db_state("spec_answer_streaming");
+        let project_id = insert_test_project(&state, "streaming-project");
+
+        // Create a spec with session_active=true and a claude_session_id
+        let conn = db::open_connection(&state.db_path).unwrap();
+        let spec_id = uuid::Uuid::new_v4();
+        conn.execute(
+            "INSERT INTO specs (id, project_id, name, file_path, status, session_active, claude_session_id, created_at, updated_at)
+             VALUES (?1, ?2, 'my-spec', '/tmp/spec.md', 'draft', 1, 'session-abc', '2024-01-01', '2024-01-01')",
+            rusqlite::params![spec_id.to_string(), project_id.to_string()],
+        )
+        .unwrap();
+        drop(conn);
+
+        let req = Request {
+            id: "66".to_string(),
+            command: "spec.answer".to_string(),
+            params: serde_json::json!({
+                "spec_id": spec_id.to_string(),
+                "answer_text": "I want to use Rust",
+            }),
+        };
+
+        // Should return Streaming because the DB part succeeds
+        // (Claude won't be available, but the handler returns Streaming before spawn)
+        match handle_spec_answer(req, &state) {
+            HandlerResult::Streaming(_rx) => {
+                // Success — handler accepted the request and started streaming
+            }
+            HandlerResult::Single(resp) => {
+                panic!(
+                    "expected Streaming response but got Single: {:?}",
+                    resp.data
+                );
+            }
+        }
+        cleanup_db(&db_dir);
+    }
+
+    #[test]
+    fn test_dispatch_spec_answer() {
+        let (state, db_dir) = make_db_state("dispatch_spec_answer");
+        let req = Request {
+            id: "67".to_string(),
+            command: "spec.answer".to_string(),
+            params: serde_json::json!({ "answer_text": "Rust" }),
+        };
+        match dispatch(req, &state) {
+            HandlerResult::Single(resp) => {
+                // Should be error (missing spec_id) but not "unknown command"
+                assert_eq!(resp.status, crate::socket::ResponseStatus::Error);
+                assert!(resp.data["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("missing required parameter: spec_id"));
+            }
+            _ => panic!("expected Single response for missing param"),
+        }
+        cleanup_db(&db_dir);
+    }
+
+    // --- DB: get_spec_by_id test ---
+
+    #[test]
+    fn test_get_spec_by_id() {
+        let (state, db_dir) = make_db_state("get_spec_by_id");
+        let project_id = insert_test_project(&state, "id-project");
+
+        let conn = db::open_connection(&state.db_path).unwrap();
+        let spec_id = uuid::Uuid::new_v4();
+        conn.execute(
+            "INSERT INTO specs (id, project_id, name, file_path, status, session_active, claude_session_id, created_at, updated_at)
+             VALUES (?1, ?2, 'my-spec', '/tmp/spec.md', 'draft', 1, 'session-xyz', '2024-01-01', '2024-01-01')",
+            rusqlite::params![spec_id.to_string(), project_id.to_string()],
+        )
+        .unwrap();
+
+        // Found
+        let spec = db::specs::get_spec_by_id(&conn, &spec_id).unwrap().unwrap();
+        assert_eq!(spec.id, spec_id);
+        assert_eq!(spec.name, "my-spec");
+        assert_eq!(spec.project_id, project_id);
+        assert!(spec.session_active);
+        assert_eq!(spec.claude_session_id.as_deref(), Some("session-xyz"));
+
+        // Not found
+        let missing = db::specs::get_spec_by_id(&conn, &uuid::Uuid::new_v4()).unwrap();
+        assert!(missing.is_none());
+
+        drop(conn);
         cleanup_db(&db_dir);
     }
 }
