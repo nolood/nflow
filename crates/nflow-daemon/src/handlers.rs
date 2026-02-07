@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use nflow_core::project::{CreateProjectParams, GitProvider, ProjectService};
-use nflow_core::spec::Spec;
+use nflow_core::spec::{Spec, SpecStatus};
 
 use crate::db;
 use crate::socket::{HandlerResult, Request, Response, StreamingResponseLine};
@@ -37,6 +37,12 @@ fn dispatch(req: Request, state: &HandlerState) -> HandlerResult {
         "project.delete" => HandlerResult::Single(handle_project_delete(req, state)),
         "spec.new" => handle_spec_new(req, state),
         "spec.answer" => handle_spec_answer(req, state),
+        "spec.list" => HandlerResult::Single(handle_spec_list(req, state)),
+        "spec.view" => HandlerResult::Single(handle_spec_view(req, state)),
+        "spec.approve" => HandlerResult::Single(handle_spec_approve(req, state)),
+        "spec.reopen" => HandlerResult::Single(handle_spec_reopen(req, state)),
+        "spec.delete" => HandlerResult::Single(handle_spec_delete(req, state)),
+        "spec.resume" => handle_spec_resume(req, state),
         _ => HandlerResult::Single(Response::error(
             req.id,
             &format!("unknown command: {}", req.command),
@@ -714,6 +720,582 @@ async fn stream_claude_spec_session(
             }),
         ))
         .await;
+}
+
+/// Handle "spec.list" command.
+///
+/// Receives: { project_name }
+/// Returns: { specs: [{ name, status, session_active, created_at }] }
+/// Hidden: specs with status = "deleted" are excluded from listings.
+fn handle_spec_list(req: Request, state: &HandlerState) -> Response {
+    let id = req.id.clone();
+
+    let project_name = match req.params.get("project_name").and_then(|v| v.as_str()) {
+        Some(n) => n.to_string(),
+        None => {
+            return Response::error(id, "missing required parameter: project_name");
+        }
+    };
+
+    let conn = match db::open_connection(&state.db_path) {
+        Ok(c) => c,
+        Err(e) => return Response::error(id, &format!("database error: {}", e)),
+    };
+
+    let project = match db::projects::get_project_by_name(&conn, &project_name) {
+        Ok(Some(p)) => p,
+        Ok(None) => {
+            return Response::error(
+                id,
+                &format!("NOT_FOUND: project '{}' not found", project_name),
+            );
+        }
+        Err(e) => return Response::error(id, &format!("database error: {}", e)),
+    };
+
+    let specs = match db::specs::list_specs_by_project(&conn, &project.id) {
+        Ok(s) => s,
+        Err(e) => return Response::error(id, &format!("database error: {}", e)),
+    };
+
+    // Filter out deleted specs (soft-delete: hidden from listings)
+    let spec_list: Vec<serde_json::Value> = specs
+        .iter()
+        .filter(|s| s.status != SpecStatus::Deleted)
+        .map(|s| {
+            serde_json::json!({
+                "name": s.name,
+                "status": s.status.to_string(),
+                "session_active": s.session_active,
+                "created_at": s.created_at.to_rfc3339(),
+            })
+        })
+        .collect();
+
+    Response::ok(id, serde_json::json!({ "specs": spec_list }))
+}
+
+/// Handle "spec.view" command.
+///
+/// Receives: { project_name, spec_name }
+/// Returns: { name, status, content } where content is the markdown file contents.
+fn handle_spec_view(req: Request, state: &HandlerState) -> Response {
+    let id = req.id.clone();
+
+    let project_name = match req.params.get("project_name").and_then(|v| v.as_str()) {
+        Some(n) => n.to_string(),
+        None => {
+            return Response::error(id, "missing required parameter: project_name");
+        }
+    };
+
+    let spec_name = match req.params.get("spec_name").and_then(|v| v.as_str()) {
+        Some(n) => n.to_string(),
+        None => {
+            return Response::error(id, "missing required parameter: spec_name");
+        }
+    };
+
+    let conn = match db::open_connection(&state.db_path) {
+        Ok(c) => c,
+        Err(e) => return Response::error(id, &format!("database error: {}", e)),
+    };
+
+    let project = match db::projects::get_project_by_name(&conn, &project_name) {
+        Ok(Some(p)) => p,
+        Ok(None) => {
+            return Response::error(
+                id,
+                &format!("NOT_FOUND: project '{}' not found", project_name),
+            );
+        }
+        Err(e) => return Response::error(id, &format!("database error: {}", e)),
+    };
+
+    let spec = match db::specs::get_spec_by_name(&conn, &project.id, &spec_name) {
+        Ok(Some(s)) => s,
+        Ok(None) => {
+            return Response::error(id, &format!("NOT_FOUND: spec '{}' not found", spec_name));
+        }
+        Err(e) => return Response::error(id, &format!("database error: {}", e)),
+    };
+
+    // Read the spec file from disk
+    let content = match std::fs::read_to_string(&spec.file_path) {
+        Ok(c) => c,
+        Err(e) => {
+            return Response::error(
+                id,
+                &format!("failed to read spec file '{}': {}", spec.file_path, e),
+            );
+        }
+    };
+
+    Response::ok(
+        id,
+        serde_json::json!({
+            "name": spec.name,
+            "status": spec.status.to_string(),
+            "content": content,
+        }),
+    )
+}
+
+/// Handle "spec.approve" command.
+///
+/// Receives: { project_name, spec_name }
+/// Transitions draft -> approved. If spec has active session, stops it first.
+fn handle_spec_approve(req: Request, state: &HandlerState) -> Response {
+    let id = req.id.clone();
+
+    let project_name = match req.params.get("project_name").and_then(|v| v.as_str()) {
+        Some(n) => n.to_string(),
+        None => {
+            return Response::error(id, "missing required parameter: project_name");
+        }
+    };
+
+    let spec_name = match req.params.get("spec_name").and_then(|v| v.as_str()) {
+        Some(n) => n.to_string(),
+        None => {
+            return Response::error(id, "missing required parameter: spec_name");
+        }
+    };
+
+    let conn = match db::open_connection(&state.db_path) {
+        Ok(c) => c,
+        Err(e) => return Response::error(id, &format!("database error: {}", e)),
+    };
+
+    let project = match db::projects::get_project_by_name(&conn, &project_name) {
+        Ok(Some(p)) => p,
+        Ok(None) => {
+            return Response::error(
+                id,
+                &format!("NOT_FOUND: project '{}' not found", project_name),
+            );
+        }
+        Err(e) => return Response::error(id, &format!("database error: {}", e)),
+    };
+
+    let mut spec = match db::specs::get_spec_by_name(&conn, &project.id, &spec_name) {
+        Ok(Some(s)) => s,
+        Ok(None) => {
+            return Response::error(id, &format!("NOT_FOUND: spec '{}' not found", spec_name));
+        }
+        Err(e) => return Response::error(id, &format!("database error: {}", e)),
+    };
+
+    // If spec has active session, stop it first
+    if spec.session_active {
+        if let Err(e) = db::specs::update_spec_session(
+            &conn,
+            &spec.id,
+            false,
+            spec.claude_session_id.as_deref(),
+        ) {
+            return Response::error(id, &format!("database error: {}", e));
+        }
+        spec.session_active = false;
+    }
+
+    // Validate state machine transition
+    if let Err(e) = spec.approve() {
+        return Response::error(id, &format!("INVALID_STATE: {}", e));
+    }
+
+    // Persist status change
+    if let Err(e) = db::specs::update_spec_status(&conn, &spec.id, spec.status) {
+        return Response::error(id, &format!("database error: {}", e));
+    }
+
+    Response::ok(
+        id,
+        serde_json::json!({
+            "name": spec.name,
+            "status": spec.status.to_string(),
+        }),
+    )
+}
+
+/// Handle "spec.reopen" command.
+///
+/// Receives: { project_name, spec_name }
+/// Transitions approved -> draft (validates not decomposed).
+fn handle_spec_reopen(req: Request, state: &HandlerState) -> Response {
+    let id = req.id.clone();
+
+    let project_name = match req.params.get("project_name").and_then(|v| v.as_str()) {
+        Some(n) => n.to_string(),
+        None => {
+            return Response::error(id, "missing required parameter: project_name");
+        }
+    };
+
+    let spec_name = match req.params.get("spec_name").and_then(|v| v.as_str()) {
+        Some(n) => n.to_string(),
+        None => {
+            return Response::error(id, "missing required parameter: spec_name");
+        }
+    };
+
+    let conn = match db::open_connection(&state.db_path) {
+        Ok(c) => c,
+        Err(e) => return Response::error(id, &format!("database error: {}", e)),
+    };
+
+    let project = match db::projects::get_project_by_name(&conn, &project_name) {
+        Ok(Some(p)) => p,
+        Ok(None) => {
+            return Response::error(
+                id,
+                &format!("NOT_FOUND: project '{}' not found", project_name),
+            );
+        }
+        Err(e) => return Response::error(id, &format!("database error: {}", e)),
+    };
+
+    let mut spec = match db::specs::get_spec_by_name(&conn, &project.id, &spec_name) {
+        Ok(Some(s)) => s,
+        Ok(None) => {
+            return Response::error(id, &format!("NOT_FOUND: spec '{}' not found", spec_name));
+        }
+        Err(e) => return Response::error(id, &format!("database error: {}", e)),
+    };
+
+    // Validate state machine transition
+    if let Err(e) = spec.reopen() {
+        return Response::error(id, &format!("INVALID_STATE: {}", e));
+    }
+
+    // Persist status change
+    if let Err(e) = db::specs::update_spec_status(&conn, &spec.id, spec.status) {
+        return Response::error(id, &format!("database error: {}", e));
+    }
+
+    Response::ok(
+        id,
+        serde_json::json!({
+            "name": spec.name,
+            "status": spec.status.to_string(),
+        }),
+    )
+}
+
+/// Handle "spec.delete" command.
+///
+/// Receives: { project_name, spec_name, force? }
+/// Soft-delete: sets status to 'deleted', record remains in DB, markdown file preserved.
+/// - If draft with active session: stops session first.
+/// - If approved: requires force=true (confirmation).
+/// - If decomposed: fails (must discard wave first).
+fn handle_spec_delete(req: Request, state: &HandlerState) -> Response {
+    let id = req.id.clone();
+
+    let project_name = match req.params.get("project_name").and_then(|v| v.as_str()) {
+        Some(n) => n.to_string(),
+        None => {
+            return Response::error(id, "missing required parameter: project_name");
+        }
+    };
+
+    let spec_name = match req.params.get("spec_name").and_then(|v| v.as_str()) {
+        Some(n) => n.to_string(),
+        None => {
+            return Response::error(id, "missing required parameter: spec_name");
+        }
+    };
+
+    let force = req
+        .params
+        .get("force")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    let conn = match db::open_connection(&state.db_path) {
+        Ok(c) => c,
+        Err(e) => return Response::error(id, &format!("database error: {}", e)),
+    };
+
+    let project = match db::projects::get_project_by_name(&conn, &project_name) {
+        Ok(Some(p)) => p,
+        Ok(None) => {
+            return Response::error(
+                id,
+                &format!("NOT_FOUND: project '{}' not found", project_name),
+            );
+        }
+        Err(e) => return Response::error(id, &format!("database error: {}", e)),
+    };
+
+    let mut spec = match db::specs::get_spec_by_name(&conn, &project.id, &spec_name) {
+        Ok(Some(s)) => s,
+        Ok(None) => {
+            return Response::error(id, &format!("NOT_FOUND: spec '{}' not found", spec_name));
+        }
+        Err(e) => return Response::error(id, &format!("database error: {}", e)),
+    };
+
+    // If approved and no force: require confirmation
+    if spec.status == SpecStatus::Approved && !force {
+        return Response::error(
+            id,
+            "INVALID_STATE: spec is approved; use force=true to confirm deletion",
+        );
+    }
+
+    // If draft with active session: stop session first
+    if spec.session_active {
+        if let Err(e) = db::specs::update_spec_session(
+            &conn,
+            &spec.id,
+            false,
+            spec.claude_session_id.as_deref(),
+        ) {
+            return Response::error(id, &format!("database error: {}", e));
+        }
+        spec.session_active = false;
+    }
+
+    // Validate state machine transition (decomposed -> deleted fails)
+    if let Err(e) = spec.delete() {
+        return Response::error(id, &format!("INVALID_STATE: {}", e));
+    }
+
+    // Persist status change (soft-delete: record stays, file preserved)
+    if let Err(e) = db::specs::update_spec_status(&conn, &spec.id, spec.status) {
+        return Response::error(id, &format!("database error: {}", e));
+    }
+
+    Response::ok(
+        id,
+        serde_json::json!({
+            "name": spec.name,
+            "status": spec.status.to_string(),
+            "deleted": true,
+        }),
+    )
+}
+
+/// Handle "spec.resume" command — resume a spec session.
+///
+/// Receives: { project_name, spec_name? }
+/// If spec_name is provided, uses that spec. Otherwise finds latest draft.
+/// Validates session not active, starts Claude with --resume.
+fn handle_spec_resume(req: Request, state: &HandlerState) -> HandlerResult {
+    let id = req.id.clone();
+
+    let project_name = match req.params.get("project_name").and_then(|v| v.as_str()) {
+        Some(n) => n.to_string(),
+        None => {
+            return HandlerResult::Single(Response::error(
+                id,
+                "missing required parameter: project_name",
+            ));
+        }
+    };
+
+    let spec_name = req
+        .params
+        .get("spec_name")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+
+    let with_codebase = req
+        .params
+        .get("with_codebase")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+
+    let conn = match db::open_connection(&state.db_path) {
+        Ok(c) => c,
+        Err(e) => {
+            return HandlerResult::Single(Response::error(id, &format!("database error: {}", e)));
+        }
+    };
+
+    let project = match db::projects::get_project_by_name(&conn, &project_name) {
+        Ok(Some(p)) => p,
+        Ok(None) => {
+            return HandlerResult::Single(Response::error(
+                id,
+                &format!("NOT_FOUND: project '{}' not found", project_name),
+            ));
+        }
+        Err(e) => {
+            return HandlerResult::Single(Response::error(id, &format!("database error: {}", e)));
+        }
+    };
+
+    // Find the spec: by name or latest draft
+    let spec = if let Some(name) = &spec_name {
+        match db::specs::get_spec_by_name(&conn, &project.id, name) {
+            Ok(Some(s)) => s,
+            Ok(None) => {
+                return HandlerResult::Single(Response::error(
+                    id,
+                    &format!("NOT_FOUND: spec '{}' not found", name),
+                ));
+            }
+            Err(e) => {
+                return HandlerResult::Single(Response::error(
+                    id,
+                    &format!("database error: {}", e),
+                ));
+            }
+        }
+    } else {
+        match db::specs::find_latest_draft_spec(&conn, &project.id) {
+            Ok(Some(s)) => s,
+            Ok(None) => {
+                return HandlerResult::Single(Response::error(
+                    id,
+                    "NOT_FOUND: no draft spec found for this project",
+                ));
+            }
+            Err(e) => {
+                return HandlerResult::Single(Response::error(
+                    id,
+                    &format!("database error: {}", e),
+                ));
+            }
+        }
+    };
+
+    // Validate spec is a draft
+    if spec.status != SpecStatus::Draft {
+        return HandlerResult::Single(Response::error(
+            id,
+            &format!(
+                "INVALID_STATE: spec '{}' is {} (must be draft to resume)",
+                spec.name, spec.status
+            ),
+        ));
+    }
+
+    // Validate session not already active
+    if spec.session_active {
+        return HandlerResult::Single(Response::error(
+            id,
+            &format!(
+                "INVALID_STATE: spec '{}' already has an active session",
+                spec.name
+            ),
+        ));
+    }
+
+    // Must have a claude_session_id to resume
+    let claude_session_id = match &spec.claude_session_id {
+        Some(sid) => sid.clone(),
+        None => {
+            return HandlerResult::Single(Response::error(
+                id,
+                &format!(
+                    "INVALID_STATE: spec '{}' has no previous session to resume",
+                    spec.name
+                ),
+            ));
+        }
+    };
+
+    // Mark session as active
+    if let Err(e) = db::specs::update_spec_session(&conn, &spec.id, true, Some(&claude_session_id))
+    {
+        return HandlerResult::Single(Response::error(id, &format!("database error: {}", e)));
+    }
+
+    // Build RunConfig for resumed spec session
+    let nflow_home = match crate::daemon::nflow_home() {
+        Ok(h) => h,
+        Err(e) => {
+            return HandlerResult::Single(Response::error(
+                id,
+                &format!("failed to get nflow home: {}", e),
+            ));
+        }
+    };
+
+    let override_dir = nflow_home.join("prompts");
+    let override_path = if override_dir.is_dir() {
+        Some(override_dir)
+    } else {
+        None
+    };
+
+    let template =
+        match nflow_claude::prompt::load_template("spec_session", override_path.as_deref()) {
+            Ok(t) => t,
+            Err(e) => {
+                return HandlerResult::Single(Response::error(
+                    id,
+                    &format!("failed to load template: {}", e),
+                ));
+            }
+        };
+
+    let context = nflow_claude::context::build_spec_context(&spec, &project);
+    let vars: std::collections::HashMap<&str, &str> = context
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    let prompt = match nflow_claude::prompt::render_template(&template, &vars) {
+        Ok(p) => p,
+        Err(e) => {
+            return HandlerResult::Single(Response::error(
+                id,
+                &format!("failed to render template: {}", e),
+            ));
+        }
+    };
+
+    let working_dir = if with_codebase {
+        PathBuf::from(&project.path)
+    } else {
+        nflow_home
+            .join("projects")
+            .join(&project.name)
+            .join("specs")
+    };
+
+    let mut run_config = nflow_claude::runner::RunConfig::for_spec(prompt, with_codebase);
+    run_config.resume_session = Some(claude_session_id);
+    run_config.working_dir = Some(working_dir);
+    run_config.system_prompt_file = override_path.map(|d| d.join("spec_session.md"));
+
+    // Create streaming channel and spawn Claude streaming
+    let (tx, rx) = tokio::sync::mpsc::channel(64);
+    let spec_id = spec.id;
+    let spec_name_owned = spec.name.clone();
+    let spec_file_path_str = spec.file_path.clone();
+    let db_path = state.db_path.clone();
+
+    let initial_id = id.clone();
+    tokio::spawn(async move {
+        // Send initial response with spec info
+        let _ = tx
+            .send(StreamingResponseLine::data(
+                initial_id.clone(),
+                serde_json::json!({
+                    "spec_id": spec_id.to_string(),
+                    "name": spec_name_owned,
+                    "status": "draft",
+                    "resumed": true,
+                }),
+            ))
+            .await;
+
+        stream_claude_spec_session(
+            tx,
+            initial_id,
+            run_config,
+            spec_id,
+            &spec_file_path_str,
+            &db_path,
+        )
+        .await;
+    });
+
+    HandlerResult::Streaming(rx)
 }
 
 /// Check if a path is a git repository using synchronous git command.
@@ -2036,6 +2618,964 @@ mod tests {
         assert!(missing.is_none());
 
         drop(conn);
+        cleanup_db(&db_dir);
+    }
+
+    // --- Helper to insert a spec directly into the DB ---
+
+    fn insert_test_spec(
+        state: &HandlerState,
+        project_id: uuid::Uuid,
+        name: &str,
+        status: &str,
+        session_active: bool,
+    ) -> uuid::Uuid {
+        let conn = db::open_connection(&state.db_path).unwrap();
+        let spec_id = uuid::Uuid::new_v4();
+        conn.execute(
+            "INSERT INTO specs (id, project_id, name, file_path, status, session_active, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, '2024-01-01T00:00:00Z', '2024-01-01T00:00:00Z')",
+            rusqlite::params![
+                spec_id.to_string(),
+                project_id.to_string(),
+                name,
+                format!("/tmp/specs/{}.md", name),
+                status,
+                session_active,
+            ],
+        )
+        .unwrap();
+        spec_id
+    }
+
+    fn insert_test_spec_with_session(
+        state: &HandlerState,
+        project_id: uuid::Uuid,
+        name: &str,
+        status: &str,
+        session_active: bool,
+        claude_session_id: Option<&str>,
+    ) -> uuid::Uuid {
+        let conn = db::open_connection(&state.db_path).unwrap();
+        let spec_id = uuid::Uuid::new_v4();
+        conn.execute(
+            "INSERT INTO specs (id, project_id, name, file_path, status, session_active, claude_session_id, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, '2024-01-01T00:00:00Z', '2024-01-01T00:00:00Z')",
+            rusqlite::params![
+                spec_id.to_string(),
+                project_id.to_string(),
+                name,
+                format!("/tmp/specs/{}.md", name),
+                status,
+                session_active,
+                claude_session_id,
+            ],
+        )
+        .unwrap();
+        spec_id
+    }
+
+    // --- spec.list tests ---
+
+    #[test]
+    fn test_handle_spec_list_missing_project_name() {
+        let state = make_test_state();
+        let req = Request {
+            id: "100".to_string(),
+            command: "spec.list".to_string(),
+            params: serde_json::json!({}),
+        };
+        let result = handle_spec_list(req, &state);
+        assert_eq!(result.status, crate::socket::ResponseStatus::Error);
+        assert!(result.data["message"]
+            .as_str()
+            .unwrap()
+            .contains("missing required parameter: project_name"));
+    }
+
+    #[test]
+    fn test_handle_spec_list_project_not_found() {
+        let (state, db_dir) = make_db_state("spec_list_notfound");
+        let req = Request {
+            id: "101".to_string(),
+            command: "spec.list".to_string(),
+            params: serde_json::json!({ "project_name": "nonexistent" }),
+        };
+        let result = handle_spec_list(req, &state);
+        assert_eq!(result.status, crate::socket::ResponseStatus::Error);
+        assert!(result.data["message"]
+            .as_str()
+            .unwrap()
+            .contains("NOT_FOUND"));
+        cleanup_db(&db_dir);
+    }
+
+    #[test]
+    fn test_handle_spec_list_empty() {
+        let (state, db_dir) = make_db_state("spec_list_empty");
+        insert_test_project(&state, "empty-project");
+
+        let req = Request {
+            id: "102".to_string(),
+            command: "spec.list".to_string(),
+            params: serde_json::json!({ "project_name": "empty-project" }),
+        };
+        let result = handle_spec_list(req, &state);
+        assert_eq!(result.status, crate::socket::ResponseStatus::Ok);
+        let specs = result.data["specs"].as_array().unwrap();
+        assert!(specs.is_empty());
+        cleanup_db(&db_dir);
+    }
+
+    #[test]
+    fn test_handle_spec_list_returns_specs() {
+        let (state, db_dir) = make_db_state("spec_list_specs");
+        let project_id = insert_test_project(&state, "list-project");
+        insert_test_spec(&state, project_id, "alpha", "draft", false);
+        insert_test_spec(&state, project_id, "beta", "approved", false);
+
+        let req = Request {
+            id: "103".to_string(),
+            command: "spec.list".to_string(),
+            params: serde_json::json!({ "project_name": "list-project" }),
+        };
+        let result = handle_spec_list(req, &state);
+        assert_eq!(result.status, crate::socket::ResponseStatus::Ok);
+        let specs = result.data["specs"].as_array().unwrap();
+        assert_eq!(specs.len(), 2);
+        assert_eq!(specs[0]["name"], "alpha");
+        assert_eq!(specs[0]["status"], "draft");
+        assert_eq!(specs[1]["name"], "beta");
+        assert_eq!(specs[1]["status"], "approved");
+        cleanup_db(&db_dir);
+    }
+
+    #[test]
+    fn test_handle_spec_list_hides_deleted() {
+        let (state, db_dir) = make_db_state("spec_list_deleted");
+        let project_id = insert_test_project(&state, "delete-list-project");
+        insert_test_spec(&state, project_id, "visible", "draft", false);
+        insert_test_spec(&state, project_id, "hidden", "deleted", false);
+
+        let req = Request {
+            id: "104".to_string(),
+            command: "spec.list".to_string(),
+            params: serde_json::json!({ "project_name": "delete-list-project" }),
+        };
+        let result = handle_spec_list(req, &state);
+        assert_eq!(result.status, crate::socket::ResponseStatus::Ok);
+        let specs = result.data["specs"].as_array().unwrap();
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0]["name"], "visible");
+        cleanup_db(&db_dir);
+    }
+
+    #[test]
+    fn test_handle_spec_list_includes_session_active() {
+        let (state, db_dir) = make_db_state("spec_list_session");
+        let project_id = insert_test_project(&state, "session-list-project");
+        insert_test_spec(&state, project_id, "active-spec", "draft", true);
+
+        let req = Request {
+            id: "105".to_string(),
+            command: "spec.list".to_string(),
+            params: serde_json::json!({ "project_name": "session-list-project" }),
+        };
+        let result = handle_spec_list(req, &state);
+        assert_eq!(result.status, crate::socket::ResponseStatus::Ok);
+        let specs = result.data["specs"].as_array().unwrap();
+        assert_eq!(specs[0]["session_active"], true);
+        cleanup_db(&db_dir);
+    }
+
+    // --- spec.view tests ---
+
+    #[test]
+    fn test_handle_spec_view_missing_project_name() {
+        let state = make_test_state();
+        let req = Request {
+            id: "110".to_string(),
+            command: "spec.view".to_string(),
+            params: serde_json::json!({ "spec_name": "my-spec" }),
+        };
+        let result = handle_spec_view(req, &state);
+        assert_eq!(result.status, crate::socket::ResponseStatus::Error);
+        assert!(result.data["message"]
+            .as_str()
+            .unwrap()
+            .contains("missing required parameter: project_name"));
+    }
+
+    #[test]
+    fn test_handle_spec_view_missing_spec_name() {
+        let state = make_test_state();
+        let req = Request {
+            id: "111".to_string(),
+            command: "spec.view".to_string(),
+            params: serde_json::json!({ "project_name": "myproject" }),
+        };
+        let result = handle_spec_view(req, &state);
+        assert_eq!(result.status, crate::socket::ResponseStatus::Error);
+        assert!(result.data["message"]
+            .as_str()
+            .unwrap()
+            .contains("missing required parameter: spec_name"));
+    }
+
+    #[test]
+    fn test_handle_spec_view_spec_not_found() {
+        let (state, db_dir) = make_db_state("spec_view_notfound");
+        insert_test_project(&state, "view-project");
+
+        let req = Request {
+            id: "112".to_string(),
+            command: "spec.view".to_string(),
+            params: serde_json::json!({
+                "project_name": "view-project",
+                "spec_name": "nonexistent",
+            }),
+        };
+        let result = handle_spec_view(req, &state);
+        assert_eq!(result.status, crate::socket::ResponseStatus::Error);
+        assert!(result.data["message"]
+            .as_str()
+            .unwrap()
+            .contains("NOT_FOUND"));
+        cleanup_db(&db_dir);
+    }
+
+    #[test]
+    fn test_handle_spec_view_reads_file() {
+        let (state, db_dir) = make_db_state("spec_view_read");
+        let project_id = insert_test_project(&state, "view-read-project");
+
+        // Create a temp spec file
+        let spec_dir =
+            std::env::temp_dir().join(format!("nflow_spec_view_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&spec_dir).unwrap();
+        let spec_file = spec_dir.join("my-spec.md");
+        std::fs::write(&spec_file, "# My Spec\n\nSome content here.").unwrap();
+
+        // Insert spec with correct file_path
+        let conn = db::open_connection(&state.db_path).unwrap();
+        let spec_id = uuid::Uuid::new_v4();
+        conn.execute(
+            "INSERT INTO specs (id, project_id, name, file_path, status, session_active, created_at, updated_at)
+             VALUES (?1, ?2, 'my-spec', ?3, 'draft', 0, '2024-01-01', '2024-01-01')",
+            rusqlite::params![spec_id.to_string(), project_id.to_string(), spec_file.to_string_lossy().to_string()],
+        ).unwrap();
+        drop(conn);
+
+        let req = Request {
+            id: "113".to_string(),
+            command: "spec.view".to_string(),
+            params: serde_json::json!({
+                "project_name": "view-read-project",
+                "spec_name": "my-spec",
+            }),
+        };
+        let result = handle_spec_view(req, &state);
+        assert_eq!(
+            result.status,
+            crate::socket::ResponseStatus::Ok,
+            "Expected Ok but got error: {:?}",
+            result.data
+        );
+        assert_eq!(result.data["name"], "my-spec");
+        assert_eq!(result.data["status"], "draft");
+        assert_eq!(result.data["content"], "# My Spec\n\nSome content here.");
+
+        let _ = std::fs::remove_dir_all(&spec_dir);
+        cleanup_db(&db_dir);
+    }
+
+    #[test]
+    fn test_handle_spec_view_file_not_found() {
+        let (state, db_dir) = make_db_state("spec_view_nofile");
+        let project_id = insert_test_project(&state, "nofile-project");
+        insert_test_spec(&state, project_id, "no-file-spec", "draft", false);
+
+        let req = Request {
+            id: "114".to_string(),
+            command: "spec.view".to_string(),
+            params: serde_json::json!({
+                "project_name": "nofile-project",
+                "spec_name": "no-file-spec",
+            }),
+        };
+        let result = handle_spec_view(req, &state);
+        assert_eq!(result.status, crate::socket::ResponseStatus::Error);
+        assert!(result.data["message"]
+            .as_str()
+            .unwrap()
+            .contains("failed to read spec file"));
+        cleanup_db(&db_dir);
+    }
+
+    // --- spec.approve tests ---
+
+    #[test]
+    fn test_handle_spec_approve_missing_params() {
+        let state = make_test_state();
+        let req = Request {
+            id: "120".to_string(),
+            command: "spec.approve".to_string(),
+            params: serde_json::json!({}),
+        };
+        let result = handle_spec_approve(req, &state);
+        assert_eq!(result.status, crate::socket::ResponseStatus::Error);
+        assert!(result.data["message"]
+            .as_str()
+            .unwrap()
+            .contains("missing required parameter: project_name"));
+    }
+
+    #[test]
+    fn test_handle_spec_approve_draft_to_approved() {
+        let (state, db_dir) = make_db_state("spec_approve_success");
+        let project_id = insert_test_project(&state, "approve-project");
+        insert_test_spec(&state, project_id, "my-spec", "draft", false);
+
+        let req = Request {
+            id: "121".to_string(),
+            command: "spec.approve".to_string(),
+            params: serde_json::json!({
+                "project_name": "approve-project",
+                "spec_name": "my-spec",
+            }),
+        };
+        let result = handle_spec_approve(req, &state);
+        assert_eq!(
+            result.status,
+            crate::socket::ResponseStatus::Ok,
+            "Expected Ok but got error: {:?}",
+            result.data
+        );
+        assert_eq!(result.data["name"], "my-spec");
+        assert_eq!(result.data["status"], "approved");
+
+        // Verify DB
+        let conn = db::open_connection(&state.db_path).unwrap();
+        let spec = db::specs::get_spec_by_name(&conn, &project_id, "my-spec")
+            .unwrap()
+            .unwrap();
+        assert_eq!(spec.status, SpecStatus::Approved);
+        cleanup_db(&db_dir);
+    }
+
+    #[test]
+    fn test_handle_spec_approve_already_approved() {
+        let (state, db_dir) = make_db_state("spec_approve_already");
+        let project_id = insert_test_project(&state, "already-approved-project");
+        insert_test_spec(&state, project_id, "approved-spec", "approved", false);
+
+        let req = Request {
+            id: "122".to_string(),
+            command: "spec.approve".to_string(),
+            params: serde_json::json!({
+                "project_name": "already-approved-project",
+                "spec_name": "approved-spec",
+            }),
+        };
+        let result = handle_spec_approve(req, &state);
+        assert_eq!(result.status, crate::socket::ResponseStatus::Error);
+        assert!(result.data["message"]
+            .as_str()
+            .unwrap()
+            .contains("INVALID_STATE"));
+        cleanup_db(&db_dir);
+    }
+
+    #[test]
+    fn test_handle_spec_approve_stops_active_session() {
+        let (state, db_dir) = make_db_state("spec_approve_session");
+        let project_id = insert_test_project(&state, "approve-session-project");
+        insert_test_spec_with_session(
+            &state,
+            project_id,
+            "active-spec",
+            "draft",
+            true,
+            Some("session-123"),
+        );
+
+        let req = Request {
+            id: "123".to_string(),
+            command: "spec.approve".to_string(),
+            params: serde_json::json!({
+                "project_name": "approve-session-project",
+                "spec_name": "active-spec",
+            }),
+        };
+        let result = handle_spec_approve(req, &state);
+        assert_eq!(
+            result.status,
+            crate::socket::ResponseStatus::Ok,
+            "Expected Ok but got error: {:?}",
+            result.data
+        );
+        assert_eq!(result.data["status"], "approved");
+
+        // Verify session was stopped
+        let conn = db::open_connection(&state.db_path).unwrap();
+        let spec = db::specs::get_spec_by_name(&conn, &project_id, "active-spec")
+            .unwrap()
+            .unwrap();
+        assert!(!spec.session_active);
+        assert_eq!(spec.status, SpecStatus::Approved);
+        cleanup_db(&db_dir);
+    }
+
+    // --- spec.reopen tests ---
+
+    #[test]
+    fn test_handle_spec_reopen_approved_to_draft() {
+        let (state, db_dir) = make_db_state("spec_reopen_success");
+        let project_id = insert_test_project(&state, "reopen-project");
+        insert_test_spec(&state, project_id, "my-spec", "approved", false);
+
+        let req = Request {
+            id: "130".to_string(),
+            command: "spec.reopen".to_string(),
+            params: serde_json::json!({
+                "project_name": "reopen-project",
+                "spec_name": "my-spec",
+            }),
+        };
+        let result = handle_spec_reopen(req, &state);
+        assert_eq!(
+            result.status,
+            crate::socket::ResponseStatus::Ok,
+            "Expected Ok but got error: {:?}",
+            result.data
+        );
+        assert_eq!(result.data["name"], "my-spec");
+        assert_eq!(result.data["status"], "draft");
+
+        // Verify DB
+        let conn = db::open_connection(&state.db_path).unwrap();
+        let spec = db::specs::get_spec_by_name(&conn, &project_id, "my-spec")
+            .unwrap()
+            .unwrap();
+        assert_eq!(spec.status, SpecStatus::Draft);
+        cleanup_db(&db_dir);
+    }
+
+    #[test]
+    fn test_handle_spec_reopen_from_draft_fails() {
+        let (state, db_dir) = make_db_state("spec_reopen_draft");
+        let project_id = insert_test_project(&state, "reopen-draft-project");
+        insert_test_spec(&state, project_id, "draft-spec", "draft", false);
+
+        let req = Request {
+            id: "131".to_string(),
+            command: "spec.reopen".to_string(),
+            params: serde_json::json!({
+                "project_name": "reopen-draft-project",
+                "spec_name": "draft-spec",
+            }),
+        };
+        let result = handle_spec_reopen(req, &state);
+        assert_eq!(result.status, crate::socket::ResponseStatus::Error);
+        assert!(result.data["message"]
+            .as_str()
+            .unwrap()
+            .contains("INVALID_STATE"));
+        cleanup_db(&db_dir);
+    }
+
+    #[test]
+    fn test_handle_spec_reopen_from_decomposed_fails() {
+        let (state, db_dir) = make_db_state("spec_reopen_decomposed");
+        let project_id = insert_test_project(&state, "reopen-decomposed-project");
+        insert_test_spec(&state, project_id, "decomposed-spec", "decomposed", false);
+
+        let req = Request {
+            id: "132".to_string(),
+            command: "spec.reopen".to_string(),
+            params: serde_json::json!({
+                "project_name": "reopen-decomposed-project",
+                "spec_name": "decomposed-spec",
+            }),
+        };
+        let result = handle_spec_reopen(req, &state);
+        assert_eq!(result.status, crate::socket::ResponseStatus::Error);
+        assert!(result.data["message"]
+            .as_str()
+            .unwrap()
+            .contains("INVALID_STATE"));
+        cleanup_db(&db_dir);
+    }
+
+    // --- spec.delete tests ---
+
+    #[test]
+    fn test_handle_spec_delete_draft() {
+        let (state, db_dir) = make_db_state("spec_delete_draft");
+        let project_id = insert_test_project(&state, "delete-draft-project");
+        insert_test_spec(&state, project_id, "draft-spec", "draft", false);
+
+        let req = Request {
+            id: "140".to_string(),
+            command: "spec.delete".to_string(),
+            params: serde_json::json!({
+                "project_name": "delete-draft-project",
+                "spec_name": "draft-spec",
+            }),
+        };
+        let result = handle_spec_delete(req, &state);
+        assert_eq!(
+            result.status,
+            crate::socket::ResponseStatus::Ok,
+            "Expected Ok but got error: {:?}",
+            result.data
+        );
+        assert_eq!(result.data["name"], "draft-spec");
+        assert_eq!(result.data["status"], "deleted");
+        assert_eq!(result.data["deleted"], true);
+
+        // Verify DB (record still exists with status=deleted)
+        let conn = db::open_connection(&state.db_path).unwrap();
+        let spec = db::specs::get_spec_by_name(&conn, &project_id, "draft-spec")
+            .unwrap()
+            .unwrap();
+        assert_eq!(spec.status, SpecStatus::Deleted);
+        cleanup_db(&db_dir);
+    }
+
+    #[test]
+    fn test_handle_spec_delete_approved_without_force() {
+        let (state, db_dir) = make_db_state("spec_delete_approved_noforce");
+        let project_id = insert_test_project(&state, "approved-noforce-project");
+        insert_test_spec(&state, project_id, "approved-spec", "approved", false);
+
+        let req = Request {
+            id: "141".to_string(),
+            command: "spec.delete".to_string(),
+            params: serde_json::json!({
+                "project_name": "approved-noforce-project",
+                "spec_name": "approved-spec",
+            }),
+        };
+        let result = handle_spec_delete(req, &state);
+        assert_eq!(result.status, crate::socket::ResponseStatus::Error);
+        assert!(result.data["message"]
+            .as_str()
+            .unwrap()
+            .contains("INVALID_STATE"));
+        assert!(result.data["message"]
+            .as_str()
+            .unwrap()
+            .contains("force=true"));
+        cleanup_db(&db_dir);
+    }
+
+    #[test]
+    fn test_handle_spec_delete_approved_with_force() {
+        let (state, db_dir) = make_db_state("spec_delete_approved_force");
+        let project_id = insert_test_project(&state, "approved-force-project");
+        insert_test_spec(&state, project_id, "approved-spec", "approved", false);
+
+        let req = Request {
+            id: "142".to_string(),
+            command: "spec.delete".to_string(),
+            params: serde_json::json!({
+                "project_name": "approved-force-project",
+                "spec_name": "approved-spec",
+                "force": true,
+            }),
+        };
+        let result = handle_spec_delete(req, &state);
+        assert_eq!(
+            result.status,
+            crate::socket::ResponseStatus::Ok,
+            "Expected Ok but got error: {:?}",
+            result.data
+        );
+        assert_eq!(result.data["status"], "deleted");
+        cleanup_db(&db_dir);
+    }
+
+    #[test]
+    fn test_handle_spec_delete_decomposed_fails() {
+        let (state, db_dir) = make_db_state("spec_delete_decomposed");
+        let project_id = insert_test_project(&state, "decomposed-del-project");
+        insert_test_spec(&state, project_id, "decomposed-spec", "decomposed", false);
+
+        let req = Request {
+            id: "143".to_string(),
+            command: "spec.delete".to_string(),
+            params: serde_json::json!({
+                "project_name": "decomposed-del-project",
+                "spec_name": "decomposed-spec",
+                "force": true,
+            }),
+        };
+        let result = handle_spec_delete(req, &state);
+        assert_eq!(result.status, crate::socket::ResponseStatus::Error);
+        assert!(result.data["message"]
+            .as_str()
+            .unwrap()
+            .contains("INVALID_STATE"));
+        cleanup_db(&db_dir);
+    }
+
+    #[test]
+    fn test_handle_spec_delete_stops_active_session() {
+        let (state, db_dir) = make_db_state("spec_delete_session");
+        let project_id = insert_test_project(&state, "del-session-project");
+        insert_test_spec_with_session(
+            &state,
+            project_id,
+            "active-spec",
+            "draft",
+            true,
+            Some("session-abc"),
+        );
+
+        let req = Request {
+            id: "144".to_string(),
+            command: "spec.delete".to_string(),
+            params: serde_json::json!({
+                "project_name": "del-session-project",
+                "spec_name": "active-spec",
+            }),
+        };
+        let result = handle_spec_delete(req, &state);
+        assert_eq!(
+            result.status,
+            crate::socket::ResponseStatus::Ok,
+            "Expected Ok but got error: {:?}",
+            result.data
+        );
+
+        // Verify session was stopped and spec is deleted
+        let conn = db::open_connection(&state.db_path).unwrap();
+        let spec = db::specs::get_spec_by_name(&conn, &project_id, "active-spec")
+            .unwrap()
+            .unwrap();
+        assert!(!spec.session_active);
+        assert_eq!(spec.status, SpecStatus::Deleted);
+        cleanup_db(&db_dir);
+    }
+
+    // --- spec.resume tests ---
+
+    #[test]
+    fn test_handle_spec_resume_missing_project_name() {
+        let state = make_test_state();
+        let req = Request {
+            id: "150".to_string(),
+            command: "spec.resume".to_string(),
+            params: serde_json::json!({}),
+        };
+        match handle_spec_resume(req, &state) {
+            HandlerResult::Single(resp) => {
+                assert_eq!(resp.status, crate::socket::ResponseStatus::Error);
+                assert!(resp.data["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("missing required parameter: project_name"));
+            }
+            _ => panic!("expected Single response for error"),
+        }
+    }
+
+    #[test]
+    fn test_handle_spec_resume_no_draft_spec() {
+        let (state, db_dir) = make_db_state("spec_resume_nodraft");
+        insert_test_project(&state, "nodraft-project");
+
+        let req = Request {
+            id: "151".to_string(),
+            command: "spec.resume".to_string(),
+            params: serde_json::json!({ "project_name": "nodraft-project" }),
+        };
+        match handle_spec_resume(req, &state) {
+            HandlerResult::Single(resp) => {
+                assert_eq!(resp.status, crate::socket::ResponseStatus::Error);
+                assert!(resp.data["message"].as_str().unwrap().contains("NOT_FOUND"));
+                assert!(resp.data["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("no draft spec"));
+            }
+            _ => panic!("expected Single response for error"),
+        }
+        cleanup_db(&db_dir);
+    }
+
+    #[test]
+    fn test_handle_spec_resume_session_already_active() {
+        let (state, db_dir) = make_db_state("spec_resume_active");
+        let project_id = insert_test_project(&state, "resume-active-project");
+        insert_test_spec_with_session(
+            &state,
+            project_id,
+            "active-spec",
+            "draft",
+            true,
+            Some("session-123"),
+        );
+
+        let req = Request {
+            id: "152".to_string(),
+            command: "spec.resume".to_string(),
+            params: serde_json::json!({
+                "project_name": "resume-active-project",
+                "spec_name": "active-spec",
+            }),
+        };
+        match handle_spec_resume(req, &state) {
+            HandlerResult::Single(resp) => {
+                assert_eq!(resp.status, crate::socket::ResponseStatus::Error);
+                assert!(resp.data["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("INVALID_STATE"));
+                assert!(resp.data["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("already has an active session"));
+            }
+            _ => panic!("expected Single response for error"),
+        }
+        cleanup_db(&db_dir);
+    }
+
+    #[test]
+    fn test_handle_spec_resume_no_previous_session() {
+        let (state, db_dir) = make_db_state("spec_resume_nosession");
+        let project_id = insert_test_project(&state, "nosession-resume-project");
+        insert_test_spec(&state, project_id, "no-session-spec", "draft", false);
+
+        let req = Request {
+            id: "153".to_string(),
+            command: "spec.resume".to_string(),
+            params: serde_json::json!({
+                "project_name": "nosession-resume-project",
+                "spec_name": "no-session-spec",
+            }),
+        };
+        match handle_spec_resume(req, &state) {
+            HandlerResult::Single(resp) => {
+                assert_eq!(resp.status, crate::socket::ResponseStatus::Error);
+                assert!(resp.data["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("INVALID_STATE"));
+                assert!(resp.data["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("no previous session"));
+            }
+            _ => panic!("expected Single response for error"),
+        }
+        cleanup_db(&db_dir);
+    }
+
+    #[test]
+    fn test_handle_spec_resume_non_draft_fails() {
+        let (state, db_dir) = make_db_state("spec_resume_approved");
+        let project_id = insert_test_project(&state, "approved-resume-project");
+        insert_test_spec_with_session(
+            &state,
+            project_id,
+            "approved-spec",
+            "approved",
+            false,
+            Some("session-123"),
+        );
+
+        let req = Request {
+            id: "154".to_string(),
+            command: "spec.resume".to_string(),
+            params: serde_json::json!({
+                "project_name": "approved-resume-project",
+                "spec_name": "approved-spec",
+            }),
+        };
+        match handle_spec_resume(req, &state) {
+            HandlerResult::Single(resp) => {
+                assert_eq!(resp.status, crate::socket::ResponseStatus::Error);
+                assert!(resp.data["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("INVALID_STATE"));
+                assert!(resp.data["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("must be draft"));
+            }
+            _ => panic!("expected Single response for error"),
+        }
+        cleanup_db(&db_dir);
+    }
+
+    #[tokio::test]
+    async fn test_handle_spec_resume_returns_streaming() {
+        let (state, db_dir) = make_db_state("spec_resume_streaming");
+        let project_id = insert_test_project(&state, "resume-streaming-project");
+        insert_test_spec_with_session(
+            &state,
+            project_id,
+            "resume-spec",
+            "draft",
+            false,
+            Some("session-abc"),
+        );
+
+        let req = Request {
+            id: "155".to_string(),
+            command: "spec.resume".to_string(),
+            params: serde_json::json!({
+                "project_name": "resume-streaming-project",
+                "spec_name": "resume-spec",
+            }),
+        };
+
+        match handle_spec_resume(req, &state) {
+            HandlerResult::Streaming(_rx) => {
+                // Success — handler accepted and started streaming
+                // Verify session was marked active in DB
+                let conn = db::open_connection(&state.db_path).unwrap();
+                let spec = db::specs::get_spec_by_name(&conn, &project_id, "resume-spec")
+                    .unwrap()
+                    .unwrap();
+                assert!(spec.session_active);
+            }
+            HandlerResult::Single(resp) => {
+                panic!(
+                    "expected Streaming response but got Single: {:?}",
+                    resp.data
+                );
+            }
+        }
+        cleanup_db(&db_dir);
+    }
+
+    // --- dispatch tests for new commands ---
+
+    #[test]
+    fn test_dispatch_spec_list() {
+        let (state, db_dir) = make_db_state("dispatch_spec_list");
+        insert_test_project(&state, "dispatch-list-project");
+        let req = Request {
+            id: "160".to_string(),
+            command: "spec.list".to_string(),
+            params: serde_json::json!({ "project_name": "dispatch-list-project" }),
+        };
+        match dispatch(req, &state) {
+            HandlerResult::Single(resp) => {
+                assert_eq!(resp.status, crate::socket::ResponseStatus::Ok);
+            }
+            _ => panic!("expected Single response"),
+        }
+        cleanup_db(&db_dir);
+    }
+
+    #[test]
+    fn test_dispatch_spec_approve() {
+        let (state, db_dir) = make_db_state("dispatch_spec_approve");
+        let req = Request {
+            id: "161".to_string(),
+            command: "spec.approve".to_string(),
+            params: serde_json::json!({}),
+        };
+        match dispatch(req, &state) {
+            HandlerResult::Single(resp) => {
+                assert_eq!(resp.status, crate::socket::ResponseStatus::Error);
+                assert!(resp.data["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("missing required parameter"));
+            }
+            _ => panic!("expected Single response"),
+        }
+        cleanup_db(&db_dir);
+    }
+
+    #[test]
+    fn test_dispatch_spec_reopen() {
+        let (state, db_dir) = make_db_state("dispatch_spec_reopen");
+        let req = Request {
+            id: "162".to_string(),
+            command: "spec.reopen".to_string(),
+            params: serde_json::json!({}),
+        };
+        match dispatch(req, &state) {
+            HandlerResult::Single(resp) => {
+                assert_eq!(resp.status, crate::socket::ResponseStatus::Error);
+                assert!(resp.data["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("missing required parameter"));
+            }
+            _ => panic!("expected Single response"),
+        }
+        cleanup_db(&db_dir);
+    }
+
+    #[test]
+    fn test_dispatch_spec_delete() {
+        let (state, db_dir) = make_db_state("dispatch_spec_delete");
+        let req = Request {
+            id: "163".to_string(),
+            command: "spec.delete".to_string(),
+            params: serde_json::json!({}),
+        };
+        match dispatch(req, &state) {
+            HandlerResult::Single(resp) => {
+                assert_eq!(resp.status, crate::socket::ResponseStatus::Error);
+                assert!(resp.data["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("missing required parameter"));
+            }
+            _ => panic!("expected Single response"),
+        }
+        cleanup_db(&db_dir);
+    }
+
+    #[test]
+    fn test_dispatch_spec_view() {
+        let (state, db_dir) = make_db_state("dispatch_spec_view");
+        let req = Request {
+            id: "164".to_string(),
+            command: "spec.view".to_string(),
+            params: serde_json::json!({}),
+        };
+        match dispatch(req, &state) {
+            HandlerResult::Single(resp) => {
+                assert_eq!(resp.status, crate::socket::ResponseStatus::Error);
+                assert!(resp.data["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("missing required parameter"));
+            }
+            _ => panic!("expected Single response"),
+        }
+        cleanup_db(&db_dir);
+    }
+
+    #[test]
+    fn test_dispatch_spec_resume() {
+        let (state, db_dir) = make_db_state("dispatch_spec_resume");
+        let req = Request {
+            id: "165".to_string(),
+            command: "spec.resume".to_string(),
+            params: serde_json::json!({}),
+        };
+        match dispatch(req, &state) {
+            HandlerResult::Single(resp) => {
+                assert_eq!(resp.status, crate::socket::ResponseStatus::Error);
+                assert!(resp.data["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("missing required parameter"));
+            }
+            _ => panic!("expected Single response for missing param"),
+        }
         cleanup_db(&db_dir);
     }
 }
