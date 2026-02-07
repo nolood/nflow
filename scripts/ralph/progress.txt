@@ -780,3 +780,21 @@ Started: Sat Feb  7 03:49:10 PM MSK 2026
   - CliNotFound is a separate error variant from CommandFailed — distinguishes "tool missing" from "tool failed"
   - check_cli_available and check_gh_auth are private helpers — only create_github_pr is public API
 ---
+
+## 2026-02-07 - US-031
+- What was implemented: MR/PR creation — GitLab in nflow-git
+  - check_glab_auth(worktree_path) async helper: runs `glab auth status` to verify authentication, returns AuthError with details
+  - create_gitlab_mr(worktree_path, title, body, base_branch) -> Result<String>: creates MR via `glab mr create`, returns MR URL
+  - Uses `--title`, `--description`, `--target-branch` flags for glab mr create
+  - Validates git repo, glab availability, and glab auth before attempting MR creation
+  - Parses MR URL from glab stdout (finds http/https URL line, falls back to trimmed stdout)
+  - Classifies glab mr create errors: auth errors (authentication/not logged in/auth login) vs generic command failures
+  - 5 new tests (79 nflow-git total) covering CLI availability, not-a-repo, glab-not-installed, auth check, error messages
+- Files changed:
+  - crates/nflow-git/src/mr.rs (added check_glab_auth, create_gitlab_mr + tests)
+- **Learnings for future iterations:**
+  - glab uses `--description` for MR body (not `--body` like gh)
+  - glab mr create may output extra text before the URL — scan lines for http(s):// prefix
+  - Same auth error classification pattern works for both gh and glab (authentication/not logged in/auth login keywords)
+  - cargo fmt collapses single-line map_err closures when they fit — don't manually break them
+---
