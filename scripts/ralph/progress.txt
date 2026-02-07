@@ -32,6 +32,8 @@
 - TUI terminal setup/restore pattern: setup() enters raw mode + alternate screen, restore() undoes both — always call restore on exit
 - nix crate for TUI needs features = ["signal", "process", "fs"] (fs for Flock/FlockArg)
 - TUI overlay pattern: Overlay enum + App.toggle_overlay()/close_overlay()/has_overlay(); Esc closes any overlay; navigation keys guarded with `if !app.has_overlay()`
+- TUI view-specific keys: handle_key_event returns (bool, ViewAction); handle_view_key dispatches by current_view to per-view handler (handle_specs_key etc.)
+- TUI list state pattern: XxxListState struct with items Vec, selected usize, select_prev/select_next, update_from_response
 - centered_rect(percent_x, percent_y, area) computes a centered Rect for popup overlays; use Clear widget before rendering popup
 - Story completion lifecycle: rebase → push → MR creation → DB update → worktree cleanup → event broadcast (all in execute_complete_story)
 - On any failure during story completion (rebase/push/MR), story is rolled back to Failed status via fail_story_on_completion_error()
@@ -1926,4 +1928,30 @@ Started: Sat Feb  7 03:49:10 PM MSK 2026
   - `Wrap { trim: false }` needed for help overlay text to not trim leading whitespace
   - Overlay toggle pattern: same overlay → close, different overlay → switch to new one
   - `?` key works even with overlay open (always toggles help), but `p` and `/` are blocked by overlays
+---
+
+## 2026-02-08 - US-076
+- What was implemented: TUI specs list view with table display, navigation, and action keybindings
+  - `SpecItem` struct and `SpecsListState` for managing spec list data and selection
+  - `update_from_response()` parses daemon `spec.list` JSON response into spec items
+  - Table rendering with columns: Name, Status, Created (date-only timestamp)
+  - Status shown with colored badge: draft (yellow), approved (green), decomposed (blue)
+  - Arrow keys (Up/Down) and j/k for navigation with highlighted selection (DarkGray background, bold name)
+  - Action keybindings: n (new), a (approve), d (delete), v (view), r (resume) — return ViewAction enum
+  - `ViewAction` enum decouples key events from async daemon commands (future stories handle the actions)
+  - `handle_key_event` now returns `(bool, ViewAction)` tuple — refactored from plain bool
+  - `handle_view_key` dispatches to view-specific handlers based on current view
+  - Empty state: shows "No specs found" message with keybinding hints
+  - `fetch_specs()` sends `spec.list` command to daemon on initial connect
+  - 17 new tests (41 total): navigation, action keybindings, overlay blocking, view-specific key dispatch
+- Files changed:
+  - crates/nflow-tui/src/app.rs (SpecItem, SpecsListState, specs_list field, fetch_specs, 8 new tests)
+  - crates/nflow-tui/src/event.rs (ViewAction enum, handle_view_key, handle_specs_key, 9 new tests)
+  - crates/nflow-tui/src/ui.rs (render_specs_list, status_color, format_timestamp, Table widget)
+  - crates/nflow-tui/src/main.rs (handle_key_event tuple destructuring)
+- **Learnings for future iterations:**
+  - ratatui `Table` widget needs `Row::new(vec![Line::from(...)])` — rows contain Lines not plain strings for styled content
+  - `handle_key_event` returning `(bool, ViewAction)` cleanly separates sync state updates from async daemon operations
+  - Selection clamping in `update_from_response()` prevents out-of-bounds after refresh with fewer items
+  - View-specific keys routed through `handle_view_key` → per-view handler — extensible for Plan/Execute/Logs views
 ---
