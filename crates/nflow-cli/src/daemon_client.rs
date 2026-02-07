@@ -25,8 +25,13 @@ pub fn pid_file_path() -> Result<PathBuf> {
     Ok(nflow_home()?.join("daemon.pid"))
 }
 
-/// Returns the path to the daemon socket (~/.nflow/nflow.sock).
+/// Returns the path to the daemon socket.
+///
+/// Uses `NFLOW_SOCKET` env var if set, otherwise `~/.nflow/nflow.sock`.
 pub fn socket_path() -> Result<PathBuf> {
+    if let Ok(override_path) = env::var("NFLOW_SOCKET") {
+        return Ok(PathBuf::from(override_path));
+    }
     Ok(nflow_home()?.join("nflow.sock"))
 }
 

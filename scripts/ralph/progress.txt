@@ -1,4 +1,8 @@
 ## Codebase Patterns
+- SocketClient::connect_to(path) for tests; SocketClient::connect() uses socket_path() (supports NFLOW_SOCKET env override) for production
+- Protocol types duplicated in CLI (not shared with daemon crate) — keeps CLI independent of daemon internals
+- Tests using Unix sockets must use unique socket paths per test, NOT env var overrides (parallel test execution races on shared env vars)
+- command_timeout() maps command prefix to timeout: spec./plan. → 300s, others → 60s
 - CLI uses clap::Parser with nested Subcommand enums: Cli → Commands → DaemonCommand/SpecCommand/PlanCommand/etc. Global flags use `#[arg(global = true)]`
 - Filesystem security: ~/.nflow/ created with 0700, enforce_dir_permissions() checks & fixes too-open dirs, socket 0600, DB inherits from dir
 - Config files: global at ~/.nflow/config.toml, per-project at ~/.nflow/projects/{name}/config.toml — both use TOML format with PartialConfig struct
@@ -1774,4 +1778,25 @@ Started: Sat Feb  7 03:49:10 PM MSK 2026
   - clap global flags propagate to all subcommands with `#[arg(global = true)]`
   - Nested subcommands use `#[command(subcommand)]` attribute on the enum variant
   - Command dispatch to daemon will map CLI commands → daemon command strings (e.g., `nflow spec new` → `"spec.new"`)
+---
+
+## 2026-02-08 - US-070
+- What was implemented: CLI socket client for communicating with the nflow daemon
+  - SocketClient with connect()/connect_to() — Unix socket connection with 5s timeout
+  - Protocol handshake (NDJSON, protocol_version: 1) with version verification
+  - send_command() — UUID-tagged request/response with configurable timeouts (60s default, 300s for spec/plan)
+  - send_streaming_command() — returns StreamingReader that yields lines until done:true
+  - NFLOW_SOCKET env var override for socket path in daemon_client::socket_path()
+  - Protocol types (Handshake, Request, Response, StreamingResponseLine, ResponseStatus) duplicated from daemon for independence
+  - 8 tests: socket not found, handshake + command, version mismatch, command timeout, error response, streaming, connection closed, multiple requests
+- Files changed:
+  - crates/nflow-cli/Cargo.toml (added uuid dependency)
+  - crates/nflow-cli/src/socket_client.rs (new — complete socket client module)
+  - crates/nflow-cli/src/daemon_client.rs (updated — NFLOW_SOCKET env var support in socket_path())
+  - crates/nflow-cli/src/main.rs (updated — registered socket_client module)
+- **Learnings for future iterations:**
+  - Tests using env vars for socket paths race in parallel — use connect_to(path) with unique temp paths instead
+  - Protocol types should be duplicated in CLI crate (not shared) to avoid coupling CLI to daemon internals
+  - tokio split stream: need both read_half and write_half for full-duplex socket communication
+  - Debug derive doesn't work on BufReader<ReadHalf<UnixStream>> — use manual Debug impl with finish_non_exhaustive()
 ---
