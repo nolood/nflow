@@ -77,6 +77,9 @@
 - for_decompose takes working_dir as param (caller decides project root vs specs dir based on with_codebase)
 - StreamEvent uses flat union pattern: one RawEvent struct with all-optional fields, dispatch on `type` field
 - Use `printf` in async tokio tests for piping multi-line content to child stdout (echo doesn't handle \n in args)
+- Signal handlers must be extern "C" fn(c_int) — use global AtomicBool statics for shutdown signaling
+- libc crate needed for c_int type in signal handler signatures
+- std::io::Error::other() preferred over std::io::Error::new(ErrorKind::Other, ...) in Rust 1.92+
 
 # Ralph Progress Log
 Started: Sat Feb  7 03:49:10 PM MSK 2026
@@ -840,4 +843,60 @@ Started: Sat Feb  7 03:49:10 PM MSK 2026
   - std::mem::forget(file) keeps the log file handle alive after dup2 — prevents fd from being closed when File drops
   - Use signal 0 (`kill(pid, None)`) to check if a process is alive — ESRCH means dead, EPERM means alive but no permission
   - NFLOW_DAEMON_MODE env var distinguishes background vs foreground — set by spawn_daemon, read in main
+- SHUTDOWN_FLAG is a global AtomicBool for async-signal-safe shutdown signaling from signal handlers
+- extern "C" signal handlers can only use async-signal-safe operations — AtomicBool::store is safe
+- libc crate needed for signal handler `c_int` parameter type
+- AtomicPtr::store does NOT need unsafe — only the signal handler installation itself is unsafe
+- std::io::Error::other() is preferred over std::io::Error::new(ErrorKind::Other, ...) in Rust 1.92+
+- nix::fcntl::Flock<File> is the RAII flock wrapper — deprecated flock() function should not be used
+- Flock::lock() error returns (File, Errno) tuple; on Linux EAGAIN==EWOULDBLOCK for contention
+- CLI daemon_client module mirrors daemon.rs path helpers — same conventions, different error types
+---
+
+## 2026-02-07 - US-034
+- What was implemented: Daemon foreground mode in nflow-daemon
+  - foreground_mode() function: ensures home/log dirs, writes PID file, installs SIGTERM/SIGINT handlers
+  - install_shutdown_handler() installs signal handlers that set a global AtomicBool shutdown flag
+  - shutdown_signal_handler() extern "C" handler — async-signal-safe, only writes AtomicBool
+  - is_shutting_down() reads the global flag for main loop polling
+  - spawn_daemon_foreground() spawns daemon with inherited stdout/stderr
+  - spawn_daemon_with_mode() refactored common spawning logic (background vs foreground)
+  - main.rs updated to handle 3 modes: "background" (daemonize), "foreground" (PID + signal handling + loop), default (same as foreground)
+  - Both foreground and default modes: write PID, poll is_shutting_down(), clean up PID on exit
+  - 3 new tests: foreground_mode PID file + shutdown flag, is_shutting_down default, signal handler direct call
+- Files changed:
+  - crates/nflow-daemon/Cargo.toml (added libc dependency)
+  - crates/nflow-daemon/src/daemon.rs (foreground_mode, install_shutdown_handler, is_shutting_down, spawn_daemon_foreground, spawn_daemon_with_mode + tests)
+  - crates/nflow-daemon/src/main.rs (3-mode match: background/foreground/default with signal-based shutdown loop)
+- **Learnings for future iterations:**
+  - libc crate is needed for `c_int` type in extern "C" signal handler signatures
+  - AtomicPtr::store is NOT unsafe — don't wrap it in unnecessary unsafe blocks
+  - Use std::io::Error::other() instead of std::io::Error::new(ErrorKind::Other, ...) to avoid clippy io_other_error warning
+  - Signal handlers must be extern "C" functions, not closures — use global statics for shared state
+  - Arc::into_raw() leaks the Arc — use std::mem::forget pattern for process-lifetime resources
+---
+
+## 2026-02-07 - US-035
+- What was implemented: Daemon auto-start with flock in nflow-cli
+  - daemon_client module in nflow-cli with full auto-start lifecycle
+  - nflow_home(), pid_file_path(), socket_path(), lock_file_path() — path helpers for ~/.nflow/ layout
+  - is_daemon_running() — checks PID file + signal 0 probe (same pattern as daemon.rs)
+  - ensure_daemon() — main entry point: check running → acquire flock → spawn → wait for socket
+  - acquire_lock(timeout) — non-blocking Flock::lock with polling loop, returns None on contention
+  - wait_for_socket(timeout) — polls for socket file every 100ms
+  - spawn_daemon() — spawns nflow-daemon binary with NFLOW_DAEMON_MODE=background
+  - find_daemon_binary() — looks next to current exe, falls back to PATH
+  - Double-check pattern: re-check is_daemon_running() after acquiring lock (race condition guard)
+  - 8 tests covering path helpers, lock acquisition, lock contention, socket timeout, smoke test
+- Files changed:
+  - crates/nflow-cli/Cargo.toml (added nix dependency with signal+fs features)
+  - crates/nflow-cli/src/main.rs (added daemon_client module)
+  - crates/nflow-cli/src/daemon_client.rs (new — full daemon auto-start with flock)
+- **Learnings for future iterations:**
+  - nix::fcntl::Flock<File> is the RAII wrapper for flock — deprecated flock() function should not be used
+  - Flock::lock() error returns (File, Errno) tuple — the file is returned back on failure
+  - On Linux, EAGAIN == EWOULDBLOCK (value 11) — nix reports EAGAIN for flock contention
+  - Use `errno == EAGAIN || errno == EWOULDBLOCK` instead of matches! to avoid unreachable_patterns warning
+  - open_lock_file() must be called fresh each time in the polling loop (Flock::lock consumes the File)
+  - find_daemon_binary: check next to current_exe first for co-located binaries (cargo install scenario)
 ---
