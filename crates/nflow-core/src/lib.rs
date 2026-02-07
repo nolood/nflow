@@ -1,6 +1,7 @@
 pub mod config;
 pub mod dag;
 pub mod db;
+pub mod decomposition;
 pub mod error;
 pub mod project;
 pub mod scheduler;

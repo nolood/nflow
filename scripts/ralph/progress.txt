@@ -32,6 +32,10 @@
 - SessionStatus enum (InProgress, Approved, Discarded) gates story schedulability — only Approved sessions produce actions
 - SchedulerAction enum: MarkStoryReady, StartStory, UpdateEpicStatus — daemon executes these
 - Scheduler groups stories by session to build per-session DAGs, then uses find_ready_stories() from dag module
+- DecompositionSession uses `impl Fn(Uuid) -> bool` for has_in_progress check (same closure pattern as ProjectService)
+- DecompositionStatus is separate from scheduler::SessionStatus — scheduler uses its own lightweight enum
+- discard_session() is a free function that orchestrates session.discard() + work item collection + spec freeing
+- next_wave_number() takes &[u32] slice of existing wave numbers — pure computation
 
 # Ralph Progress Log
 Started: Sat Feb  7 03:49:10 PM MSK 2026
@@ -200,4 +204,26 @@ Started: Sat Feb  7 03:49:10 PM MSK 2026
   - Only filter for status == Pending when marking stories ready (avoid re-marking Ready/InProgress/Done)
   - Only filter for status == Ready when selecting stories to start (failed stories need manual retry)
   - cargo fmt collapses single-field struct initialization — don't fight it
+---
+
+## 2026-02-07 - US-009
+- What was implemented: Decomposition session model in nflow-core
+  - DecompositionStatus enum (InProgress, Approved, Discarded) with Display impl
+  - DecompositionSession struct with all required fields (id, project_id, wave_number, status, claude_session_id, created_at, updated_at)
+  - Constructor with has_in_progress guard (only one in-progress session per project) and auto-increment wave_number
+  - State machine: approve() (InProgress→Approved), discard() (InProgress→Discarded)
+  - DecompositionSpec struct for many-to-many session↔spec mapping
+  - next_wave_number() pure function computing max existing + 1
+  - discard_session() orchestrates session discard + work item ID collection + spec status revert to Approved
+  - set_claude_session_id() helper for storing Claude session reference
+  - 21 new tests (222 total) covering all acceptance criteria
+- Files changed:
+  - crates/nflow-core/src/decomposition.rs (new module — full decomposition session model)
+  - crates/nflow-core/src/lib.rs (added decomposition module)
+- **Learnings for future iterations:**
+  - DecompositionStatus is a separate enum from scheduler::SessionStatus — each has its own purpose
+  - Use `impl Fn(Uuid) -> bool` closures for external checks (same pattern as ProjectService)
+  - discard_session() is a free function, not a method — it needs mutable access to session, work_items, and specs simultaneously
+  - next_wave_number() takes a slice of existing wave numbers — caller is responsible for querying storage
+  - cargo fmt collapses short multi-arg constructor calls (WorkItem::new_epic) to single lines
 ---
