@@ -7,7 +7,9 @@
 - Binary crates use `[[bin]]` in Cargo.toml with explicit path
 - uuid and chrono crates need `serde` feature enabled for Serialize/Deserialize derives
 - Use `impl Fn` closures for external checks to keep nflow-core pure (no IO traits)
-- NflowError enum in error.rs: Validation, NotFound, Conflict, InvalidState, Serialization
+- NflowError enum in error.rs: Validation, NotFound, Conflict, InvalidState, InvalidTransition, Serialization
+- State machines use `&mut self` methods returning `Result<()>` with InvalidTransition errors
+- SpecStatus has Display impl for use in error messages
 
 # Ralph Progress Log
 Started: Sat Feb  7 03:49:10 PM MSK 2026
@@ -49,4 +51,21 @@ Started: Sat Feb  7 03:49:10 PM MSK 2026
   - Use `impl Fn(&str) -> bool` and `impl Fn(Uuid) -> usize` closures for external checks to keep nflow-core pure
   - `thiserror = "2"` is the version in use (not 1.x)
   - Project creation uses trim() on name and path for whitespace-only validation
+---
+
+## 2026-02-07 - US-003
+- What was implemented: Spec model and state machine in nflow-core
+  - SpecStatus enum (Draft, Approved, Decomposed, Deleted) with Display impl
+  - Spec struct with all required fields (id, project_id, name, file_path, status, session_active, claude_session_id, created_at, updated_at)
+  - State machine: approve(), reopen(), decompose(), discard_plan(), delete() — all enforce valid transitions
+  - Session management: start_session(), end_session() with active-session guard
+  - Added InvalidTransition { from, to } variant to NflowError
+  - 21 unit tests covering all acceptance criteria
+- Files changed:
+  - crates/nflow-core/src/error.rs (added InvalidTransition variant)
+  - crates/nflow-core/src/spec.rs (full Spec model with state machine and tests)
+- **Learnings for future iterations:**
+  - State machine methods use `&mut self` and return `Result<()>` with InvalidTransition errors
+  - cargo fmt auto-collapses single-arg error constructors to one line (don't manually break them)
+  - SpecStatus implements Display for human-readable error messages in InvalidTransition
 ---
