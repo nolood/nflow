@@ -466,6 +466,8 @@ Started: Sat Feb  7 03:49:10 PM MSK 2026
 - tokio::process::Command + Stdio::piped for stdout/stderr + Stdio::null for stdin
 - Lines<BufReader<ChildStdout>> for line-by-line async streaming from spawned process
 - GitError enum in nflow-git/src/error.rs: PathAlreadyExists, NotAGitRepository, CommandFailed, Io
+- `git cat-file -t {hash}` returns "commit" for valid commits — use for commit existence verification before reset
+- `git reflog show HEAD --format=%H` last entry = initial commit of worktree — use for get_base_commit
 - `git worktree list --porcelain` outputs: "worktree /path\nHEAD abc\nbranch refs/heads/main\n\n" per entry
 - `git worktree remove --force` for worktrees with possible uncommitted changes; graceful fallback to prune for stale entries
 - Use CLI (`git rev-parse --is-inside-work-tree`) for repo validation — git2 requires OpenSSL which may not be available
@@ -737,4 +739,21 @@ Started: Sat Feb  7 03:49:10 PM MSK 2026
   - fetch_and_rebase catches CommandFailed from rebase, aborts rebase, then wraps as RebaseConflict — always leaves worktree clean
   - `git push -u` sets upstream tracking — verify with `git rev-parse --abbrev-ref --symbolic-full-name @{u}`
   - cargo fmt collapses `run_git_command(worktree_path, &["push", "-u", "origin", branch_name])` to single line
+---
+
+## 2026-02-07 - US-029
+- What was implemented: Worktree reset for retry in nflow-git
+  - verify_commit_exists(worktree_path, commit_hash) uses `git cat-file -t` to verify a commit exists before reset
+  - reset_to_commit(worktree_path, commit_hash) runs `git reset --hard {hash}` + `git clean -fd` to restore clean state
+  - Validates commit exists before reset (returns error with "does not exist" message)
+  - get_base_commit(worktree_path) uses reflog to find the initial commit when the worktree was created
+  - Falls back to root commit via `git rev-list --max-parents=0 HEAD` if reflog is unavailable
+  - 12 new tests (66 nflow-git total) covering all acceptance criteria
+- Files changed:
+  - crates/nflow-git/src/worktree.rs (added verify_commit_exists, reset_to_commit, get_base_commit + tests)
+- **Learnings for future iterations:**
+  - `git cat-file -t {hash}` returns "commit" for valid commits, exits non-zero for nonexistent objects — good for commit verification
+  - `git reflog show HEAD --format=%H` lists reflog entries newest-first; the last entry is the initial commit when a worktree was created
+  - `git clean -fd` removes untracked files (-f) and directories (-d) — needed after `git reset --hard` to fully clean state
+  - cargo fmt collapses `run_git_command(worktree_path, &["reflog", "show", "HEAD", "--format=%H"])` to single line
 ---

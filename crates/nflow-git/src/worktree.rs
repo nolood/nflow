@@ -209,6 +209,78 @@ pub async fn cleanup_all(repo_path: &Path, worktree_dir: &Path) -> Result<Vec<Pa
     Ok(removed)
 }
 
+/// Verifies that a commit hash exists in the repository at `worktree_path`.
+///
+/// Uses `git cat-file -t {commit_hash}` to check if the object exists and is a commit.
+pub async fn verify_commit_exists(worktree_path: &Path, commit_hash: &str) -> Result<bool> {
+    let result = run_git_command(worktree_path, &["cat-file", "-t", commit_hash]).await;
+    match result {
+        Ok(output) => Ok(output.trim() == "commit"),
+        Err(GitError::CommandFailed(_)) => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+/// Resets a worktree to a specific commit, discarding all changes.
+///
+/// Runs `git reset --hard {commit_hash}` then `git clean -fd` to remove any
+/// uncommitted changes and untracked files. This is used when retrying an impl
+/// task to restore the worktree to the last known good state.
+///
+/// Returns an error if the commit_hash doesn't exist in the repository.
+pub async fn reset_to_commit(worktree_path: &Path, commit_hash: &str) -> Result<()> {
+    validate_git_repo(worktree_path).await?;
+
+    // Verify the commit exists before attempting reset
+    if !verify_commit_exists(worktree_path, commit_hash).await? {
+        return Err(GitError::CommandFailed(format!(
+            "Commit {} does not exist",
+            commit_hash
+        )));
+    }
+
+    // Reset to the specified commit
+    run_git_command(worktree_path, &["reset", "--hard", commit_hash]).await?;
+
+    // Clean untracked files and directories
+    run_git_command(worktree_path, &["clean", "-fd"]).await?;
+
+    Ok(())
+}
+
+/// Returns the commit hash that a worktree was originally created from.
+///
+/// Uses `git merge-base HEAD` with the reflog to find the initial commit of the worktree.
+/// Falls back to `git rev-list --max-parents=0 HEAD` (root commit) if reflog is unavailable.
+pub async fn get_base_commit(worktree_path: &Path) -> Result<String> {
+    validate_git_repo(worktree_path).await?;
+
+    // The first entry in the reflog of HEAD is the commit the worktree was created from.
+    // `git reflog show HEAD --format=%H` lists commits from newest to oldest;
+    // the last entry is the initial commit when the worktree was created.
+    let result = run_git_command(worktree_path, &["reflog", "show", "HEAD", "--format=%H"]).await;
+
+    match result {
+        Ok(output) => {
+            let lines: Vec<&str> = output.trim().lines().collect();
+            if let Some(last) = lines.last() {
+                Ok(last.trim().to_string())
+            } else {
+                // Empty reflog — fall back to root commit
+                let root = run_git_command(worktree_path, &["rev-list", "--max-parents=0", "HEAD"])
+                    .await?;
+                Ok(root.trim().lines().next().unwrap_or("").to_string())
+            }
+        }
+        Err(_) => {
+            // Reflog unavailable — fall back to root commit
+            let root =
+                run_git_command(worktree_path, &["rev-list", "--max-parents=0", "HEAD"]).await?;
+            Ok(root.trim().lines().next().unwrap_or("").to_string())
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -603,5 +675,232 @@ mod tests {
         // No worktrees under this dir — should return empty vec
         let removed = cleanup_all(&repo, &wt_dir).await.unwrap();
         assert!(removed.is_empty());
+    }
+
+    // --- verify_commit_exists tests ---
+
+    #[tokio::test]
+    async fn test_verify_commit_exists_valid() {
+        let (_dir, _bare, repo) = setup_repo_with_remote().await;
+        let head = crate::branch::get_head_commit(&repo).await.unwrap();
+
+        let exists = verify_commit_exists(&repo, &head).await.unwrap();
+        assert!(exists, "HEAD commit should exist");
+    }
+
+    #[tokio::test]
+    async fn test_verify_commit_exists_invalid() {
+        let (_dir, _bare, repo) = setup_repo_with_remote().await;
+
+        let exists = verify_commit_exists(&repo, "0000000000000000000000000000000000000000")
+            .await
+            .unwrap();
+        assert!(!exists, "Nonexistent commit should not exist");
+    }
+
+    #[tokio::test]
+    async fn test_verify_commit_exists_garbage() {
+        let (_dir, _bare, repo) = setup_repo_with_remote().await;
+
+        let exists = verify_commit_exists(&repo, "not-a-hash").await.unwrap();
+        assert!(!exists, "Garbage input should return false");
+    }
+
+    // --- reset_to_commit tests ---
+
+    #[tokio::test]
+    async fn test_reset_to_commit_success() {
+        let (_dir, _bare, repo) = setup_repo_with_remote().await;
+
+        // Record the initial HEAD
+        let initial_head = crate::branch::get_head_commit(&repo).await.unwrap();
+
+        // Make a new commit
+        std::fs::write(repo.join("new_file.txt"), "content").unwrap();
+        run_git_command(&repo, &["add", "."]).await.unwrap();
+        run_git_command(&repo, &["commit", "-m", "second commit"])
+            .await
+            .unwrap();
+
+        let second_head = crate::branch::get_head_commit(&repo).await.unwrap();
+        assert_ne!(initial_head, second_head);
+
+        // Reset to initial commit
+        let result = reset_to_commit(&repo, &initial_head).await;
+        assert!(result.is_ok(), "reset_to_commit failed: {:?}", result);
+
+        // Verify HEAD is back to initial
+        let current_head = crate::branch::get_head_commit(&repo).await.unwrap();
+        assert_eq!(current_head, initial_head);
+
+        // Verify the new file is gone
+        assert!(
+            !repo.join("new_file.txt").exists(),
+            "new_file.txt should be removed after reset"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_reset_to_commit_cleans_untracked_files() {
+        let (_dir, _bare, repo) = setup_repo_with_remote().await;
+        let head = crate::branch::get_head_commit(&repo).await.unwrap();
+
+        // Create untracked files and directories
+        std::fs::write(repo.join("untracked.txt"), "garbage").unwrap();
+        std::fs::create_dir_all(repo.join("untracked_dir")).unwrap();
+        std::fs::write(repo.join("untracked_dir/file.txt"), "more garbage").unwrap();
+
+        // Reset should clean everything
+        reset_to_commit(&repo, &head).await.unwrap();
+
+        assert!(
+            !repo.join("untracked.txt").exists(),
+            "Untracked file should be removed"
+        );
+        assert!(
+            !repo.join("untracked_dir").exists(),
+            "Untracked directory should be removed"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_reset_to_commit_nonexistent_hash() {
+        let (_dir, _bare, repo) = setup_repo_with_remote().await;
+
+        let result = reset_to_commit(&repo, "0000000000000000000000000000000000000000").await;
+        assert!(result.is_err(), "Expected error for nonexistent commit");
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, GitError::CommandFailed(ref msg) if msg.contains("does not exist")),
+            "Expected 'does not exist' error, got: {:?}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn test_reset_to_commit_not_a_repo() {
+        let dir = TempDir::new().unwrap();
+        let fake = dir.path().join("not-a-repo");
+        std::fs::create_dir_all(&fake).unwrap();
+
+        let result = reset_to_commit(&fake, "abc123").await;
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            GitError::NotAGitRepository(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_reset_to_commit_handles_bad_commits() {
+        let (_dir, _bare, repo) = setup_repo_with_remote().await;
+        let initial_head = crate::branch::get_head_commit(&repo).await.unwrap();
+
+        // Make two commits
+        std::fs::write(repo.join("good.txt"), "good").unwrap();
+        run_git_command(&repo, &["add", "."]).await.unwrap();
+        run_git_command(&repo, &["commit", "-m", "good commit"])
+            .await
+            .unwrap();
+        let good_commit = crate::branch::get_head_commit(&repo).await.unwrap();
+
+        std::fs::write(repo.join("bad.txt"), "bad").unwrap();
+        run_git_command(&repo, &["add", "."]).await.unwrap();
+        run_git_command(&repo, &["commit", "-m", "bad commit"])
+            .await
+            .unwrap();
+
+        // Reset to the good commit (skipping the bad one)
+        reset_to_commit(&repo, &good_commit).await.unwrap();
+
+        let current = crate::branch::get_head_commit(&repo).await.unwrap();
+        assert_eq!(current, good_commit);
+        assert!(repo.join("good.txt").exists());
+        assert!(!repo.join("bad.txt").exists());
+
+        // Can also reset all the way back to initial
+        reset_to_commit(&repo, &initial_head).await.unwrap();
+        let current = crate::branch::get_head_commit(&repo).await.unwrap();
+        assert_eq!(current, initial_head);
+        assert!(!repo.join("good.txt").exists());
+    }
+
+    // --- get_base_commit tests ---
+
+    #[tokio::test]
+    async fn test_get_base_commit_returns_initial_commit() {
+        let (_dir, _bare, repo) = setup_repo_with_remote().await;
+
+        // Record initial HEAD before creating worktree
+        let initial_head = crate::branch::get_head_commit(&repo).await.unwrap();
+
+        // Create a worktree
+        let wt_path = _dir.path().join("worktrees/base-test");
+        create_worktree(&repo, &wt_path, "main").await.unwrap();
+
+        // get_base_commit should return the commit the worktree was created from
+        let base = get_base_commit(&wt_path).await.unwrap();
+        assert_eq!(base.len(), 40, "Expected 40-char SHA, got: {}", base);
+        assert!(
+            base.chars().all(|c| c.is_ascii_hexdigit()),
+            "Expected hex SHA, got: {}",
+            base
+        );
+
+        // The base commit should be the same as initial HEAD (both point to main)
+        assert_eq!(base, initial_head);
+    }
+
+    #[tokio::test]
+    async fn test_get_base_commit_after_commits() {
+        let (_dir, _bare, repo) = setup_repo_with_remote().await;
+        let initial_head = crate::branch::get_head_commit(&repo).await.unwrap();
+
+        // Create a worktree
+        let wt_path = _dir.path().join("worktrees/base-after-commits");
+        create_worktree(&repo, &wt_path, "main").await.unwrap();
+
+        // Make commits in the worktree
+        std::fs::write(wt_path.join("file1.txt"), "content1").unwrap();
+        run_git_command(&wt_path, &["add", "."]).await.unwrap();
+        run_git_command(&wt_path, &["commit", "-m", "commit 1"])
+            .await
+            .unwrap();
+
+        std::fs::write(wt_path.join("file2.txt"), "content2").unwrap();
+        run_git_command(&wt_path, &["add", "."]).await.unwrap();
+        run_git_command(&wt_path, &["commit", "-m", "commit 2"])
+            .await
+            .unwrap();
+
+        // Base commit should still be the original (not the new commits)
+        let base = get_base_commit(&wt_path).await.unwrap();
+        assert_eq!(
+            base, initial_head,
+            "Base should be initial commit, not HEAD after new commits"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_base_commit_not_a_repo() {
+        let dir = TempDir::new().unwrap();
+        let fake = dir.path().join("not-a-repo");
+        std::fs::create_dir_all(&fake).unwrap();
+
+        let result = get_base_commit(&fake).await;
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            GitError::NotAGitRepository(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_get_base_commit_on_plain_repo() {
+        let (_dir, _bare, repo) = setup_repo_with_remote().await;
+
+        // On a regular repo (not a worktree), get_base_commit returns the first reflog entry
+        let base = get_base_commit(&repo).await.unwrap();
+        assert_eq!(base.len(), 40, "Expected 40-char SHA, got: {}", base);
     }
 }
