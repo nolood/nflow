@@ -5,6 +5,9 @@
 - All other crates depend on nflow-core via `{ workspace = true }`
 - Empty .rs module files need a trailing newline to pass `cargo fmt --check`
 - Binary crates use `[[bin]]` in Cargo.toml with explicit path
+- uuid and chrono crates need `serde` feature enabled for Serialize/Deserialize derives
+- Use `impl Fn` closures for external checks to keep nflow-core pure (no IO traits)
+- NflowError enum in error.rs: Validation, NotFound, Conflict, InvalidState, Serialization
 
 # Ralph Progress Log
 Started: Sat Feb  7 03:49:10 PM MSK 2026
@@ -26,4 +29,24 @@ Started: Sat Feb  7 03:49:10 PM MSK 2026
   - nflow-core deps: uuid, chrono, serde, serde_json, thiserror — no IO deps
   - Module stubs are empty files — each future US will fill them in
   - Rust 1.92 available on this system, rust-version set to 1.75 min
+---
+
+## 2026-02-07 - US-002
+- What was implemented: Project model and CRUD logic in nflow-core
+  - NflowError enum with Validation, NotFound, Conflict, InvalidState, Serialization variants
+  - GitProvider enum (Github, Gitlab) with detect_from_remote() method
+  - Project struct with all required fields (id, name, path, base_branch, git_provider, execution_enabled, created_at, updated_at)
+  - CreateProjectParams struct for project creation input
+  - ProjectService::create() with validation (non-empty name, unique name, non-empty path, git provider detection/override, base branch detection)
+  - ProjectService::delete() with running-agent guard
+  - 15 unit tests covering all acceptance criteria
+- Files changed:
+  - crates/nflow-core/Cargo.toml (added serde feature to uuid and chrono)
+  - crates/nflow-core/src/error.rs (NflowError enum and Result type alias)
+  - crates/nflow-core/src/project.rs (GitProvider, Project, CreateProjectParams, ProjectService with tests)
+- **Learnings for future iterations:**
+  - uuid and chrono need `serde` feature flag to support Serialize/Deserialize derives
+  - Use `impl Fn(&str) -> bool` and `impl Fn(Uuid) -> usize` closures for external checks to keep nflow-core pure
+  - `thiserror = "2"` is the version in use (not 1.x)
+  - Project creation uses trim() on name and path for whitespace-only validation
 ---
