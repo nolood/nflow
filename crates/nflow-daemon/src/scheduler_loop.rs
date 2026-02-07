@@ -17,6 +17,23 @@ use crate::db::agent_runs::{AgentRun, AgentRunStatus};
 use crate::events::{Event, SharedEventBus};
 use crate::recovery::{read_process_start_time, verify_process, ProcessState};
 
+/// An action to progress a story after a task completes.
+///
+/// Returned by `reap_finished_agents` for async execution by the caller.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StoryProgressAction {
+    /// Start the next task in the story (either paired verify or next impl).
+    StartNextTask {
+        task_id: Uuid,
+        story_id: Uuid,
+        project_id: Uuid,
+    },
+    /// Mark the story as failed (task or verify failed).
+    FailStory { story_id: Uuid },
+    /// Mark the story as done (all tasks completed).
+    CompleteStory { story_id: Uuid },
+}
+
 /// Result of evaluating a finished agent's output.
 #[derive(Debug, PartialEq, Eq)]
 pub struct ReapResult {
@@ -221,22 +238,28 @@ fn is_hex_hash(s: &str) -> bool {
 /// 5. Updates work_item status in DB
 /// 6. Stores commit_hash on successful impl tasks
 /// 7. Broadcasts status change events
+/// 8. Determines story progression actions (start next task, fail/complete story)
 ///
-/// Returns the number of agents reaped.
-pub fn reap_finished_agents(conn: &Connection, event_bus: Option<&SharedEventBus>) -> u32 {
+/// Returns (reaped_count, progress_actions) where progress_actions describe
+/// async follow-up work (starting next tasks, completing stories).
+pub fn reap_finished_agents(
+    conn: &Connection,
+    event_bus: Option<&SharedEventBus>,
+) -> (u32, Vec<StoryProgressAction>) {
     let running = match db::agent_runs::find_running_agent_runs(conn) {
         Ok(r) => r,
         Err(e) => {
             warn!("reap: failed to find running agent runs: {}", e);
-            return 0;
+            return (0, Vec::new());
         }
     };
 
     if running.is_empty() {
-        return 0;
+        return (0, Vec::new());
     }
 
     let mut reaped = 0;
+    let mut progress_actions = Vec::new();
 
     for run in &running {
         let state = match run.pid {
@@ -345,6 +368,11 @@ pub fn reap_finished_agents(conn: &Connection, event_bus: Option<&SharedEventBus
                     "done",
                     conn,
                 );
+
+                // Determine story progression after task success
+                if let Some(action) = determine_story_progress(conn, &work_item, true, event_bus) {
+                    progress_actions.push(action);
+                }
             }
         } else {
             // Update agent run as failed
@@ -389,13 +417,209 @@ pub fn reap_finished_agents(conn: &Connection, event_bus: Option<&SharedEventBus
                     "failed",
                     conn,
                 );
+
+                // Determine story progression after task failure
+                if let Some(action) = determine_story_progress(conn, &work_item, false, event_bus) {
+                    progress_actions.push(action);
+                }
             }
         }
 
         reaped += 1;
     }
 
-    reaped
+    (reaped, progress_actions)
+}
+
+/// Determine the next story progression action after a task completes.
+///
+/// Logic:
+/// - On impl task success: start paired verify task (if exists), otherwise next impl task
+/// - On verify task success: start next pending impl task
+/// - On any task failure (impl or verify): fail the story
+/// - When all tasks are done: complete the story
+fn determine_story_progress(
+    conn: &Connection,
+    completed_task: &WorkItem,
+    succeeded: bool,
+    event_bus: Option<&SharedEventBus>,
+) -> Option<StoryProgressAction> {
+    let story_id = completed_task.parent_id?;
+    let is_verify = completed_task.kind == Some(TaskKind::Verify);
+
+    // On failure: always fail the story immediately
+    if !succeeded {
+        info!(
+            "progress: task {} failed — failing story {}",
+            completed_task.short_id, story_id
+        );
+
+        // Update story status to Failed
+        if let Err(e) =
+            db::work_items::update_work_item_status(conn, &story_id, WorkItemStatus::Failed)
+        {
+            warn!("progress: failed to fail story {}: {}", story_id, e);
+        } else if let Ok(Some(story)) = db::work_items::get_work_item_by_id(conn, &story_id) {
+            broadcast_status_change(event_bus, &story_id, &story, "in_progress", "failed", conn);
+        }
+
+        return Some(StoryProgressAction::FailStory { story_id });
+    }
+
+    // On success: determine next task
+    let tasks = match db::work_items::list_work_items_by_parent(conn, &story_id) {
+        Ok(t) => t,
+        Err(e) => {
+            warn!(
+                "progress: failed to list tasks for story {}: {}",
+                story_id, e
+            );
+            return None;
+        }
+    };
+
+    let next_task = if is_verify {
+        // Verify succeeded: find the next pending task (next impl by sort_order)
+        nflow_core::work_item::get_next_pending_task(story_id, &tasks)
+    } else {
+        // Impl succeeded: find paired verify task first
+        let verify = tasks.iter().find(|t| {
+            t.item_type == ItemType::Task
+                && t.kind == Some(TaskKind::Verify)
+                && t.parent_id == completed_task.parent_id
+                && t.sort_order == completed_task.sort_order + 1
+                && t.status == WorkItemStatus::Pending
+        });
+
+        if verify.is_some() {
+            verify
+        } else {
+            // No verify task — find next pending task
+            nflow_core::work_item::get_next_pending_task(story_id, &tasks)
+        }
+    };
+
+    if let Some(task) = next_task {
+        // Mark the next task as InProgress
+        if let Err(e) =
+            db::work_items::update_work_item_status(conn, &task.id, WorkItemStatus::InProgress)
+        {
+            warn!(
+                "progress: failed to mark task {} as in_progress: {}",
+                task.id, e
+            );
+            return None;
+        }
+        info!(
+            "progress: starting next task {} ({}) for story {}",
+            task.short_id, task.id, story_id
+        );
+        broadcast_status_change(event_bus, &task.id, task, "pending", "in_progress", conn);
+
+        // Find the project_id for spawning the agent
+        let project_id = find_project_id_for_item(conn, task)?;
+
+        return Some(StoryProgressAction::StartNextTask {
+            task_id: task.id,
+            story_id,
+            project_id,
+        });
+    }
+
+    // No more pending tasks — check if all tasks are done (or done+cancelled/skipped)
+    let all_finished = tasks
+        .iter()
+        .filter(|t| t.item_type == ItemType::Task)
+        .all(|t| t.status == WorkItemStatus::Done || t.status == WorkItemStatus::Cancelled);
+
+    if all_finished {
+        info!(
+            "progress: all tasks done for story {} — completing",
+            story_id
+        );
+
+        // Mark story as Done
+        if let Err(e) =
+            db::work_items::update_work_item_status(conn, &story_id, WorkItemStatus::Done)
+        {
+            warn!("progress: failed to complete story {}: {}", story_id, e);
+        } else if let Ok(Some(story)) = db::work_items::get_work_item_by_id(conn, &story_id) {
+            broadcast_status_change(event_bus, &story_id, &story, "in_progress", "done", conn);
+        }
+
+        return Some(StoryProgressAction::CompleteStory { story_id });
+    }
+
+    None
+}
+
+/// Execute story progress actions that were collected during reaping.
+///
+/// These actions require async operations (spawning Claude agents).
+pub async fn execute_story_progress_actions(
+    conn: &Connection,
+    actions: &[StoryProgressAction],
+    event_bus: Option<&SharedEventBus>,
+) {
+    for action in actions {
+        match action {
+            StoryProgressAction::StartNextTask {
+                task_id,
+                story_id,
+                project_id,
+            } => {
+                // Load project, story, and task for agent spawning
+                let project = match db::projects::get_project_by_id(conn, project_id) {
+                    Ok(Some(p)) => p,
+                    Ok(None) => {
+                        warn!(
+                            "progress_exec: project {} not found for task {}",
+                            project_id, task_id
+                        );
+                        continue;
+                    }
+                    Err(e) => {
+                        warn!(
+                            "progress_exec: failed to load project {}: {}",
+                            project_id, e
+                        );
+                        continue;
+                    }
+                };
+
+                let story = match db::work_items::get_work_item_by_id(conn, story_id) {
+                    Ok(Some(s)) => s,
+                    Ok(None) => {
+                        warn!("progress_exec: story {} not found", story_id);
+                        continue;
+                    }
+                    Err(e) => {
+                        warn!("progress_exec: failed to load story {}: {}", story_id, e);
+                        continue;
+                    }
+                };
+
+                let task = match db::work_items::get_work_item_by_id(conn, task_id) {
+                    Ok(Some(t)) => t,
+                    Ok(None) => {
+                        warn!("progress_exec: task {} not found", task_id);
+                        continue;
+                    }
+                    Err(e) => {
+                        warn!("progress_exec: failed to load task {}: {}", task_id, e);
+                        continue;
+                    }
+                };
+
+                start_task_execution(conn, &task, &project, &story, event_bus).await;
+            }
+            StoryProgressAction::FailStory { .. } | StoryProgressAction::CompleteStory { .. } => {
+                // These are already handled synchronously in determine_story_progress
+                // (DB updates and broadcasts done inline).
+                // Listed here for completeness — no async follow-up needed.
+            }
+        }
+    }
 }
 
 /// Helper to mark an agent as failed with an error message.
@@ -1013,30 +1237,36 @@ async fn execute_start_story(
 ///
 /// For each project with `execution_enabled = true`, this function:
 /// 1. Reaps finished agent processes (US-053)
-/// 2. Loads all decomposition sessions and their work items + dependencies
-/// 3. Counts running agents
-/// 4. Builds a `SchedulerState` snapshot
-/// 5. Calls the pure `schedule()` algorithm
-/// 6. Logs all returned actions at DEBUG level
+/// 2. Determines story progression actions (US-056)
+/// 3. Loads all decomposition sessions and their work items + dependencies
+/// 4. Counts running agents
+/// 5. Builds a `SchedulerState` snapshot
+/// 6. Calls the pure `schedule()` algorithm
+/// 7. Logs all returned actions at DEBUG level
 ///
-/// Returns the collected actions for all projects (project_id, action).
-/// The caller (daemon main loop) is responsible for executing these actions
-/// (updating DB, spawning agents, etc.).
+/// Returns (scheduler_actions, story_progress_actions).
+/// The caller (daemon main loop) is responsible for executing both sets of actions.
 pub fn scheduler_tick(
     conn: &Connection,
     event_bus: Option<&SharedEventBus>,
-) -> Vec<(Uuid, SchedulerAction)> {
+) -> (Vec<(Uuid, SchedulerAction)>, Vec<StoryProgressAction>) {
     // Phase 0: Reap finished agent processes before scheduling
-    let reaped = reap_finished_agents(conn, event_bus);
+    let (reaped, progress_actions) = reap_finished_agents(conn, event_bus);
     if reaped > 0 {
         debug!("scheduler: reaped {} finished agent(s)", reaped);
+    }
+    if !progress_actions.is_empty() {
+        debug!(
+            "scheduler: {} story progress action(s) from reaping",
+            progress_actions.len()
+        );
     }
 
     let projects = match db::projects::list_projects(conn) {
         Ok(p) => p,
         Err(e) => {
             warn!("scheduler: failed to list projects: {}", e);
-            return Vec::new();
+            return (Vec::new(), progress_actions);
         }
     };
 
@@ -1045,7 +1275,7 @@ pub fn scheduler_tick(
 
     if enabled_projects.is_empty() {
         debug!("scheduler: no projects with execution_enabled, skipping tick");
-        return Vec::new();
+        return (Vec::new(), progress_actions);
     }
 
     let mut all_actions = Vec::new();
@@ -1140,7 +1370,7 @@ pub fn scheduler_tick(
         all_actions.extend(actions.into_iter().map(|a| (project.id, a)));
     }
 
-    all_actions
+    (all_actions, progress_actions)
 }
 
 #[cfg(test)]
@@ -1201,7 +1431,7 @@ mod tests {
     #[test]
     fn tick_returns_empty_with_no_projects() {
         let conn = test_conn();
-        let actions = scheduler_tick(&conn, None);
+        let (actions, _progress) = scheduler_tick(&conn, None);
         assert!(actions.is_empty());
     }
 
@@ -1211,7 +1441,7 @@ mod tests {
         let project = make_project("disabled", false);
         db::projects::insert_project(&conn, &project).unwrap();
 
-        let actions = scheduler_tick(&conn, None);
+        let (actions, _progress) = scheduler_tick(&conn, None);
         assert!(actions.is_empty());
     }
 
@@ -1222,7 +1452,7 @@ mod tests {
         project.execution_enabled = true;
         db::projects::insert_project(&conn, &project).unwrap();
 
-        let actions = scheduler_tick(&conn, None);
+        let (actions, _progress) = scheduler_tick(&conn, None);
         assert!(actions.is_empty());
     }
 
@@ -1253,7 +1483,7 @@ mod tests {
         );
         db::work_items::insert_work_item(&conn, &story).unwrap();
 
-        let actions = scheduler_tick(&conn, None);
+        let (actions, _progress) = scheduler_tick(&conn, None);
 
         // Should have MarkStoryReady for the pending story (no blockers)
         let mark_ready: Vec<_> = actions
@@ -1300,7 +1530,7 @@ mod tests {
         );
         db::work_items::insert_work_item(&conn, &story).unwrap();
 
-        let actions = scheduler_tick(&conn, None);
+        let (actions, _progress) = scheduler_tick(&conn, None);
 
         // No actions for stories in unapproved sessions
         let story_actions: Vec<_> = actions
@@ -1392,7 +1622,7 @@ mod tests {
     #[test]
     fn reap_no_running_agents() {
         let conn = test_conn();
-        let reaped = reap_finished_agents(&conn, None);
+        let (reaped, _progress) = reap_finished_agents(&conn, None);
         assert_eq!(reaped, 0);
     }
 
@@ -1439,7 +1669,7 @@ mod tests {
         };
         insert_agent_run(&conn, &run).unwrap();
 
-        let reaped = reap_finished_agents(&conn, None);
+        let (reaped, _progress) = reap_finished_agents(&conn, None);
         assert_eq!(reaped, 0);
 
         // Agent should still be running
@@ -1487,7 +1717,7 @@ mod tests {
         let run = make_running_agent(task.id, Some(4_000_000_000));
         insert_agent_run(&conn, &run).unwrap();
 
-        let reaped = reap_finished_agents(&conn, None);
+        let (reaped, _progress) = reap_finished_agents(&conn, None);
         assert_eq!(reaped, 1);
 
         // Agent run should be marked as failed
@@ -1541,7 +1771,7 @@ mod tests {
         let run = make_running_agent(task.id, None);
         insert_agent_run(&conn, &run).unwrap();
 
-        let reaped = reap_finished_agents(&conn, None);
+        let (reaped, _progress) = reap_finished_agents(&conn, None);
         assert_eq!(reaped, 1);
 
         // Work item should be failed
@@ -1596,7 +1826,7 @@ mod tests {
         let client = crate::events::ClientId::new();
         let mut rx = bus.subscribe(client);
 
-        let reaped = reap_finished_agents(&conn, Some(&bus));
+        let (reaped, _progress) = reap_finished_agents(&conn, Some(&bus));
         assert_eq!(reaped, 1);
 
         // Should have received a status change event
@@ -1848,6 +2078,513 @@ mod tests {
                 assert_eq!(new_status, "ready");
             }
             _ => panic!("expected StatusChange event"),
+        }
+    }
+
+    // --- story progression tests (US-056) ---
+
+    /// Helper to set up a project + session + epic + story with tasks.
+    /// Returns (project, session, epic, story, impl_task, verify_task).
+    fn setup_story_with_tasks(
+        conn: &Connection,
+    ) -> (
+        Project,
+        DecompositionSession,
+        WorkItem,
+        WorkItem,
+        WorkItem,
+        WorkItem,
+    ) {
+        let project = make_project("proj", true);
+        db::projects::insert_project(conn, &project).unwrap();
+
+        let session = make_approved_session(project.id, 1);
+        db::decomposition_sessions::insert_decomposition_session(conn, &session).unwrap();
+
+        let epic = WorkItem::new_epic(session.id, "E".into(), "D".into(), "E1".into(), 0);
+        db::work_items::insert_work_item(conn, &epic).unwrap();
+
+        let story = WorkItem::new_story(
+            epic.id,
+            session.id,
+            "S".into(),
+            "D".into(),
+            "AC".into(),
+            "S1".into(),
+            0,
+        );
+        db::work_items::insert_work_item(conn, &story).unwrap();
+
+        // Impl task at sort_order 0, verify at sort_order 1
+        let impl_task = WorkItem::new_task(
+            story.id,
+            session.id,
+            "Implement feature".into(),
+            "D".into(),
+            "AC".into(),
+            "T1".into(),
+            0,
+        );
+        db::work_items::insert_work_item(conn, &impl_task).unwrap();
+
+        let mut verify_task = WorkItem::new_task(
+            story.id,
+            session.id,
+            "Verify feature".into(),
+            "D".into(),
+            "AC".into(),
+            "T1v".into(),
+            1,
+        );
+        verify_task.kind = Some(TaskKind::Verify);
+        db::work_items::insert_work_item(conn, &verify_task).unwrap();
+
+        (project, session, epic, story, impl_task, verify_task)
+    }
+
+    #[test]
+    fn progress_impl_success_starts_verify_task() {
+        let conn = test_conn();
+        let (_project, _session, _epic, story, impl_task, verify_task) =
+            setup_story_with_tasks(&conn);
+
+        // Set story and impl task to in_progress
+        db::work_items::update_work_item_status(&conn, &story.id, WorkItemStatus::InProgress)
+            .unwrap();
+        db::work_items::update_work_item_status(&conn, &impl_task.id, WorkItemStatus::InProgress)
+            .unwrap();
+
+        // Mark impl task as done (simulating successful reap)
+        db::work_items::update_work_item_status(&conn, &impl_task.id, WorkItemStatus::Done)
+            .unwrap();
+
+        // Now determine progression
+        let impl_item = db::work_items::get_work_item_by_id(&conn, &impl_task.id)
+            .unwrap()
+            .unwrap();
+        let action = determine_story_progress(&conn, &impl_item, true, None);
+
+        // Should start the verify task
+        assert!(action.is_some());
+        match action.unwrap() {
+            StoryProgressAction::StartNextTask {
+                task_id, story_id, ..
+            } => {
+                assert_eq!(task_id, verify_task.id);
+                assert_eq!(story_id, story.id);
+            }
+            other => panic!("expected StartNextTask, got {:?}", other),
+        }
+
+        // Verify task should be marked in_progress
+        let updated_verify = db::work_items::get_work_item_by_id(&conn, &verify_task.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated_verify.status, WorkItemStatus::InProgress);
+    }
+
+    #[test]
+    fn progress_verify_success_starts_next_impl_task() {
+        let conn = test_conn();
+        let (_project, session, _epic, story, impl_task, verify_task) =
+            setup_story_with_tasks(&conn);
+
+        // Add a second impl+verify pair
+        let impl_task2 = WorkItem::new_task(
+            story.id,
+            session.id,
+            "Implement feature 2".into(),
+            "D".into(),
+            "AC".into(),
+            "T2".into(),
+            2,
+        );
+        db::work_items::insert_work_item(&conn, &impl_task2).unwrap();
+
+        let mut verify_task2 = WorkItem::new_task(
+            story.id,
+            session.id,
+            "Verify feature 2".into(),
+            "D".into(),
+            "AC".into(),
+            "T2v".into(),
+            3,
+        );
+        verify_task2.kind = Some(TaskKind::Verify);
+        db::work_items::insert_work_item(&conn, &verify_task2).unwrap();
+
+        // Mark story in_progress, first impl done, first verify done
+        db::work_items::update_work_item_status(&conn, &story.id, WorkItemStatus::InProgress)
+            .unwrap();
+        db::work_items::update_work_item_status(&conn, &impl_task.id, WorkItemStatus::Done)
+            .unwrap();
+        db::work_items::update_work_item_status(&conn, &verify_task.id, WorkItemStatus::InProgress)
+            .unwrap();
+        db::work_items::update_work_item_status(&conn, &verify_task.id, WorkItemStatus::Done)
+            .unwrap();
+
+        // Determine progression after verify task succeeds
+        let verify_item = db::work_items::get_work_item_by_id(&conn, &verify_task.id)
+            .unwrap()
+            .unwrap();
+        let action = determine_story_progress(&conn, &verify_item, true, None);
+
+        // Should start the second impl task
+        assert!(action.is_some());
+        match action.unwrap() {
+            StoryProgressAction::StartNextTask {
+                task_id, story_id, ..
+            } => {
+                assert_eq!(task_id, impl_task2.id);
+                assert_eq!(story_id, story.id);
+            }
+            other => panic!("expected StartNextTask, got {:?}", other),
+        }
+
+        // Second impl task should be marked in_progress
+        let updated = db::work_items::get_work_item_by_id(&conn, &impl_task2.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated.status, WorkItemStatus::InProgress);
+    }
+
+    #[test]
+    fn progress_verify_failure_fails_story() {
+        let conn = test_conn();
+        let (_project, _session, _epic, story, impl_task, verify_task) =
+            setup_story_with_tasks(&conn);
+
+        // Story in_progress, impl done, verify in_progress
+        db::work_items::update_work_item_status(&conn, &story.id, WorkItemStatus::InProgress)
+            .unwrap();
+        db::work_items::update_work_item_status(&conn, &impl_task.id, WorkItemStatus::Done)
+            .unwrap();
+        db::work_items::update_work_item_status(&conn, &verify_task.id, WorkItemStatus::InProgress)
+            .unwrap();
+        db::work_items::update_work_item_status(&conn, &verify_task.id, WorkItemStatus::Failed)
+            .unwrap();
+
+        let verify_item = db::work_items::get_work_item_by_id(&conn, &verify_task.id)
+            .unwrap()
+            .unwrap();
+        let action = determine_story_progress(&conn, &verify_item, false, None);
+
+        // Should fail the story
+        assert!(action.is_some());
+        match action.unwrap() {
+            StoryProgressAction::FailStory { story_id } => {
+                assert_eq!(story_id, story.id);
+            }
+            other => panic!("expected FailStory, got {:?}", other),
+        }
+
+        // Story should be failed in DB
+        let updated_story = db::work_items::get_work_item_by_id(&conn, &story.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated_story.status, WorkItemStatus::Failed);
+    }
+
+    #[test]
+    fn progress_impl_failure_fails_story() {
+        let conn = test_conn();
+        let (_project, _session, _epic, story, impl_task, _verify_task) =
+            setup_story_with_tasks(&conn);
+
+        // Story in_progress, impl in_progress then failed
+        db::work_items::update_work_item_status(&conn, &story.id, WorkItemStatus::InProgress)
+            .unwrap();
+        db::work_items::update_work_item_status(&conn, &impl_task.id, WorkItemStatus::InProgress)
+            .unwrap();
+        db::work_items::update_work_item_status(&conn, &impl_task.id, WorkItemStatus::Failed)
+            .unwrap();
+
+        let impl_item = db::work_items::get_work_item_by_id(&conn, &impl_task.id)
+            .unwrap()
+            .unwrap();
+        let action = determine_story_progress(&conn, &impl_item, false, None);
+
+        // Should fail the story
+        assert!(action.is_some());
+        match action.unwrap() {
+            StoryProgressAction::FailStory { story_id } => {
+                assert_eq!(story_id, story.id);
+            }
+            other => panic!("expected FailStory, got {:?}", other),
+        }
+
+        // Story should be failed
+        let updated_story = db::work_items::get_work_item_by_id(&conn, &story.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated_story.status, WorkItemStatus::Failed);
+    }
+
+    #[test]
+    fn progress_all_tasks_done_completes_story() {
+        let conn = test_conn();
+        let (_project, _session, _epic, story, impl_task, verify_task) =
+            setup_story_with_tasks(&conn);
+
+        // Story in_progress, impl done, verify done
+        db::work_items::update_work_item_status(&conn, &story.id, WorkItemStatus::InProgress)
+            .unwrap();
+        db::work_items::update_work_item_status(&conn, &impl_task.id, WorkItemStatus::Done)
+            .unwrap();
+        db::work_items::update_work_item_status(&conn, &verify_task.id, WorkItemStatus::InProgress)
+            .unwrap();
+        db::work_items::update_work_item_status(&conn, &verify_task.id, WorkItemStatus::Done)
+            .unwrap();
+
+        // Determine progression after last verify task succeeds
+        let verify_item = db::work_items::get_work_item_by_id(&conn, &verify_task.id)
+            .unwrap()
+            .unwrap();
+        let action = determine_story_progress(&conn, &verify_item, true, None);
+
+        // Should complete the story
+        assert!(action.is_some());
+        match action.unwrap() {
+            StoryProgressAction::CompleteStory { story_id } => {
+                assert_eq!(story_id, story.id);
+            }
+            other => panic!("expected CompleteStory, got {:?}", other),
+        }
+
+        // Story should be done in DB
+        let updated_story = db::work_items::get_work_item_by_id(&conn, &story.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated_story.status, WorkItemStatus::Done);
+    }
+
+    #[test]
+    fn progress_mix_done_and_cancelled_completes_story() {
+        let conn = test_conn();
+        let (_project, session, _epic, story, impl_task, verify_task) =
+            setup_story_with_tasks(&conn);
+
+        // Add a second impl+verify pair that will be cancelled
+        let impl_task2 = WorkItem::new_task(
+            story.id,
+            session.id,
+            "Skipped feature".into(),
+            "D".into(),
+            "AC".into(),
+            "T2".into(),
+            2,
+        );
+        db::work_items::insert_work_item(&conn, &impl_task2).unwrap();
+
+        let mut verify_task2 = WorkItem::new_task(
+            story.id,
+            session.id,
+            "Skipped verify".into(),
+            "D".into(),
+            "AC".into(),
+            "T2v".into(),
+            3,
+        );
+        verify_task2.kind = Some(TaskKind::Verify);
+        db::work_items::insert_work_item(&conn, &verify_task2).unwrap();
+
+        // Story in_progress, first pair done, second pair cancelled
+        db::work_items::update_work_item_status(&conn, &story.id, WorkItemStatus::InProgress)
+            .unwrap();
+        db::work_items::update_work_item_status(&conn, &impl_task.id, WorkItemStatus::Done)
+            .unwrap();
+        db::work_items::update_work_item_status(&conn, &verify_task.id, WorkItemStatus::Done)
+            .unwrap();
+        db::work_items::update_work_item_status(&conn, &impl_task2.id, WorkItemStatus::Cancelled)
+            .unwrap();
+        db::work_items::update_work_item_status(&conn, &verify_task2.id, WorkItemStatus::Cancelled)
+            .unwrap();
+
+        // Determine progression after last verify done
+        let verify_item = db::work_items::get_work_item_by_id(&conn, &verify_task.id)
+            .unwrap()
+            .unwrap();
+        let action = determine_story_progress(&conn, &verify_item, true, None);
+
+        // Should complete the story (mix of done + cancelled)
+        assert!(action.is_some());
+        match action.unwrap() {
+            StoryProgressAction::CompleteStory { story_id } => {
+                assert_eq!(story_id, story.id);
+            }
+            other => panic!("expected CompleteStory, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn progress_impl_success_no_verify_starts_next_impl() {
+        let conn = test_conn();
+        let (_project, session, _epic, _story, ..) = setup_story_with_tasks(&conn);
+
+        // Remove the verify task (story with impl only — no auto-generated verifies)
+        // Create a new story with just two impl tasks, no verifies
+        let story2 = WorkItem::new_story(
+            _epic.id,
+            session.id,
+            "S2".into(),
+            "D".into(),
+            "AC".into(),
+            "S2".into(),
+            1,
+        );
+        db::work_items::insert_work_item(&conn, &story2).unwrap();
+
+        let task_a = WorkItem::new_task(
+            story2.id,
+            session.id,
+            "Task A".into(),
+            "D".into(),
+            "AC".into(),
+            "T3".into(),
+            0,
+        );
+        db::work_items::insert_work_item(&conn, &task_a).unwrap();
+
+        let task_b = WorkItem::new_task(
+            story2.id,
+            session.id,
+            "Task B".into(),
+            "D".into(),
+            "AC".into(),
+            "T4".into(),
+            2, // Gap in sort_order (no verify at 1)
+        );
+        db::work_items::insert_work_item(&conn, &task_b).unwrap();
+
+        // Story in_progress, task_a done
+        db::work_items::update_work_item_status(&conn, &story2.id, WorkItemStatus::InProgress)
+            .unwrap();
+        db::work_items::update_work_item_status(&conn, &task_a.id, WorkItemStatus::Done).unwrap();
+
+        let task_a_item = db::work_items::get_work_item_by_id(&conn, &task_a.id)
+            .unwrap()
+            .unwrap();
+        let action = determine_story_progress(&conn, &task_a_item, true, None);
+
+        // Should start task B (next pending task)
+        assert!(action.is_some());
+        match action.unwrap() {
+            StoryProgressAction::StartNextTask {
+                task_id, story_id, ..
+            } => {
+                assert_eq!(task_id, task_b.id);
+                assert_eq!(story_id, story2.id);
+            }
+            other => panic!("expected StartNextTask, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn reap_dead_impl_triggers_story_fail_action() {
+        let conn = test_conn();
+        let (_project, _session, _epic, story, impl_task, _verify_task) =
+            setup_story_with_tasks(&conn);
+
+        // Story and impl task in_progress
+        db::work_items::update_work_item_status(&conn, &story.id, WorkItemStatus::InProgress)
+            .unwrap();
+        db::work_items::update_work_item_status(&conn, &impl_task.id, WorkItemStatus::InProgress)
+            .unwrap();
+
+        // Dead agent for impl task
+        let run = make_running_agent(impl_task.id, Some(4_000_000_000));
+        insert_agent_run(&conn, &run).unwrap();
+
+        let (reaped, progress) = reap_finished_agents(&conn, None);
+        assert_eq!(reaped, 1);
+
+        // Should have a FailStory action
+        assert_eq!(progress.len(), 1);
+        match &progress[0] {
+            StoryProgressAction::FailStory { story_id } => {
+                assert_eq!(*story_id, story.id);
+            }
+            other => panic!("expected FailStory, got {:?}", other),
+        }
+
+        // Story should be marked as failed
+        let updated_story = db::work_items::get_work_item_by_id(&conn, &story.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated_story.status, WorkItemStatus::Failed);
+    }
+
+    #[test]
+    fn progress_broadcasts_story_failure_event() {
+        let conn = test_conn();
+        let (_project, _session, _epic, story, impl_task, _verify_task) =
+            setup_story_with_tasks(&conn);
+
+        // Story and impl in_progress
+        db::work_items::update_work_item_status(&conn, &story.id, WorkItemStatus::InProgress)
+            .unwrap();
+        db::work_items::update_work_item_status(&conn, &impl_task.id, WorkItemStatus::Failed)
+            .unwrap();
+
+        let bus = crate::events::new_event_bus(16);
+        let client = crate::events::ClientId::new();
+        let mut rx = bus.subscribe(client);
+
+        let impl_item = db::work_items::get_work_item_by_id(&conn, &impl_task.id)
+            .unwrap()
+            .unwrap();
+        let _action = determine_story_progress(&conn, &impl_item, false, Some(&bus));
+
+        // Should broadcast story failure
+        let event = rx.try_recv().unwrap();
+        match event {
+            Event::StatusChange {
+                item_id,
+                new_status,
+                ..
+            } => {
+                assert_eq!(item_id, story.id.to_string());
+                assert_eq!(new_status, "failed");
+            }
+            _ => panic!("expected StatusChange event for story failure"),
+        }
+    }
+
+    #[test]
+    fn progress_broadcasts_story_completion_event() {
+        let conn = test_conn();
+        let (_project, _session, _epic, story, impl_task, verify_task) =
+            setup_story_with_tasks(&conn);
+
+        // All tasks done
+        db::work_items::update_work_item_status(&conn, &story.id, WorkItemStatus::InProgress)
+            .unwrap();
+        db::work_items::update_work_item_status(&conn, &impl_task.id, WorkItemStatus::Done)
+            .unwrap();
+        db::work_items::update_work_item_status(&conn, &verify_task.id, WorkItemStatus::Done)
+            .unwrap();
+
+        let bus = crate::events::new_event_bus(16);
+        let client = crate::events::ClientId::new();
+        let mut rx = bus.subscribe(client);
+
+        let verify_item = db::work_items::get_work_item_by_id(&conn, &verify_task.id)
+            .unwrap()
+            .unwrap();
+        let _action = determine_story_progress(&conn, &verify_item, true, Some(&bus));
+
+        // Should broadcast story completion
+        let event = rx.try_recv().unwrap();
+        match event {
+            Event::StatusChange {
+                item_id,
+                new_status,
+                ..
+            } => {
+                assert_eq!(item_id, story.id.to_string());
+                assert_eq!(new_status, "done");
+            }
+            _ => panic!("expected StatusChange event for story completion"),
         }
     }
 }

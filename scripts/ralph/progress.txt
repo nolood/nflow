@@ -134,6 +134,12 @@
 - slugify() converts story titles to URL-safe branch name slugs: lowercase, non-alphanumeric→hyphen, collapse, trim, truncate to 50 chars
 - Action execution pattern: scheduler_tick() returns actions (pure), then execute_actions() performs IO (DB writes, git ops)
 - StartStory flow: load project → load story → render branch name → create worktree → update DB (worktree_path, branch_name, status) → mark first task InProgress
+- reap_finished_agents returns (u32, Vec<StoryProgressAction>) — reaped count + async follow-up actions for story progression
+- StoryProgressAction enum: StartNextTask, FailStory, CompleteStory — collected during sync reaping, executed async by caller
+- determine_story_progress() is sync: updates DB (story status), returns action for async work (agent spawning)
+- scheduler_tick returns (Vec<SchedulerAction>, Vec<StoryProgressAction>) — both sets executed by main loop
+- Story completion = all tasks Done|Cancelled; mix of done + cancelled/skipped still triggers completion
+- Task failure (impl or verify) immediately fails the parent story — no partial recovery within a story
 
 # Ralph Progress Log
 Started: Sat Feb  7 03:49:10 PM MSK 2026
@@ -1460,4 +1466,28 @@ Started: Sat Feb  7 03:49:10 PM MSK 2026
   - `find_latest_agent_run_for_task()` enables retry context: on retry, the previous error message is included in the prompt
   - ClaudeProcess.stdout is moved into the background task; the child handle and stderr are also moved but not actively monitored (reaper handles this)
   - The event_bus is `Option<&SharedEventBus>` (Arc<EventBus>), so `.cloned()` gives `Option<SharedEventBus>` for moving into async tasks
+---
+
+## 2026-02-07 - US-056
+- What was implemented: Task completion and story progression logic in scheduler_loop
+  - StoryProgressAction enum (StartNextTask, FailStory, CompleteStory) for async follow-up work after reaping
+  - determine_story_progress() function — determines next action after task completion:
+    - Impl success → start paired verify task (if exists) or next impl task
+    - Verify success → start next pending impl task by sort_order
+    - Any task failure → fail the story immediately
+    - All tasks done (Done or Cancelled) → complete the story
+  - execute_story_progress_actions() async function — spawns Claude agents for next tasks
+  - Updated reap_finished_agents() to return (u32, Vec<StoryProgressAction>) instead of just u32
+  - Updated scheduler_tick() to return (Vec<SchedulerAction>, Vec<StoryProgressAction>)
+  - Updated main.rs to execute story progress actions before scheduler actions
+  - 11 new tests covering all progression scenarios
+- Files changed:
+  - crates/nflow-daemon/src/scheduler_loop.rs (+~350 lines — StoryProgressAction, determine_story_progress, execute_story_progress_actions, 11 tests)
+  - crates/nflow-daemon/src/main.rs (+7 lines — handle new return type and execute progress actions)
+- **Learnings for future iterations:**
+  - reap_finished_agents is sync but needs to produce async follow-up work (agent spawning) — solve with action return pattern
+  - determine_story_progress handles DB updates synchronously (story status) and returns action for async work (agent spawning)
+  - Story completion triggers immediately when all tasks are Done|Cancelled — no separate "check story completion" phase needed
+  - Task failure always fails the story — there's no partial story recovery (retry is handled at the story level via US-061)
+  - When updating function return types, all call sites (including tests) must be updated — use destructuring with `_` prefix for unused fields
 ---

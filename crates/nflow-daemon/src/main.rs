@@ -75,7 +75,17 @@ async fn main() {
                 };
 
                 // Run scheduler tick with reaping (synchronous — serialized on main task)
-                let actions = scheduler_loop::scheduler_tick(&conn, None);
+                let (actions, progress_actions) = scheduler_loop::scheduler_tick(&conn, None);
+
+                // Execute story progress actions first (start next tasks from reaping)
+                if !progress_actions.is_empty() {
+                    debug!(
+                        "scheduler: {} story progress actions to execute",
+                        progress_actions.len()
+                    );
+                    scheduler_loop::execute_story_progress_actions(&conn, &progress_actions, None)
+                        .await;
+                }
 
                 if !actions.is_empty() {
                     debug!("scheduler: {} actions produced this tick", actions.len());
