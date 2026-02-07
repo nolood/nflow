@@ -51,6 +51,8 @@
 - selected_story_id() on ExecuteTreeState: walks backwards from depth-3 task to find parent depth-2 story
 - plan.show daemon command returns { wave_number, status, epics: [{ short_id, title, status, stories: [{ ..., progress, depends_on, tasks }] }] }
 - visible_nodes() pattern: iterate all nodes, skip children when parent.collapsed, filter verify tasks when hide_verify — returns Vec<(real_index, &node)> for mapping back to flat array
+- TUI full-screen view pattern: in_*_view() check in handle_key_event blocks global keys; handle_*_detail_key() handles exclusive navigation; Esc returns to parent view
+- TUI streaming in multiple views: each view has its own streaming state (execute_output, logs_view); event loop checks in_*_streaming() for correct polling; daemon events guarded by all streaming checks
 - Story completion lifecycle: rebase → push → MR creation → DB update → worktree cleanup → event broadcast (all in execute_complete_story)
 - On any failure during story completion (rebase/push/MR), story is rolled back to Failed status via fail_story_on_completion_error()
 - Wall-clock timeout: check_agent_timeouts() runs as Phase 0.5 in scheduler_tick (after reaping, before scheduling). Uses nix SIGTERM→sleep(10s)→SIGKILL pattern.
@@ -2077,4 +2079,21 @@ Started: Sat Feb  7 03:49:10 PM MSK 2026
 - Escalate: stops story via exec.stop then shows worktree path in status message for manual intervention
 - ConfirmAction.message() returns String (not &str) to support dynamic content with story IDs
 - render_execute_confirm_popup() renders in render() after plan sub-views — only one type of popup at a time
+---
+
+## 2026-02-08 - US-084
+- What was implemented: Full-screen logs view for inspecting agent output in detail
+- Files changed:
+  - crates/nflow-tui/src/app.rs — Added LogsViewState, LogEntry, log parsing/formatting functions, App helper methods (in_logs_streaming, in_logs_view, enter_logs_for_task, exit_logs_view)
+  - crates/nflow-tui/src/event.rs — Added LogsSelectTask/LogsExit ViewAction variants, handle_logs_key (task list), handle_logs_detail_key (full-screen viewer with j/k/G/g/Ctrl+d/Ctrl+u/Esc)
+  - crates/nflow-tui/src/main.rs — Added handle_logs_select_task (historical + streaming), poll_logs_streaming_data, wired into event loop
+  - crates/nflow-tui/src/ui.rs — Added render_logs_view (full-screen log with styled entries), render_logs_task_list (task picker), status_color_from_status helper
+- **Learnings for future iterations:**
+  - LogsViewState duplicates some ExecuteOutputState patterns but adds full pager navigation (page up/down, top/bottom, visible_height-aware scrolling)
+  - Log entry parsing: classify lines by prefix (Tool call:/tool_use:, Tool result:/tool_result:, Error:/error:) into entry_type for color styling
+  - Streaming vs historical scroll inversion: streaming offset 0=bottom (like execute output), historical offset 0=top (like pager)
+  - handle_logs_detail_key blocks all global keys when task is loaded (same pattern as pager) — checked before pager in handle_key_event
+  - Logs view task list reuses execute_tree for navigation/selection — no separate task list state needed
+  - poll_logs_streaming_data follows same pattern as poll_execute_streaming_data but writes to logs_view instead of execute_output
+  - in_logs_streaming() checked in event loop for streaming polling, and in daemon event guard (prevent double-polling)
 ---

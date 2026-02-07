@@ -119,9 +119,18 @@ async fn event_loop(
             poll_execute_streaming_data(app, client).await;
         }
 
+        // If in logs view with streaming output, poll for logs streaming data
+        if app.in_logs_streaming() {
+            poll_logs_streaming_data(app, client).await;
+        }
+
         // Poll for daemon events when subscribed and not actively streaming
         // (when streaming, events arrive interleaved and are handled there)
-        if app.is_event_subscribed() && !app.in_execute_streaming() && !app.in_dialogue() {
+        if app.is_event_subscribed()
+            && !app.in_execute_streaming()
+            && !app.in_logs_streaming()
+            && !app.in_dialogue()
+        {
             poll_daemon_events(app, client).await;
         }
 
@@ -192,6 +201,12 @@ async fn event_loop(
                 }
                 event::ViewAction::ExecuteConfirmExit => {
                     // Confirmation popup was dismissed — no action needed
+                }
+                event::ViewAction::LogsSelectTask(task_id) => {
+                    handle_logs_select_task(app, client, &task_id).await;
+                }
+                event::ViewAction::LogsExit => {
+                    app.exit_logs_view();
                 }
                 _ => {}
             }
@@ -750,6 +765,109 @@ async fn poll_execute_streaming_data(app: &mut App, client: &mut SocketClient) {
             app.execute_output
                 .append_line("[Connection lost]".to_string());
             app.execute_output.stop_streaming();
+        }
+    }
+}
+
+/// Handle selecting a task in the logs view to display its full-screen log.
+async fn handle_logs_select_task(app: &mut App, client: &mut SocketClient, task_id: &str) {
+    let is_running = app.execute_tree.selected_task_status().as_deref() == Some("in_progress");
+    let task_status = app
+        .execute_tree
+        .selected_task_status()
+        .unwrap_or_else(|| "unknown".to_string());
+
+    let params = serde_json::json!({
+        "project_name": &app.project,
+        "task_id": task_id,
+        "follow": is_running,
+    });
+
+    if is_running {
+        // Start streaming for live output
+        match client.send_streaming_command("exec.log", params).await {
+            Ok(request_id) => {
+                app.logs_view
+                    .start_streaming(task_id.to_string(), request_id);
+            }
+            Err(e) => {
+                app.logs_view.set_historical(
+                    task_id.to_string(),
+                    task_status,
+                    vec![format!("[Failed to start streaming: {}]", e)],
+                );
+            }
+        }
+    } else {
+        // Fetch historical log
+        match client.send_command("exec.log", params).await {
+            Ok(resp) if resp.status == ResponseStatus::Ok => {
+                let lines = parse_log_lines(&resp.data);
+                app.logs_view
+                    .set_historical(task_id.to_string(), task_status, lines);
+            }
+            Ok(resp) => {
+                let msg = resp
+                    .data
+                    .get("message")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("Failed to fetch log");
+                app.logs_view.set_historical(
+                    task_id.to_string(),
+                    task_status,
+                    vec![msg.to_string()],
+                );
+            }
+            Err(e) => {
+                app.logs_view.set_historical(
+                    task_id.to_string(),
+                    task_status,
+                    vec![format!("[Error: {}]", e)],
+                );
+            }
+        }
+    }
+}
+
+/// Poll for streaming logs data in the full-screen logs view (non-blocking).
+async fn poll_logs_streaming_data(app: &mut App, client: &mut SocketClient) {
+    let poll_timeout = std::time::Duration::from_millis(10);
+
+    match client.try_read_streaming_line(poll_timeout).await {
+        Ok(Some(line)) => {
+            // Check if this is a daemon event (from subscription) rather than streaming data
+            if line.event.is_some() {
+                handle_daemon_event(app, client, &line).await;
+                return;
+            }
+
+            if line.status == ResponseStatus::Error {
+                let msg = line
+                    .data
+                    .get("message")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown error");
+                app.logs_view.append_line(format!("[Error: {}]", msg));
+                app.logs_view.stop_streaming();
+                return;
+            }
+
+            if line.done {
+                app.logs_view.stop_streaming();
+                return;
+            }
+
+            // Append text content from streaming events
+            if let Some(text) = line.data.get("text").and_then(|v| v.as_str()) {
+                app.logs_view.append_line(text.to_string());
+            }
+        }
+        Ok(None) => {
+            // Timeout — no data yet
+        }
+        Err(_) => {
+            app.logs_view.append_line("[Connection lost]".to_string());
+            app.logs_view.stop_streaming();
         }
     }
 }

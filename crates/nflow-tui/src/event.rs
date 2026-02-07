@@ -64,6 +64,10 @@ pub enum ViewAction {
     ExecuteEscalate(String),
     /// Execute confirmation popup was closed (Esc/n).
     ExecuteConfirmExit,
+    /// Request to fetch and display a task's log in the full-screen logs view.
+    LogsSelectTask(String),
+    /// User exited the full-screen logs view back to Execute.
+    LogsExit,
 }
 
 /// Handle a key event, returning true if the app should continue, false to quit.
@@ -73,6 +77,12 @@ pub fn handle_key_event(app: &mut App, key: KeyEvent) -> (bool, ViewAction) {
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
         app.should_quit = true;
         return (false, ViewAction::None);
+    }
+
+    // If in logs view with a task loaded, handle logs keys exclusively
+    if app.in_logs_view() {
+        let action = handle_logs_detail_key(app, key);
+        return (true, action);
     }
 
     // If in pager mode, handle pager keys exclusively
@@ -294,7 +304,7 @@ fn handle_view_key(app: &mut App, key: KeyEvent) -> ViewAction {
         View::Specs => handle_specs_key(app, key),
         View::Plan => handle_plan_key(app, key),
         View::Execute => handle_execute_key(app, key),
-        _ => ViewAction::None,
+        View::Logs => handle_logs_key(app, key),
     }
 }
 
@@ -600,6 +610,74 @@ fn handle_execute_key(app: &mut App, key: KeyEvent) -> ViewAction {
         }
         KeyCode::Char('K') => {
             app.execute_output.scroll_up();
+            ViewAction::None
+        }
+        _ => ViewAction::None,
+    }
+}
+
+/// Handle key events in the Logs task list view (no task selected).
+fn handle_logs_key(app: &mut App, key: KeyEvent) -> ViewAction {
+    match key.code {
+        // Navigate task list using execute tree navigation
+        KeyCode::Up | KeyCode::Char('k') => {
+            app.execute_tree.select_prev();
+            ViewAction::None
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            app.execute_tree.select_next();
+            ViewAction::None
+        }
+        // Enter: open the selected task's log in full-screen
+        KeyCode::Enter => {
+            if let Some(task_id) = app.execute_tree.selected_task_id() {
+                ViewAction::LogsSelectTask(task_id)
+            } else {
+                ViewAction::None
+            }
+        }
+        _ => ViewAction::None,
+    }
+}
+
+/// Handle key events in the full-screen log detail view (task loaded).
+/// This handler blocks all global keys (like pager).
+fn handle_logs_detail_key(app: &mut App, key: KeyEvent) -> ViewAction {
+    // Get visible height for scroll calculations (approximate — actual area set by renderer)
+    // We use 20 as a reasonable default; the actual height will be clamped in scroll methods.
+    let visible_height = 40_u16;
+
+    match key.code {
+        // Esc: exit back to Execute view
+        KeyCode::Esc => ViewAction::LogsExit,
+        // j / Down: scroll down one line
+        KeyCode::Down | KeyCode::Char('j') => {
+            app.logs_view.scroll_down(visible_height);
+            ViewAction::None
+        }
+        // k / Up: scroll up one line
+        KeyCode::Up | KeyCode::Char('k') => {
+            app.logs_view.scroll_up(visible_height);
+            ViewAction::None
+        }
+        // Ctrl+d: page down
+        KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.logs_view.page_down(visible_height);
+            ViewAction::None
+        }
+        // Ctrl+u: page up
+        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.logs_view.page_up(visible_height);
+            ViewAction::None
+        }
+        // G: jump to bottom
+        KeyCode::Char('G') => {
+            app.logs_view.scroll_to_bottom(visible_height);
+            ViewAction::None
+        }
+        // g: jump to top
+        KeyCode::Char('g') => {
+            app.logs_view.scroll_to_top(visible_height);
             ViewAction::None
         }
         _ => ViewAction::None,

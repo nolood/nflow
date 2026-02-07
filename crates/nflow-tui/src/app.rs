@@ -1153,6 +1153,277 @@ impl ExecuteOutputState {
     }
 }
 
+/// A parsed log entry for display in the logs view.
+#[derive(Debug, Clone)]
+pub struct LogEntry {
+    /// Timestamp string (if available).
+    pub timestamp: Option<String>,
+    /// Entry type: "text", "tool_call", "tool_result", "error".
+    pub entry_type: String,
+    /// The display text for this entry.
+    pub text: String,
+}
+
+/// State for the full-screen logs view.
+#[derive(Debug)]
+pub struct LogsViewState {
+    /// Short ID of the currently displayed task (if any).
+    pub task_id: Option<String>,
+    /// Task title for display.
+    pub task_title: Option<String>,
+    /// Task status (e.g., "in_progress", "done", "failed").
+    pub task_status: Option<String>,
+    /// Parsed log entries for display.
+    pub entries: Vec<LogEntry>,
+    /// Flat lines for rendering (derived from entries).
+    pub lines: Vec<String>,
+    /// Whether we're streaming live output.
+    pub is_streaming: bool,
+    /// Streaming request ID (for validating response lines).
+    pub request_id: Option<String>,
+    /// Current scroll offset (0 = bottom for streaming, 0 = top for historical).
+    pub scroll_offset: u16,
+    /// Total number of lines.
+    pub total_lines: u16,
+}
+
+impl LogsViewState {
+    pub fn new() -> Self {
+        Self {
+            task_id: None,
+            task_title: None,
+            task_status: None,
+            entries: Vec::new(),
+            lines: Vec::new(),
+            is_streaming: false,
+            request_id: None,
+            scroll_offset: 0,
+            total_lines: 0,
+        }
+    }
+
+    /// Set the displayed task and its log lines (historical/completed task).
+    pub fn set_historical(&mut self, task_id: String, status: String, lines: Vec<String>) {
+        self.task_id = Some(task_id);
+        self.task_status = Some(status);
+        self.entries = parse_log_entries(&lines);
+        self.lines = format_log_entries(&self.entries);
+        self.total_lines = self.lines.len() as u16;
+        self.is_streaming = false;
+        self.request_id = None;
+        self.scroll_offset = 0;
+    }
+
+    /// Start streaming output for a running task.
+    pub fn start_streaming(&mut self, task_id: String, request_id: String) {
+        self.task_id = Some(task_id);
+        self.task_status = Some("in_progress".to_string());
+        self.entries.clear();
+        self.lines.clear();
+        self.total_lines = 0;
+        self.is_streaming = true;
+        self.request_id = Some(request_id);
+        self.scroll_offset = 0;
+    }
+
+    /// Append a line of streaming output.
+    pub fn append_line(&mut self, line: String) {
+        let entry = parse_single_log_entry(&line);
+        let formatted = format_single_entry(&entry);
+        self.entries.push(entry);
+        self.lines.push(formatted);
+        self.total_lines = self.lines.len() as u16;
+        // Auto-scroll when streaming (keep at bottom)
+        self.scroll_offset = 0;
+    }
+
+    /// Stop streaming.
+    pub fn stop_streaming(&mut self) {
+        self.is_streaming = false;
+        self.request_id = None;
+        if let Some(ref mut status) = self.task_status {
+            if status == "in_progress" {
+                *status = "done".to_string();
+            }
+        }
+    }
+
+    /// Clear the logs view state.
+    pub fn clear(&mut self) {
+        self.task_id = None;
+        self.task_title = None;
+        self.task_status = None;
+        self.entries.clear();
+        self.lines.clear();
+        self.total_lines = 0;
+        self.is_streaming = false;
+        self.request_id = None;
+        self.scroll_offset = 0;
+    }
+
+    /// Scroll down by one line (toward bottom of content).
+    pub fn scroll_down(&mut self, visible_height: u16) {
+        if self.is_streaming {
+            // Streaming: offset 0 = bottom, increasing moves up
+            self.scroll_offset = self.scroll_offset.saturating_sub(1);
+        } else {
+            // Historical: offset 0 = top, increasing moves down
+            let max_scroll = self.total_lines.saturating_sub(visible_height);
+            if self.scroll_offset < max_scroll {
+                self.scroll_offset += 1;
+            }
+        }
+    }
+
+    /// Scroll up by one line (toward top of content).
+    pub fn scroll_up(&mut self, visible_height: u16) {
+        if self.is_streaming {
+            // Streaming: increasing offset = moving up from bottom
+            let max_scroll = self.total_lines.saturating_sub(visible_height);
+            if self.scroll_offset < max_scroll {
+                self.scroll_offset += 1;
+            }
+        } else {
+            // Historical: decreasing offset = moving up
+            self.scroll_offset = self.scroll_offset.saturating_sub(1);
+        }
+    }
+
+    /// Scroll down by half a page.
+    pub fn page_down(&mut self, visible_height: u16) {
+        let half = visible_height / 2;
+        if self.is_streaming {
+            self.scroll_offset = self.scroll_offset.saturating_sub(half);
+        } else {
+            let max_scroll = self.total_lines.saturating_sub(visible_height);
+            self.scroll_offset = (self.scroll_offset + half).min(max_scroll);
+        }
+    }
+
+    /// Scroll up by half a page.
+    pub fn page_up(&mut self, visible_height: u16) {
+        let half = visible_height / 2;
+        if self.is_streaming {
+            let max_scroll = self.total_lines.saturating_sub(visible_height);
+            self.scroll_offset = (self.scroll_offset + half).min(max_scroll);
+        } else {
+            self.scroll_offset = self.scroll_offset.saturating_sub(half);
+        }
+    }
+
+    /// Jump to the top of the log.
+    pub fn scroll_to_top(&mut self, visible_height: u16) {
+        if self.is_streaming {
+            let max_scroll = self.total_lines.saturating_sub(visible_height);
+            self.scroll_offset = max_scroll;
+        } else {
+            self.scroll_offset = 0;
+        }
+    }
+
+    /// Jump to the bottom of the log.
+    pub fn scroll_to_bottom(&mut self, visible_height: u16) {
+        if self.is_streaming {
+            self.scroll_offset = 0;
+        } else {
+            self.scroll_offset = self.total_lines.saturating_sub(visible_height);
+        }
+    }
+}
+
+/// Parse raw log lines into structured LogEntry objects.
+/// Detects tool calls, tool results, and timestamps.
+fn parse_log_entries(lines: &[String]) -> Vec<LogEntry> {
+    lines.iter().map(|l| parse_single_log_entry(l)).collect()
+}
+
+/// Parse a single log line into a LogEntry.
+fn parse_single_log_entry(line: &str) -> LogEntry {
+    // Detect tool call patterns: "Tool: <name>" or lines starting with tool-related prefixes
+    let trimmed = line.trim();
+
+    // Try to extract timestamp from beginning of line (e.g., "[2026-02-08T10:30:00Z]")
+    let (timestamp, rest) = if trimmed.starts_with('[') {
+        if let Some(end) = trimmed.find(']') {
+            let ts = trimmed[1..end].to_string();
+            let remainder = trimmed[end + 1..].trim();
+            (Some(ts), remainder)
+        } else {
+            (None, trimmed)
+        }
+    } else {
+        (None, trimmed)
+    };
+
+    // Classify the entry type
+    let entry_type = if rest.starts_with("Tool call:")
+        || rest.starts_with("tool_use:")
+        || rest.starts_with("Running:")
+    {
+        "tool_call"
+    } else if rest.starts_with("Tool result:")
+        || rest.starts_with("tool_result:")
+        || rest.starts_with("Result:")
+    {
+        "tool_result"
+    } else if rest.starts_with("Error:") || rest.starts_with("error:") || rest.starts_with("ERR") {
+        "error"
+    } else {
+        "text"
+    };
+
+    LogEntry {
+        timestamp,
+        entry_type: entry_type.to_string(),
+        text: line.to_string(),
+    }
+}
+
+/// Format log entries into display lines.
+fn format_log_entries(entries: &[LogEntry]) -> Vec<String> {
+    entries.iter().map(format_single_entry).collect()
+}
+
+/// Format a single log entry into a display line.
+fn format_single_entry(entry: &LogEntry) -> String {
+    if let Some(ref ts) = entry.timestamp {
+        // Extract just the time portion for compact display
+        let time_part = if let Some(t_pos) = ts.find('T') {
+            let time_str = &ts[t_pos + 1..];
+            // Truncate at seconds (drop fractional/timezone)
+            if let Some(dot) = time_str.find('.') {
+                &time_str[..dot]
+            } else if let Some(plus) = time_str.find('+') {
+                &time_str[..plus]
+            } else if let Some(stripped) = time_str.strip_suffix('Z') {
+                stripped
+            } else {
+                time_str
+            }
+        } else {
+            ts.as_str()
+        };
+        format!(
+            "[{}] {}",
+            time_part,
+            entry
+                .text
+                .trim_start_matches(|c: char| c == '['
+                    || c.is_ascii_digit()
+                    || c == '-'
+                    || c == 'T'
+                    || c == ':'
+                    || c == '.'
+                    || c == 'Z'
+                    || c == '+'
+                    || c == ']')
+                .trim_start()
+        )
+    } else {
+        entry.text.clone()
+    }
+}
+
 /// Overlay that can be displayed on top of the current view.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Overlay {
@@ -1264,6 +1535,8 @@ pub struct App {
     pub execute_confirm: Option<PlanConfirmState>,
     /// Event subscription state for real-time updates.
     pub event_subscription: EventSubscriptionState,
+    /// Full-screen logs view state.
+    pub logs_view: LogsViewState,
 }
 
 impl App {
@@ -1290,6 +1563,7 @@ impl App {
             execute_output: ExecuteOutputState::new(),
             execute_confirm: None,
             event_subscription: EventSubscriptionState::new(),
+            logs_view: LogsViewState::new(),
         }
     }
 
@@ -1513,6 +1787,30 @@ impl App {
     /// Close the execute confirmation popup.
     pub fn close_execute_confirm(&mut self) {
         self.execute_confirm = None;
+    }
+
+    /// Returns true if the logs view is actively streaming.
+    pub fn in_logs_streaming(&self) -> bool {
+        self.current_view == View::Logs && self.logs_view.is_streaming
+    }
+
+    /// Returns true if the logs view has a task loaded (active sub-view).
+    pub fn in_logs_view(&self) -> bool {
+        self.current_view == View::Logs && self.logs_view.task_id.is_some()
+    }
+
+    /// Enter the logs view for a specific task, switching to Logs tab.
+    #[allow(dead_code)] // Used by future integration (e.g., double-click from execute view)
+    pub fn enter_logs_for_task(&mut self, task_id: String, task_status: String) {
+        self.logs_view.task_id = Some(task_id);
+        self.logs_view.task_status = Some(task_status);
+        self.current_view = View::Logs;
+    }
+
+    /// Exit the logs view back to Execute view.
+    pub fn exit_logs_view(&mut self) {
+        self.logs_view.clear();
+        self.current_view = View::Execute;
     }
 
     /// Fetch the execute tree from the daemon.

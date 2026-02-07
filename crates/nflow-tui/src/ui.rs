@@ -96,9 +96,7 @@ fn render_content(app: &App, frame: &mut Frame, area: Rect) {
             render_execute_view(app, frame, area);
         }
         View::Logs => {
-            let block = Block::default().borders(Borders::ALL).title("Logs");
-            let paragraph = Paragraph::new("Logs view — shows agent output").block(block);
-            frame.render_widget(paragraph, area);
+            render_logs_view(app, frame, area);
         }
     }
 }
@@ -630,6 +628,221 @@ fn render_execute_output(app: &App, frame: &mut Frame, area: Rect) {
             .wrap(Wrap { trim: false })
             .scroll((scroll, 0));
         frame.render_widget(paragraph, area);
+    }
+}
+
+/// Render the full-screen logs view.
+fn render_logs_view(app: &App, frame: &mut Frame, area: Rect) {
+    let logs = &app.logs_view;
+
+    // If no task is loaded, show the task list from execute tree
+    if logs.task_id.is_none() {
+        render_logs_task_list(app, frame, area);
+        return;
+    }
+
+    let task_id = logs.task_id.as_deref().unwrap_or("?");
+    let status_label = logs.task_status.as_deref().unwrap_or("unknown");
+
+    let title = if logs.is_streaming {
+        format!(
+            "Log: {} [{}] (live) — j/k:line Ctrl+d/u:page g/G:top/bottom Esc:back",
+            task_id, status_label
+        )
+    } else {
+        format!(
+            "Log: {} [{}] — j/k:line Ctrl+d/u:page g/G:top/bottom Esc:back",
+            task_id, status_label
+        )
+    };
+
+    let border_color = if logs.is_streaming {
+        Color::Cyan
+    } else if status_label == "failed" {
+        Color::Red
+    } else {
+        Color::White
+    };
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(title)
+        .title_style(Style::default().add_modifier(Modifier::BOLD))
+        .border_style(Style::default().fg(border_color));
+
+    if logs.lines.is_empty() {
+        let hint = if logs.is_streaming {
+            "Waiting for output..."
+        } else {
+            "No log content available for this task."
+        };
+        let empty = Paragraph::new(vec![
+            Line::from(""),
+            Line::from(Span::styled(hint, Style::default().fg(Color::DarkGray))),
+        ])
+        .block(block);
+        frame.render_widget(empty, area);
+        return;
+    }
+
+    let inner_height = area.height.saturating_sub(2);
+
+    // Build styled content lines
+    let content_lines: Vec<Line> = logs
+        .lines
+        .iter()
+        .enumerate()
+        .map(|(i, l)| {
+            let entry = logs.entries.get(i);
+            let style = match entry.map(|e| e.entry_type.as_str()) {
+                Some("tool_call") => Style::default().fg(Color::Blue),
+                Some("tool_result") => Style::default().fg(Color::Green),
+                Some("error") => Style::default().fg(Color::Red),
+                _ => Style::default(),
+            };
+            Line::from(Span::styled(l.as_str(), style))
+        })
+        .collect();
+
+    if logs.is_streaming {
+        // Streaming: show most recent lines, scroll_offset moves up from bottom
+        let total = content_lines.len() as u16;
+        let max_scroll = total.saturating_sub(inner_height);
+        let scroll = max_scroll.saturating_sub(logs.scroll_offset);
+
+        let paragraph = Paragraph::new(content_lines)
+            .block(block)
+            .wrap(Wrap { trim: false })
+            .scroll((scroll, 0));
+        frame.render_widget(paragraph, area);
+    } else {
+        // Historical: normal top-to-bottom scroll
+        let total = content_lines.len() as u16;
+        let max_scroll = total.saturating_sub(inner_height);
+        let scroll = logs.scroll_offset.min(max_scroll);
+
+        let paragraph = Paragraph::new(content_lines)
+            .block(block)
+            .wrap(Wrap { trim: false })
+            .scroll((scroll, 0));
+        frame.render_widget(paragraph, area);
+    }
+}
+
+/// Render the task list for the logs view (when no task is selected).
+fn render_logs_task_list(app: &App, frame: &mut Frame, area: Rect) {
+    let tree = &app.execute_tree;
+
+    if tree.nodes.is_empty() {
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title("Logs — Select a task");
+        let empty = Paragraph::new(vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                "  No tasks available. Start execution first.",
+                Style::default().fg(Color::DarkGray),
+            )),
+        ])
+        .block(block);
+        frame.render_widget(empty, area);
+        return;
+    }
+
+    let title = "Logs — j/k:navigate Enter:view log";
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(title)
+        .title_style(Style::default().add_modifier(Modifier::BOLD));
+
+    // Show only tasks (depth 3) from the execute tree
+    let tasks: Vec<&crate::app::ExecuteTreeNode> =
+        tree.nodes.iter().filter(|n| n.depth == 3).collect();
+
+    if tasks.is_empty() {
+        let empty = Paragraph::new(vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                "  No tasks found in the execution tree.",
+                Style::default().fg(Color::DarkGray),
+            )),
+        ])
+        .block(block);
+        frame.render_widget(empty, area);
+        return;
+    }
+
+    let inner_height = area.height.saturating_sub(2) as usize;
+
+    // Use execute_tree.selected for selection tracking in list mode
+    let visible = tree.visible_nodes();
+    let task_visible: Vec<(usize, &crate::app::ExecuteTreeNode)> = visible
+        .iter()
+        .filter(|(_, n)| n.depth == 3)
+        .copied()
+        .collect();
+
+    let selected_vis_idx = tree.selected;
+
+    // Scrolling: compute viewport
+    let scroll_offset = if selected_vis_idx >= inner_height {
+        selected_vis_idx - inner_height + 1
+    } else {
+        0
+    };
+
+    let lines: Vec<Line> = task_visible
+        .iter()
+        .enumerate()
+        .skip(scroll_offset)
+        .take(inner_height)
+        .map(|(vi, (_, node))| {
+            let (icon, icon_color) = status_icon(&node.status);
+            let kind_label = node
+                .kind
+                .as_deref()
+                .map(|k| format!("[{}]", k))
+                .unwrap_or_default();
+
+            let is_selected = vi == selected_vis_idx;
+            let style = if is_selected {
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+
+            let prefix = if is_selected { "▶ " } else { "  " };
+
+            Line::from(vec![
+                Span::styled(prefix, style),
+                Span::styled(format!("{} ", icon), Style::default().fg(icon_color)),
+                Span::styled(format!("{} ", node.short_id), style),
+                Span::styled(&node.title, style),
+                Span::styled(
+                    format!(" {}", kind_label),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ])
+        })
+        .collect();
+
+    let paragraph = Paragraph::new(lines).block(block);
+    frame.render_widget(paragraph, area);
+}
+
+/// Get a color based on work item status.
+#[allow(dead_code)] // Used by logs task list when needed for standalone coloring
+fn status_color_from_status(status: &str) -> Color {
+    match status {
+        "pending" => Color::DarkGray,
+        "ready" => Color::Yellow,
+        "in_progress" => Color::Blue,
+        "done" => Color::Green,
+        "failed" => Color::Red,
+        "cancelled" => Color::DarkGray,
+        _ => Color::White,
     }
 }
 
