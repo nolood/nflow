@@ -1283,7 +1283,7 @@
         "Typecheck passes"
       ],
       "priority": 74,
-      "passes": false,
+      "passes": true,
       "notes": ""
     },
     {

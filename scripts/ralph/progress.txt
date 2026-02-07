@@ -27,6 +27,10 @@
 - ExitCode::from(u8) is NOT const in Rust — use u8 constants with a runtime conversion function for exit code modules
 - exec.stop vs exec.cancel: stop sends SIGTERM to running agents (InProgress stories), cancel sets Pending/Ready stories to Cancelled (no process termination)
 - terminate_agent_process_sigterm() sends SIGTERM only (no wait), vs scheduler_loop::terminate_agent_process() which does SIGTERM→wait 10s→SIGKILL
+- TUI protocol types duplicated from daemon (like CLI) — each client crate is independent
+- TUI uses crossterm::event::poll() for non-blocking input (16ms timeout ≈ 60fps), not tokio async events
+- TUI terminal setup/restore pattern: setup() enters raw mode + alternate screen, restore() undoes both — always call restore on exit
+- nix crate for TUI needs features = ["signal", "process", "fs"] (fs for Flock/FlockArg)
 - Story completion lifecycle: rebase → push → MR creation → DB update → worktree cleanup → event broadcast (all in execute_complete_story)
 - On any failure during story completion (rebase/push/MR), story is rolled back to Failed status via fail_story_on_completion_error()
 - Wall-clock timeout: check_agent_timeouts() runs as Phase 0.5 in scheduler_tick (after reaping, before scheduling). Uses nix SIGTERM→sleep(10s)→SIGKILL pattern.
@@ -1867,4 +1871,31 @@ Started: Sat Feb  7 03:49:10 PM MSK 2026
   - ExitCode::from() is not const in Rust — use u8 constants with a conversion function instead
   - Daemon error messages use string prefixes (NOT_FOUND:, INVALID_PARAMS:, etc.) — classify_error_message() maps these to exit codes
   - clap's `after_long_help` attribute only shows in `--help` (long help), not `-h` (short help) — good for detailed reference info
+---
+
+## 2026-02-08 - US-074
+- What was implemented: TUI app skeleton with ratatui + crossterm framework
+- Architecture: 7 modules — app (state/views), daemon_client (auto-start), socket_client (NDJSON protocol), event (input handling), terminal (raw mode setup/restore), ui (rendering), error
+- Full event loop: render frame → poll input (16ms) → handle key events → loop
+- View system: 4 views (Specs/Plan/Execute/Logs) with Tab/Shift+Tab cycling and 1-4 number key switching
+- Daemon integration: auto-start daemon if not running, connect via Unix socket, verify connection on startup
+- Terminal safety: always restores terminal on exit (raw mode cleanup, cursor visible, alternate screen)
+- Project detection: --project flag or auto-detect from cwd
+- 14 unit tests passing (app state, event handling, view cycling, project resolution)
+- Files changed:
+  - crates/nflow-tui/Cargo.toml (added uuid, thiserror, nix, clap dependencies)
+  - crates/nflow-tui/src/main.rs (full TUI entry point with event loop)
+  - crates/nflow-tui/src/app.rs (App state, View enum, DaemonState, tests)
+  - crates/nflow-tui/src/daemon_client.rs (daemon auto-start, socket path, PID check)
+  - crates/nflow-tui/src/socket_client.rs (NDJSON protocol client, handshake, commands)
+  - crates/nflow-tui/src/event.rs (crossterm event polling, key event handling, tests)
+  - crates/nflow-tui/src/terminal.rs (raw mode setup/restore, alternate screen)
+  - crates/nflow-tui/src/ui.rs (header tabs, content area, status bar rendering)
+  - crates/nflow-tui/src/error.rs (TuiError enum with Core/Io/Socket/Terminal variants)
+- **Learnings for future iterations:**
+  - Protocol types are duplicated per client crate (CLI and TUI each have their own) — keeps crates independent
+  - nix crate needs "fs" feature for Flock/FlockArg (daemon lock file)
+  - crossterm::event::poll() is synchronous/blocking for the given duration — use short timeout (16ms) in async event loop
+  - ratatui 0.29 uses Tabs::new(Vec<Line>) — each tab title is a Line of styled Spans
+  - Terminal restore must happen even on error — structure with setup → result = event_loop → restore → result pattern
 ---
