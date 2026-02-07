@@ -115,6 +115,12 @@ pub fn handle_key_event(app: &mut App, key: KeyEvent) -> (bool, ViewAction) {
         return (true, ViewAction::None);
     }
 
+    // Help overlay: any key press dismisses it
+    if app.overlay == Some(Overlay::Help) {
+        app.close_overlay();
+        return (true, ViewAction::None);
+    }
+
     match key.code {
         // Quit (only when no overlay is open)
         KeyCode::Char('q') if !app.has_overlay() => {
@@ -834,6 +840,24 @@ mod tests {
     }
 
     #[test]
+    fn test_any_key_dismisses_help_overlay() {
+        let mut app = App::new("test".to_string());
+        app.toggle_overlay(Overlay::Help);
+        assert_eq!(app.overlay, Some(Overlay::Help));
+
+        // Pressing an arbitrary key dismisses the help overlay
+        let (cont, _) = handle_key_event(&mut app, make_key(KeyCode::Char('x')));
+        assert!(cont);
+        assert_eq!(app.overlay, None);
+
+        // Re-open and test with another key
+        app.toggle_overlay(Overlay::Help);
+        let (cont, _) = handle_key_event(&mut app, make_key(KeyCode::Enter));
+        assert!(cont);
+        assert_eq!(app.overlay, None);
+    }
+
+    #[test]
     fn test_number_keys_blocked_with_overlay() {
         let mut app = App::new("test".to_string());
         app.toggle_overlay(Overlay::Help);
@@ -955,12 +979,15 @@ mod tests {
         let mut app = app_with_specs();
         app.toggle_overlay(Overlay::Help);
 
+        // First key dismisses help overlay (any key dismisses help)
         let (_, action) = handle_key_event(&mut app, make_key(KeyCode::Char('n')));
         assert_eq!(action, ViewAction::None);
+        assert_eq!(app.overlay, None);
 
+        // After help is dismissed, keys work normally
         let (_, action) = handle_key_event(&mut app, make_key(KeyCode::Down));
         assert_eq!(action, ViewAction::None);
-        assert_eq!(app.specs_list.selected, 0);
+        assert_eq!(app.specs_list.selected, 1);
     }
 
     #[test]

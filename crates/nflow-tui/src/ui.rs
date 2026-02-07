@@ -23,7 +23,7 @@ pub fn render(app: &App, frame: &mut Frame) {
 
     // Render overlay on top if active
     if let Some(overlay) = &app.overlay {
-        render_overlay(overlay, frame, frame.area());
+        render_overlay(overlay, app.current_view, frame, frame.area());
     }
 
     // Render plan sub-views on top
@@ -1125,69 +1125,119 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
 }
 
 /// Render an overlay popup on top of the current view.
-fn render_overlay(overlay: &Overlay, frame: &mut Frame, area: Rect) {
+fn render_overlay(overlay: &Overlay, current_view: View, frame: &mut Frame, area: Rect) {
     match overlay {
-        Overlay::Help => render_help_overlay(frame, area),
+        Overlay::Help => render_help_overlay(current_view, frame, area),
         Overlay::ProjectSwitcher => render_project_switcher_overlay(frame, area),
         Overlay::Filter => render_filter_overlay(frame, area),
     }
 }
 
-/// Render the help overlay with keybinding reference.
-fn render_help_overlay(frame: &mut Frame, area: Rect) {
-    let popup_area = centered_rect(60, 60, area);
+/// Helper to create a keybinding line for the help overlay.
+fn help_key(key: &str, desc: &str) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(format!("  {:<11}", key), Style::default().fg(Color::Yellow)),
+        Span::raw(desc.to_string()),
+    ])
+}
+
+/// Helper to create a section header line for the help overlay.
+fn help_section(title: &str) -> Line<'static> {
+    Line::from(Span::styled(
+        title.to_string(),
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    ))
+}
+
+/// Return keybindings specific to the given view.
+fn view_keybindings(view: View) -> Vec<Line<'static>> {
+    match view {
+        View::Specs => vec![
+            help_key("j/k", "Navigate spec list"),
+            help_key("n", "New spec"),
+            help_key("r", "Resume spec dialogue"),
+            help_key("v", "View spec content"),
+            help_key("a", "Approve spec"),
+            help_key("d", "Delete spec"),
+        ],
+        View::Plan => vec![
+            help_key("j/k", "Navigate plan tree"),
+            help_key("Space", "Toggle collapse"),
+            help_key("Enter", "View item detail"),
+            help_key("h", "Toggle verify tasks"),
+            help_key("g", "Generate plan"),
+            help_key("f", "Give feedback"),
+            help_key("a", "Approve plan"),
+            help_key("d", "Discard plan"),
+        ],
+        View::Execute => vec![
+            help_key("j/k", "Navigate tree"),
+            help_key("J/K", "Scroll output pane"),
+            help_key("Space", "Toggle collapse"),
+            help_key("h", "Toggle verify tasks"),
+            help_key("Enter", "View task output"),
+            help_key("r", "Run execution"),
+            help_key("s", "Stop story"),
+            help_key("c", "Cancel story"),
+            help_key("e", "Escalate story"),
+        ],
+        View::Logs => vec![
+            help_key("j/k", "Navigate task list"),
+            help_key("Enter", "View full task log"),
+            help_key("Esc", "Exit log detail"),
+        ],
+    }
+}
+
+/// Render the help overlay with view-specific and global keybinding reference.
+fn render_help_overlay(current_view: View, frame: &mut Frame, area: Rect) {
+    // Dim the background for semi-transparent effect
+    let dim_style = Style::default().fg(Color::DarkGray);
+    let buf = frame.buffer_mut();
+    for y in area.top()..area.bottom() {
+        for x in area.left()..area.right() {
+            if let Some(cell) = buf.cell_mut((x, y)) {
+                cell.set_style(dim_style);
+            }
+        }
+    }
+
+    let popup_area = centered_rect(60, 70, area);
     frame.render_widget(Clear, popup_area);
 
-    let help_lines = vec![
-        Line::from(Span::styled(
-            "Keyboard Shortcuts",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        )),
-        Line::from(""),
-        Line::from(vec![
-            Span::styled("  1-4      ", Style::default().fg(Color::Yellow)),
-            Span::raw("Switch to Specs/Plan/Execute/Logs view"),
-        ]),
-        Line::from(vec![
-            Span::styled("  Tab      ", Style::default().fg(Color::Yellow)),
-            Span::raw("Next view"),
-        ]),
-        Line::from(vec![
-            Span::styled("  Shift+Tab", Style::default().fg(Color::Yellow)),
-            Span::raw("Previous view"),
-        ]),
-        Line::from(""),
-        Line::from(vec![
-            Span::styled("  ?        ", Style::default().fg(Color::Yellow)),
-            Span::raw("Toggle this help"),
-        ]),
-        Line::from(vec![
-            Span::styled("  p        ", Style::default().fg(Color::Yellow)),
-            Span::raw("Project switcher"),
-        ]),
-        Line::from(vec![
-            Span::styled("  /        ", Style::default().fg(Color::Yellow)),
-            Span::raw("Filter / search"),
-        ]),
-        Line::from(vec![
-            Span::styled("  q        ", Style::default().fg(Color::Yellow)),
-            Span::raw("Quit TUI (daemon continues)"),
-        ]),
-        Line::from(vec![
-            Span::styled("  Ctrl+C   ", Style::default().fg(Color::Yellow)),
-            Span::raw("Force quit"),
-        ]),
-        Line::from(vec![
-            Span::styled("  Esc      ", Style::default().fg(Color::Yellow)),
-            Span::raw("Close overlay"),
-        ]),
-    ];
+    let mut lines: Vec<Line<'static>> = Vec::new();
 
+    // View-specific section
+    lines.push(help_section(&format!("{} View", current_view.label())));
+    lines.push(Line::from(""));
+    lines.extend(view_keybindings(current_view));
+
+    // Global section
+    lines.push(Line::from(""));
+    lines.push(help_section("Global"));
+    lines.push(Line::from(""));
+    lines.push(help_key("1-4", "Switch view"));
+    lines.push(help_key("Tab", "Next view"));
+    lines.push(help_key("Shift+Tab", "Previous view"));
+    lines.push(help_key("?", "Toggle help"));
+    lines.push(help_key("p", "Project switcher"));
+    lines.push(help_key("/", "Filter / search"));
+    lines.push(help_key("q", "Quit"));
+    lines.push(help_key("Ctrl+C", "Force quit"));
+
+    // Dismiss hint
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "  Press any key to dismiss".to_string(),
+        Style::default().fg(Color::DarkGray),
+    )));
+
+    let title = format!(" Help - {} ", current_view.label());
     let block = Block::default()
         .borders(Borders::ALL)
-        .title("Help")
+        .title(title)
         .title_style(
             Style::default()
                 .fg(Color::Cyan)
@@ -1195,7 +1245,7 @@ fn render_help_overlay(frame: &mut Frame, area: Rect) {
         )
         .border_style(Style::default().fg(Color::Cyan));
 
-    let paragraph = Paragraph::new(help_lines)
+    let paragraph = Paragraph::new(lines)
         .block(block)
         .wrap(Wrap { trim: false });
     frame.render_widget(paragraph, popup_area);
