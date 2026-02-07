@@ -54,6 +54,7 @@
 - visible_nodes() pattern: iterate all nodes, skip children when parent.collapsed, filter verify tasks when hide_verify — returns Vec<(real_index, &node)> for mapping back to flat array
 - TUI full-screen view pattern: in_*_view() check in handle_key_event blocks global keys; handle_*_detail_key() handles exclusive navigation; Esc returns to parent view
 - TUI streaming in multiple views: each view has its own streaming state (execute_output, logs_view); event loop checks in_*_streaming() for correct polling; daemon events guarded by all streaming checks
+- TUI filter pattern: FilterState on App (global), visible_nodes_filtered(filter) propagates matches up to ancestors, bottom-bar input replaces status bar while editing
 - Story completion lifecycle: rebase → push → MR creation → DB update → worktree cleanup → event broadcast (all in execute_complete_story)
 - On any failure during story completion (rebase/push/MR), story is rolled back to Failed status via fail_story_on_completion_error()
 - Wall-clock timeout: check_agent_timeouts() runs as Phase 0.5 in scheduler_tick (after reaping, before scheduling). Uses nix SIGTERM→sleep(10s)→SIGKILL pattern.
@@ -2145,4 +2146,26 @@ Started: Sat Feb  7 03:49:10 PM MSK 2026
   - render_overlay signature needed app reference instead of just current_view when overlays need app state
   - project.list returns name, path, base_branch, git_provider, execution_enabled, spec_count, story_count, active_agent_count
   - Pre-existing flaky test: test_config_set_validation_rejects_zero_max_parallel fails in parallel but passes in isolation
+---
+
+## 2026-02-08 - US-087
+- What was implemented: TUI filter and search — bottom-bar input for filtering tree items by title
+  - FilterState struct: editing mode, query text, applied_query, matches() helper (case-insensitive)
+  - Replaced Overlay::Filter popup with bottom-bar input mode (like vim's / search)
+  - visible_nodes_filtered(filter) on PlanTreeState and ExecuteTreeState: filters by title, shows ancestors of matches
+  - visible_items_filtered(filter) on SpecsListState: filters specs by name
+  - Live filtering while typing; Enter confirms, Esc clears filter
+  - Filter bar replaces status bar: shows input field + "Showing X/Y items" match count
+  - Navigation (j/k/arrows), collapse (Space), and selection work correctly with filtered views
+  - Works across all views: Specs, Plan, Execute, Logs (task list)
+- Files changed:
+  - crates/nflow-tui/src/app.rs (FilterState struct, visible_nodes_filtered, visible_items_filtered, select_prev/next_filtered, toggle_collapse_filtered, removed Overlay::Filter)
+  - crates/nflow-tui/src/event.rs (handle_filter_editing, / key opens filter input, Esc clears, Enter confirms, view keys use filtered navigation)
+  - crates/nflow-tui/src/ui.rs (render_filter_bar replaces render_filter_overlay, tree/list renderers use filtered visible nodes, match count display)
+- **Learnings for future iterations:**
+  - Filter bottom-bar is better UX than popup overlay for search — keeps context visible while typing
+  - Tree filtering requires ancestor propagation: walk backwards from matching nodes to mark all parents as visible
+  - visible_nodes_filtered("") is backward-compatible with visible_nodes() — delegate for zero breakage
+  - Filter state is global on App (not per-view) — simpler than per-view filter state
+  - Removing an enum variant (Overlay::Filter) requires updating all match arms and test assertions referencing it
 ---

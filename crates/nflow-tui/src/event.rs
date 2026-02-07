@@ -83,6 +83,11 @@ pub fn handle_key_event(app: &mut App, key: KeyEvent) -> (bool, ViewAction) {
         return (false, ViewAction::None);
     }
 
+    // If filter is being edited, handle filter input exclusively
+    if app.in_filter_editing() {
+        return handle_filter_editing(app, key);
+    }
+
     // If in logs view with a task loaded, handle logs keys exclusively
     if app.in_logs_view() {
         let action = handle_logs_detail_key(app, key);
@@ -113,10 +118,15 @@ pub fn handle_key_event(app: &mut App, key: KeyEvent) -> (bool, ViewAction) {
         return (true, action);
     }
 
-    // Escape closes any open overlay
-    if key.code == KeyCode::Esc && app.has_overlay() {
-        app.close_overlay();
-        return (true, ViewAction::None);
+    // Escape closes any open overlay or clears filter
+    if key.code == KeyCode::Esc {
+        if app.has_overlay() {
+            app.close_overlay();
+            return (true, ViewAction::None);
+        } else if app.filter_state.is_active() {
+            app.filter_state.cancel();
+            return (true, ViewAction::None);
+        }
     }
 
     // Help overlay: any key press dismisses it
@@ -145,7 +155,7 @@ pub fn handle_key_event(app: &mut App, key: KeyEvent) -> (bool, ViewAction) {
         }
         KeyCode::Char('p') if !app.has_overlay() => (true, ViewAction::ProjectSwitcherOpen),
         KeyCode::Char('/') if !app.has_overlay() => {
-            app.toggle_overlay(Overlay::Filter);
+            app.filter_state.start_editing();
             (true, ViewAction::None)
         }
 
@@ -192,6 +202,29 @@ pub fn handle_key_event(app: &mut App, key: KeyEvent) -> (bool, ViewAction) {
 }
 
 /// Handle key events in the project switcher overlay.
+/// Handle key events when filter input bar is being edited.
+fn handle_filter_editing(app: &mut App, key: KeyEvent) -> (bool, ViewAction) {
+    match key.code {
+        KeyCode::Char(c) => {
+            app.filter_state.query.push(c);
+            (true, ViewAction::None)
+        }
+        KeyCode::Backspace => {
+            app.filter_state.query.pop();
+            (true, ViewAction::None)
+        }
+        KeyCode::Enter => {
+            app.filter_state.confirm();
+            (true, ViewAction::None)
+        }
+        KeyCode::Esc => {
+            app.filter_state.cancel();
+            (true, ViewAction::None)
+        }
+        _ => (true, ViewAction::None),
+    }
+}
+
 fn handle_project_switcher_key(app: &mut App, key: KeyEvent) -> ViewAction {
     let switcher = match &mut app.project_switcher {
         Some(s) => s,
@@ -351,19 +384,26 @@ fn handle_view_key(app: &mut App, key: KeyEvent) -> ViewAction {
 
 /// Handle key events in the Plan tree view.
 fn handle_plan_key(app: &mut App, key: KeyEvent) -> ViewAction {
+    // Get the active filter query (editing query if editing, otherwise applied query)
+    let filter_query = if app.filter_state.editing {
+        &app.filter_state.query
+    } else {
+        &app.filter_state.applied_query
+    };
+
     match key.code {
         // Navigation
         KeyCode::Up | KeyCode::Char('k') => {
-            app.plan_tree.select_prev();
+            app.plan_tree.select_prev_filtered(filter_query);
             ViewAction::None
         }
         KeyCode::Down | KeyCode::Char('j') => {
-            app.plan_tree.select_next();
+            app.plan_tree.select_next_filtered(filter_query);
             ViewAction::None
         }
         // Toggle collapse (Space only; Enter now opens detail)
         KeyCode::Char(' ') => {
-            app.plan_tree.toggle_collapse();
+            app.plan_tree.toggle_collapse_filtered(filter_query);
             ViewAction::None
         }
         // Enter: show detail popup for the selected item
@@ -569,19 +609,26 @@ fn handle_execute_confirm_key(app: &mut App, key: KeyEvent) -> ViewAction {
 
 /// Handle key events in the Execute split view.
 fn handle_execute_key(app: &mut App, key: KeyEvent) -> ViewAction {
+    // Get the active filter query (editing query if editing, otherwise applied query)
+    let filter_query = if app.filter_state.editing {
+        &app.filter_state.query
+    } else {
+        &app.filter_state.applied_query
+    };
+
     match key.code {
         // Navigation
         KeyCode::Up | KeyCode::Char('k') => {
-            app.execute_tree.select_prev();
+            app.execute_tree.select_prev_filtered(filter_query);
             ViewAction::None
         }
         KeyCode::Down | KeyCode::Char('j') => {
-            app.execute_tree.select_next();
+            app.execute_tree.select_next_filtered(filter_query);
             ViewAction::None
         }
         // Toggle collapse
         KeyCode::Char(' ') => {
-            app.execute_tree.toggle_collapse();
+            app.execute_tree.toggle_collapse_filtered(filter_query);
             ViewAction::None
         }
         // Toggle verify task visibility
@@ -727,14 +774,21 @@ fn handle_logs_detail_key(app: &mut App, key: KeyEvent) -> ViewAction {
 
 /// Handle key events in the Specs list view.
 fn handle_specs_key(app: &mut App, key: KeyEvent) -> ViewAction {
+    // Get the active filter query (editing query if editing, otherwise applied query)
+    let filter_query = if app.filter_state.editing {
+        &app.filter_state.query
+    } else {
+        &app.filter_state.applied_query
+    };
+
     match key.code {
         // Navigation
         KeyCode::Up | KeyCode::Char('k') => {
-            app.specs_list.select_prev();
+            app.specs_list.select_prev_filtered(filter_query);
             ViewAction::None
         }
         KeyCode::Down | KeyCode::Char('j') => {
-            app.specs_list.select_next();
+            app.specs_list.select_next_filtered(filter_query);
             ViewAction::None
         }
 
@@ -851,7 +905,7 @@ mod tests {
     fn test_slash_opens_filter() {
         let mut app = App::new("test".to_string());
         handle_key_event(&mut app, make_key(KeyCode::Char('/')));
-        assert_eq!(app.overlay, Some(Overlay::Filter));
+        assert!(app.filter_state.is_editing());
     }
 
     #[test]

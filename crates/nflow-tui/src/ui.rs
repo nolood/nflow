@@ -145,14 +145,21 @@ fn render_specs_list(app: &App, frame: &mut Frame, area: Rect) {
         return;
     }
 
+    // Get the active filter query (editing query if editing, otherwise applied query)
+    let filter_query = if app.filter_state.editing {
+        &app.filter_state.query
+    } else {
+        &app.filter_state.applied_query
+    };
+    let visible_items = specs.visible_items_filtered(filter_query);
+
     // Build table rows
-    let rows: Vec<Row> = specs
-        .items
+    let rows: Vec<Row> = visible_items
         .iter()
         .enumerate()
-        .map(|(i, spec)| {
+        .map(|(vi, &(_i, spec))| {
             let color = status_color(&spec.status);
-            let name_style = if i == specs.selected {
+            let name_style = if vi == specs.selected {
                 Style::default()
                     .fg(Color::White)
                     .add_modifier(Modifier::BOLD)
@@ -172,7 +179,7 @@ fn render_specs_list(app: &App, frame: &mut Frame, area: Rect) {
                 )),
             ]);
 
-            if i == specs.selected {
+            if vi == specs.selected {
                 row.style(Style::default().bg(Color::DarkGray))
             } else {
                 row
@@ -273,7 +280,14 @@ fn render_plan_tree(app: &App, frame: &mut Frame, area: Rect) {
         .title_style(Style::default().add_modifier(Modifier::BOLD));
 
     let inner_height = area.height.saturating_sub(2) as usize;
-    let visible = tree.visible_nodes();
+
+    // Get the active filter query (editing query if editing, otherwise applied query)
+    let filter_query = if app.filter_state.editing {
+        &app.filter_state.query
+    } else {
+        &app.filter_state.applied_query
+    };
+    let visible = tree.visible_nodes_filtered(filter_query);
 
     // Scroll offset to keep selection visible
     let scroll_offset = if tree.selected >= inner_height {
@@ -443,7 +457,14 @@ fn render_execute_tree(app: &App, frame: &mut Frame, area: Rect) {
         .title_style(Style::default().add_modifier(Modifier::BOLD));
 
     let inner_height = area.height.saturating_sub(2) as usize;
-    let visible = tree.visible_nodes();
+
+    // Get the active filter query (editing query if editing, otherwise applied query)
+    let filter_query = if app.filter_state.editing {
+        &app.filter_state.query
+    } else {
+        &app.filter_state.applied_query
+    };
+    let visible = tree.visible_nodes_filtered(filter_query);
 
     // Scroll offset to keep selection visible
     let scroll_offset = if tree.selected >= inner_height {
@@ -774,8 +795,15 @@ fn render_logs_task_list(app: &App, frame: &mut Frame, area: Rect) {
 
     let inner_height = area.height.saturating_sub(2) as usize;
 
+    // Get the active filter query (editing query if editing, otherwise applied query)
+    let filter_query = if app.filter_state.editing {
+        &app.filter_state.query
+    } else {
+        &app.filter_state.applied_query
+    };
+
     // Use execute_tree.selected for selection tracking in list mode
-    let visible = tree.visible_nodes();
+    let visible = tree.visible_nodes_filtered(filter_query);
     let task_visible: Vec<(usize, &crate::app::ExecuteTreeNode)> = visible
         .iter()
         .filter(|(_, n)| n.depth == 3)
@@ -1017,6 +1045,12 @@ fn render_spec_dialogue(app: &App, frame: &mut Frame, area: Rect) {
 
 /// Render the status bar at the bottom.
 fn render_status_bar(app: &App, frame: &mut Frame, area: Rect) {
+    // If filter is active or being edited, show filter bar instead
+    if app.filter_state.is_editing() || app.filter_state.is_active() {
+        render_filter_bar(app, frame, area);
+        return;
+    }
+
     let daemon_style = match app.daemon_state {
         DaemonState::Connected => Style::default().fg(Color::Green),
         DaemonState::Disconnected => Style::default().fg(Color::Red),
@@ -1103,6 +1137,61 @@ fn render_status_bar(app: &App, frame: &mut Frame, area: Rect) {
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
+/// Render the filter bar (replaces status bar when filter is active).
+fn render_filter_bar(app: &App, frame: &mut Frame, area: Rect) {
+    // Get the query to display (editing or applied)
+    let query = if app.filter_state.is_editing() {
+        &app.filter_state.query
+    } else {
+        &app.filter_state.applied_query
+    };
+
+    // Count matches based on current view
+    let (visible, total) = match app.current_view {
+        View::Specs => {
+            let visible = app.specs_list.visible_items_filtered(query);
+            (visible.len(), app.specs_list.items.len())
+        }
+        View::Plan => {
+            let visible = app.plan_tree.visible_nodes_filtered(query);
+            (visible.len(), app.plan_tree.nodes.len())
+        }
+        View::Execute | View::Logs => {
+            let visible = app.execute_tree.visible_nodes_filtered(query);
+            (visible.len(), app.execute_tree.nodes.len())
+        }
+    };
+
+    let mut spans = vec![
+        Span::styled(" Filter: /", Style::default().fg(Color::Yellow)),
+        Span::styled(query, Style::default().fg(Color::White)),
+        Span::styled("/ ", Style::default().fg(Color::Yellow)),
+    ];
+
+    // Show match count
+    spans.push(Span::raw(" | "));
+    spans.push(Span::styled(
+        format!("Showing {}/{} items", visible, total),
+        Style::default().fg(Color::Cyan),
+    ));
+
+    // Show hints
+    spans.push(Span::raw(" | "));
+    if app.filter_state.is_editing() {
+        spans.push(Span::styled(
+            "Enter:apply Esc:cancel",
+            Style::default().fg(Color::DarkGray),
+        ));
+    } else {
+        spans.push(Span::styled(
+            "Esc:clear /:edit",
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
 /// Compute a centered rect of the given percentage within the provided area.
 fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
     let popup_layout = Layout::default()
@@ -1129,7 +1218,6 @@ fn render_overlay(overlay: &Overlay, app: &App, frame: &mut Frame, area: Rect) {
     match overlay {
         Overlay::Help => render_help_overlay(app.current_view, frame, area),
         Overlay::ProjectSwitcher => render_project_switcher_overlay(app, frame, area),
-        Overlay::Filter => render_filter_overlay(frame, area),
     }
 }
 
@@ -1628,37 +1716,6 @@ fn render_detail_popup(app: &App, frame: &mut Frame, area: Rect) {
 }
 
 /// Render the filter overlay (placeholder for future implementation).
-fn render_filter_overlay(frame: &mut Frame, area: Rect) {
-    let popup_area = centered_rect(50, 30, area);
-    frame.render_widget(Clear, popup_area);
-
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title("Filter")
-        .title_style(
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        )
-        .border_style(Style::default().fg(Color::Yellow));
-
-    let content = Paragraph::new(vec![
-        Line::from(""),
-        Line::from(Span::styled(
-            "  Type to filter...",
-            Style::default().fg(Color::DarkGray),
-        )),
-        Line::from(""),
-        Line::from(Span::styled(
-            "  Press Esc to close.",
-            Style::default().fg(Color::DarkGray),
-        )),
-    ])
-    .block(block);
-
-    frame.render_widget(content, popup_area);
-}
-
 /// Render a confirmation popup for execute actions (stop, cancel, escalate).
 fn render_execute_confirm_popup(app: &App, frame: &mut Frame, area: Rect) {
     let confirm = match &app.execute_confirm {

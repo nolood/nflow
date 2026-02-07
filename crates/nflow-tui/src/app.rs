@@ -26,16 +26,43 @@ impl SpecsListState {
         }
     }
 
+    /// Get visible items with optional text filter.
+    pub fn visible_items_filtered(&self, filter: &str) -> Vec<(usize, &SpecItem)> {
+        if filter.is_empty() {
+            return self.items.iter().enumerate().collect();
+        }
+        let filter_lower = filter.to_lowercase();
+        self.items
+            .iter()
+            .enumerate()
+            .filter(|(_, item)| item.name.to_lowercase().contains(&filter_lower))
+            .collect()
+    }
+
     /// Move selection up.
+    #[allow(dead_code)]
     pub fn select_prev(&mut self) {
-        if !self.items.is_empty() && self.selected > 0 {
+        self.select_prev_filtered("");
+    }
+
+    /// Move selection up with filter.
+    pub fn select_prev_filtered(&mut self, filter: &str) {
+        let visible = self.visible_items_filtered(filter);
+        if !visible.is_empty() && self.selected > 0 {
             self.selected -= 1;
         }
     }
 
     /// Move selection down.
+    #[allow(dead_code)]
     pub fn select_next(&mut self) {
-        if !self.items.is_empty() && self.selected < self.items.len() - 1 {
+        self.select_next_filtered("");
+    }
+
+    /// Move selection down with filter.
+    pub fn select_next_filtered(&mut self, filter: &str) {
+        let visible = self.visible_items_filtered(filter);
+        if !visible.is_empty() && self.selected < visible.len() - 1 {
             self.selected += 1;
         }
     }
@@ -292,11 +319,51 @@ impl PlanTreeState {
 
     /// Get visible nodes (respecting collapsed state and verify filter).
     pub fn visible_nodes(&self) -> Vec<(usize, &PlanTreeNode)> {
+        self.visible_nodes_filtered("")
+    }
+
+    /// Get visible nodes with optional text filter.
+    /// If filter is non-empty, only show nodes that match or have matching descendants.
+    pub fn visible_nodes_filtered(&self, filter: &str) -> Vec<(usize, &PlanTreeNode)> {
+        // First pass: determine which nodes match (directly or via descendants)
+        let matching = if filter.is_empty() {
+            vec![true; self.nodes.len()]
+        } else {
+            let filter_lower = filter.to_lowercase();
+            let mut matches = vec![false; self.nodes.len()];
+
+            // Mark direct matches
+            for (i, node) in self.nodes.iter().enumerate() {
+                if node.title.to_lowercase().contains(&filter_lower) {
+                    matches[i] = true;
+                }
+            }
+
+            // Propagate matches upward: if a child matches, mark all its ancestors
+            // For each matching node, walk backwards to find and mark all ancestors
+            let mut result = matches.clone();
+            for (i, &is_match) in matches.iter().enumerate() {
+                if is_match {
+                    let mut depth = self.nodes[i].depth;
+                    for j in (0..i).rev() {
+                        if self.nodes[j].depth < depth {
+                            result[j] = true;
+                            depth = self.nodes[j].depth;
+                            if depth == 0 {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            result
+        };
+
+        // Second pass: normal visibility logic (collapsed, verify filter) + matching filter
         let mut result = Vec::new();
         let mut skip_depth: Option<u8> = None;
 
         for (i, node) in self.nodes.iter().enumerate() {
-            // Skip children of collapsed nodes
             if let Some(sd) = skip_depth {
                 if node.depth > sd {
                     continue;
@@ -304,7 +371,11 @@ impl PlanTreeState {
                 skip_depth = None;
             }
 
-            // Filter out verify tasks if hide_verify is on
+            // Filter out non-matching nodes
+            if !matching[i] {
+                continue;
+            }
+
             if self.hide_verify && node.depth == 3 {
                 if let Some(ref kind) = node.kind {
                     if kind == "verify" {
@@ -324,8 +395,14 @@ impl PlanTreeState {
     }
 
     /// Move selection up.
+    #[allow(dead_code)]
     pub fn select_prev(&mut self) {
-        let visible = self.visible_nodes();
+        self.select_prev_filtered("");
+    }
+
+    /// Move selection up with filter.
+    pub fn select_prev_filtered(&mut self, filter: &str) {
+        let visible = self.visible_nodes_filtered(filter);
         if visible.is_empty() {
             return;
         }
@@ -335,8 +412,14 @@ impl PlanTreeState {
     }
 
     /// Move selection down.
+    #[allow(dead_code)]
     pub fn select_next(&mut self) {
-        let visible = self.visible_nodes();
+        self.select_next_filtered("");
+    }
+
+    /// Move selection down with filter.
+    pub fn select_next_filtered(&mut self, filter: &str) {
+        let visible = self.visible_nodes_filtered(filter);
         if visible.is_empty() {
             return;
         }
@@ -346,8 +429,14 @@ impl PlanTreeState {
     }
 
     /// Toggle collapse on the selected node.
+    #[allow(dead_code)]
     pub fn toggle_collapse(&mut self) {
-        let visible = self.visible_nodes();
+        self.toggle_collapse_filtered("");
+    }
+
+    /// Toggle collapse on the selected node with filter.
+    pub fn toggle_collapse_filtered(&mut self, filter: &str) {
+        let visible = self.visible_nodes_filtered(filter);
         if let Some(&(real_idx, _)) = visible.get(self.selected) {
             if self.nodes[real_idx].has_children {
                 self.nodes[real_idx].collapsed = !self.nodes[real_idx].collapsed;
@@ -706,6 +795,47 @@ impl ExecuteTreeState {
 
     /// Get visible nodes (respecting collapsed state and verify filter).
     pub fn visible_nodes(&self) -> Vec<(usize, &ExecuteTreeNode)> {
+        self.visible_nodes_filtered("")
+    }
+
+    /// Get visible nodes with optional text filter.
+    /// If filter is non-empty, only show nodes that match or have matching descendants.
+    pub fn visible_nodes_filtered(&self, filter: &str) -> Vec<(usize, &ExecuteTreeNode)> {
+        // First pass: determine which nodes match (directly or via descendants)
+        let matching = if filter.is_empty() {
+            vec![true; self.nodes.len()]
+        } else {
+            let filter_lower = filter.to_lowercase();
+            let mut matches = vec![false; self.nodes.len()];
+
+            // Mark direct matches
+            for (i, node) in self.nodes.iter().enumerate() {
+                if node.title.to_lowercase().contains(&filter_lower) {
+                    matches[i] = true;
+                }
+            }
+
+            // Propagate matches upward: if a child matches, mark all its ancestors
+            // For each matching node, walk backwards to find and mark all ancestors
+            let mut result = matches.clone();
+            for (i, &is_match) in matches.iter().enumerate() {
+                if is_match {
+                    let mut depth = self.nodes[i].depth;
+                    for j in (0..i).rev() {
+                        if self.nodes[j].depth < depth {
+                            result[j] = true;
+                            depth = self.nodes[j].depth;
+                            if depth == 0 {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            result
+        };
+
+        // Second pass: normal visibility logic (collapsed, verify filter) + matching filter
         let mut result = Vec::new();
         let mut skip_depth: Option<u8> = None;
 
@@ -715,6 +845,11 @@ impl ExecuteTreeState {
                     continue;
                 }
                 skip_depth = None;
+            }
+
+            // Filter out non-matching nodes
+            if !matching[i] {
+                continue;
             }
 
             if self.hide_verify && node.depth == 3 {
@@ -736,8 +871,14 @@ impl ExecuteTreeState {
     }
 
     /// Move selection up.
+    #[allow(dead_code)]
     pub fn select_prev(&mut self) {
-        let visible = self.visible_nodes();
+        self.select_prev_filtered("");
+    }
+
+    /// Move selection up with filter.
+    pub fn select_prev_filtered(&mut self, filter: &str) {
+        let visible = self.visible_nodes_filtered(filter);
         if visible.is_empty() {
             return;
         }
@@ -747,8 +888,14 @@ impl ExecuteTreeState {
     }
 
     /// Move selection down.
+    #[allow(dead_code)]
     pub fn select_next(&mut self) {
-        let visible = self.visible_nodes();
+        self.select_next_filtered("");
+    }
+
+    /// Move selection down with filter.
+    pub fn select_next_filtered(&mut self, filter: &str) {
+        let visible = self.visible_nodes_filtered(filter);
         if visible.is_empty() {
             return;
         }
@@ -758,8 +905,14 @@ impl ExecuteTreeState {
     }
 
     /// Toggle collapse on the selected node.
+    #[allow(dead_code)]
     pub fn toggle_collapse(&mut self) {
-        let visible = self.visible_nodes();
+        self.toggle_collapse_filtered("");
+    }
+
+    /// Toggle collapse on the selected node with filter.
+    pub fn toggle_collapse_filtered(&mut self, filter: &str) {
+        let visible = self.visible_nodes_filtered(filter);
         if let Some(&(real_idx, _)) = visible.get(self.selected) {
             if self.nodes[real_idx].has_children {
                 self.nodes[real_idx].collapsed = !self.nodes[real_idx].collapsed;
@@ -1464,12 +1617,85 @@ impl ProjectSwitcherState {
     }
 }
 
+/// State for the filter/search bar.
+#[derive(Debug)]
+pub struct FilterState {
+    /// Whether the filter input bar is active (user is typing).
+    pub editing: bool,
+    /// The current filter query text.
+    pub query: String,
+    /// The confirmed/applied filter query (what's actually filtering).
+    pub applied_query: String,
+}
+
+impl FilterState {
+    pub fn new() -> Self {
+        Self {
+            editing: false,
+            query: String::new(),
+            applied_query: String::new(),
+        }
+    }
+
+    /// Start editing the filter (open the input bar).
+    pub fn start_editing(&mut self) {
+        self.editing = true;
+        self.query = self.applied_query.clone();
+    }
+
+    /// Confirm the current query (Enter).
+    pub fn confirm(&mut self) {
+        self.applied_query = self.query.clone();
+        self.editing = false;
+    }
+
+    /// Cancel editing and clear the filter (Esc).
+    pub fn cancel(&mut self) {
+        self.editing = false;
+        self.query.clear();
+        self.applied_query.clear();
+    }
+
+    /// Returns true if a filter is active (non-empty applied query).
+    pub fn is_active(&self) -> bool {
+        !self.applied_query.is_empty()
+    }
+
+    /// Returns true if the filter input bar is being edited.
+    pub fn is_editing(&self) -> bool {
+        self.editing
+    }
+
+    /// Check if a title matches the filter (case-insensitive).
+    #[allow(dead_code)]
+    pub fn matches(&self, title: &str) -> bool {
+        if self.applied_query.is_empty() {
+            return true;
+        }
+        let query_lower = self.applied_query.to_lowercase();
+        title.to_lowercase().contains(&query_lower)
+    }
+
+    /// Check if a title matches the current editing query (for live preview).
+    #[allow(dead_code)]
+    pub fn matches_editing(&self, title: &str) -> bool {
+        let q = if self.editing {
+            &self.query
+        } else {
+            &self.applied_query
+        };
+        if q.is_empty() {
+            return true;
+        }
+        title.to_lowercase().contains(&q.to_lowercase())
+    }
+}
+
 /// Overlay that can be displayed on top of the current view.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Overlay {
     Help,
     ProjectSwitcher,
-    Filter,
 }
 
 /// The active view in the TUI.
@@ -1549,6 +1775,8 @@ pub struct App {
     pub overlay: Option<Overlay>,
     /// Project switcher state (populated when overlay is open).
     pub project_switcher: Option<ProjectSwitcherState>,
+    /// Filter/search state for the filter bar.
+    pub filter_state: FilterState,
     /// Current wave number (from daemon status).
     pub current_wave: Option<u32>,
     /// Number of active agents (from daemon status).
@@ -1592,6 +1820,7 @@ impl App {
             status_message: String::new(),
             overlay: None,
             project_switcher: None,
+            filter_state: FilterState::new(),
             current_wave: None,
             active_agent_count: 0,
             specs_list: SpecsListState::new(),
@@ -1666,6 +1895,11 @@ impl App {
     /// Returns true if any overlay is currently shown.
     pub fn has_overlay(&self) -> bool {
         self.overlay.is_some()
+    }
+
+    /// Returns true if the filter input bar is being edited.
+    pub fn in_filter_editing(&self) -> bool {
+        self.filter_state.is_editing()
     }
 
     /// Open the project switcher overlay with the given project list.
@@ -2134,7 +2368,7 @@ mod tests {
     #[test]
     fn test_close_overlay() {
         let mut app = App::new("test".to_string());
-        app.toggle_overlay(Overlay::Filter);
+        app.toggle_overlay(Overlay::Help);
         assert!(app.has_overlay());
 
         app.close_overlay();
