@@ -4,7 +4,9 @@ use std::sync::Arc;
 use nflow_core::decomposition::{DecompositionSession, DecompositionSpec};
 use nflow_core::project::{CreateProjectParams, GitProvider, ProjectService};
 use nflow_core::spec::{Spec, SpecStatus};
-use nflow_core::work_item::{auto_generate_verify_tasks, Dependency, WorkItem};
+use nflow_core::work_item::{
+    auto_generate_verify_tasks, Dependency, ItemType, WorkItem, WorkItemStatus,
+};
 
 use crate::db;
 use crate::socket::{HandlerResult, Request, Response, StreamingResponseLine};
@@ -46,6 +48,7 @@ fn dispatch(req: Request, state: &HandlerState) -> HandlerResult {
         "spec.delete" => HandlerResult::Single(handle_spec_delete(req, state)),
         "spec.resume" => handle_spec_resume(req, state),
         "plan.generate" => handle_plan_generate(req, state),
+        "plan.show" => HandlerResult::Single(handle_plan_show(req, state)),
         _ => HandlerResult::Single(Response::error(
             req.id,
             &format!("unknown command: {}", req.command),
@@ -2083,6 +2086,200 @@ fn create_project_dirs(project_name: &str) -> std::io::Result<()> {
     std::fs::create_dir_all(project_dir.join("specs"))?;
     std::fs::create_dir_all(project_dir.join("agent-logs"))?;
     Ok(())
+}
+
+/// Handle "plan.show" command.
+///
+/// Receives: { project_name, wave?, dag? }
+/// Returns:
+///   - Tree format (default): { wave_number, status, epics: [{ short_id, title, status, stories }] }
+///   - DAG format (with dag=true): { wave_number, adjacency: { short_id: [blocked_ids] } }
+fn handle_plan_show(req: Request, state: &HandlerState) -> Response {
+    let id = req.id.clone();
+
+    let project_name = match req.params.get("project_name").and_then(|v| v.as_str()) {
+        Some(n) => n.to_string(),
+        None => {
+            return Response::error(id, "missing required parameter: project_name");
+        }
+    };
+
+    let wave_number: Option<u32> = req
+        .params
+        .get("wave")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as u32);
+
+    let use_dag = req
+        .params
+        .get("dag")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    let conn = match db::open_connection(&state.db_path) {
+        Ok(c) => c,
+        Err(e) => return Response::error(id, &format!("database error: {}", e)),
+    };
+
+    let project = match db::projects::get_project_by_name(&conn, &project_name) {
+        Ok(Some(p)) => p,
+        Ok(None) => {
+            return Response::error(
+                id,
+                &format!("NOT_FOUND: project '{}' not found", project_name),
+            );
+        }
+        Err(e) => return Response::error(id, &format!("database error: {}", e)),
+    };
+
+    let all_sessions =
+        match db::decomposition_sessions::list_sessions_by_project(&conn, &project.id) {
+            Ok(s) => s,
+            Err(e) => return Response::error(id, &format!("database error: {}", e)),
+        };
+
+    if all_sessions.is_empty() {
+        return Response::error(
+            id,
+            &format!(
+                "NOT_FOUND: project '{}' has no decomposition waves",
+                project_name
+            ),
+        );
+    }
+
+    let session = if let Some(wave) = wave_number {
+        match all_sessions.iter().find(|s| s.wave_number == wave) {
+            Some(s) => s.clone(),
+            None => {
+                return Response::error(id, &format!("NOT_FOUND: wave W{} not found", wave));
+            }
+        }
+    } else {
+        all_sessions.last().unwrap().clone()
+    };
+
+    let all_items = match db::work_items::list_work_items_by_session(&conn, &session.id) {
+        Ok(items) => items,
+        Err(e) => return Response::error(id, &format!("database error: {}", e)),
+    };
+
+    let dependencies = match db::work_items::list_dependencies_by_session(&conn, &session.id) {
+        Ok(deps) => deps,
+        Err(e) => return Response::error(id, &format!("database error: {}", e)),
+    };
+
+    if use_dag {
+        // Build DAG adjacency list
+        let stories: Vec<&WorkItem> = all_items
+            .iter()
+            .filter(|item| item.item_type == ItemType::Story)
+            .collect();
+
+        let mut adjacency = serde_json::Map::new();
+        for story in &stories {
+            let display_id = format!("W{}-{}", session.wave_number, story.short_id);
+            let blocked: Vec<serde_json::Value> = dependencies
+                .iter()
+                .filter(|dep| dep.blocker_id == story.id)
+                .filter_map(|dep| {
+                    all_items
+                        .iter()
+                        .find(|item| item.id == dep.blocked_id)
+                        .map(|item| {
+                            serde_json::Value::String(format!(
+                                "W{}-{}",
+                                session.wave_number, item.short_id
+                            ))
+                        })
+                })
+                .collect();
+            adjacency.insert(display_id, serde_json::Value::Array(blocked));
+        }
+
+        return Response::ok(
+            id,
+            serde_json::json!({
+                "wave_number": session.wave_number,
+                "status": session.status.to_string(),
+                "adjacency": adjacency,
+            }),
+        );
+    }
+
+    // Build hierarchical tree
+    let epics: Vec<&WorkItem> = all_items
+        .iter()
+        .filter(|item| item.item_type == ItemType::Epic)
+        .collect();
+
+    let mut epics_data = Vec::new();
+    for epic in &epics {
+        let epic_stories: Vec<&WorkItem> = all_items
+            .iter()
+            .filter(|item| item.item_type == ItemType::Story && item.parent_id == Some(epic.id))
+            .collect();
+
+        let mut stories_data = Vec::new();
+        for story in &epic_stories {
+            let story_tasks: Vec<&WorkItem> = all_items
+                .iter()
+                .filter(|item| item.item_type == ItemType::Task && item.parent_id == Some(story.id))
+                .collect();
+
+            let total_tasks = story_tasks.len() as u32;
+            let done_tasks = story_tasks
+                .iter()
+                .filter(|t| t.status == WorkItemStatus::Done)
+                .count() as u32;
+
+            let depends_on: Vec<String> = dependencies
+                .iter()
+                .filter(|dep| dep.blocked_id == story.id)
+                .filter_map(|dep| {
+                    all_items
+                        .iter()
+                        .find(|item| item.id == dep.blocker_id)
+                        .map(|item| format!("W{}-{}", session.wave_number, item.short_id))
+                })
+                .collect();
+
+            let mut tasks_data = Vec::new();
+            for task in &story_tasks {
+                tasks_data.push(serde_json::json!({
+                    "short_id": format!("W{}-{}", session.wave_number, task.short_id),
+                    "title": task.title,
+                    "status": task.status.to_string(),
+                    "kind": task.kind.as_ref().map(|k| k.to_string()),
+                }));
+            }
+
+            stories_data.push(serde_json::json!({
+                "short_id": format!("W{}-{}", session.wave_number, story.short_id),
+                "title": story.title,
+                "status": story.status.to_string(),
+                "depends_on": depends_on,
+                "progress": format!("{}/{}", done_tasks, total_tasks),
+                "tasks": tasks_data,
+            }));
+        }
+
+        epics_data.push(serde_json::json!({
+            "short_id": format!("W{}-{}", session.wave_number, epic.short_id),
+            "title": epic.title,
+            "status": epic.status.to_string(),
+            "stories": stories_data,
+        }));
+    }
+
+    Response::ok(
+        id,
+        serde_json::json!({
+            "wave_number": session.wave_number,
+            "status": session.status.to_string(),
+            "epics": epics_data,
+        }),
+    )
 }
 
 #[cfg(test)]
@@ -4253,6 +4450,362 @@ mod tests {
             }
             _ => panic!("expected Single response for missing param"),
         }
+        cleanup_db(&db_dir);
+    }
+
+    // --- plan.show tests ---
+
+    #[test]
+    fn test_plan_show_missing_project_name() {
+        let (state, db_dir) = make_db_state("plan_show_missing_param");
+        let req = Request {
+            id: "200".to_string(),
+            command: "plan.show".to_string(),
+            params: serde_json::json!({}),
+        };
+        match dispatch(req, &state) {
+            HandlerResult::Single(resp) => {
+                assert_eq!(resp.status, crate::socket::ResponseStatus::Error);
+                assert!(resp.data["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("missing required parameter"));
+            }
+            _ => panic!("expected Single response"),
+        }
+        cleanup_db(&db_dir);
+    }
+
+    #[test]
+    fn test_plan_show_project_not_found() {
+        let (state, db_dir) = make_db_state("plan_show_not_found");
+        let req = Request {
+            id: "201".to_string(),
+            command: "plan.show".to_string(),
+            params: serde_json::json!({ "project_name": "nonexistent" }),
+        };
+        match dispatch(req, &state) {
+            HandlerResult::Single(resp) => {
+                assert_eq!(resp.status, crate::socket::ResponseStatus::Error);
+                assert!(resp.data["message"].as_str().unwrap().contains("NOT_FOUND"));
+            }
+            _ => panic!("expected Single response"),
+        }
+        cleanup_db(&db_dir);
+    }
+
+    #[test]
+    fn test_plan_show_no_waves() {
+        let (state, db_dir) = make_db_state("plan_show_no_waves");
+        insert_test_project(&state, "plan-show-nowaves");
+        let req = Request {
+            id: "202".to_string(),
+            command: "plan.show".to_string(),
+            params: serde_json::json!({ "project_name": "plan-show-nowaves" }),
+        };
+        match dispatch(req, &state) {
+            HandlerResult::Single(resp) => {
+                assert_eq!(resp.status, crate::socket::ResponseStatus::Error);
+                assert!(resp.data["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("no decomposition waves"));
+            }
+            _ => panic!("expected Single response"),
+        }
+        cleanup_db(&db_dir);
+    }
+
+    #[test]
+    fn test_plan_show_tree_format() {
+        use nflow_core::decomposition::{DecompositionSession, DecompositionStatus};
+        use nflow_core::work_item::{Dependency, TaskKind, WorkItem};
+
+        let (state, db_dir) = make_db_state("plan_show_tree");
+        let project_id = insert_test_project(&state, "plan-show-tree");
+        let conn = db::open_connection(&state.db_path).unwrap();
+
+        // Create a decomposition session (wave 1)
+        let session = DecompositionSession {
+            id: uuid::Uuid::new_v4(),
+            project_id,
+            wave_number: 1,
+            status: DecompositionStatus::Approved,
+            claude_session_id: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        db::decomposition_sessions::insert_decomposition_session(&conn, &session).unwrap();
+
+        // Create an epic
+        let epic = WorkItem::new_epic(session.id, "Epic 1".into(), "desc".into(), "E1".into(), 0);
+        db::work_items::insert_work_item(&conn, &epic).unwrap();
+
+        // Create two stories under the epic
+        let story1 = WorkItem::new_story(
+            epic.id,
+            session.id,
+            "Story 1".into(),
+            "desc".into(),
+            "ac".into(),
+            "S1".into(),
+            0,
+        );
+        db::work_items::insert_work_item(&conn, &story1).unwrap();
+
+        let story2 = WorkItem::new_story(
+            epic.id,
+            session.id,
+            "Story 2".into(),
+            "desc".into(),
+            "ac".into(),
+            "S2".into(),
+            1,
+        );
+        db::work_items::insert_work_item(&conn, &story2).unwrap();
+
+        // Story 2 depends on Story 1
+        let dep = Dependency {
+            blocker_id: story1.id,
+            blocked_id: story2.id,
+        };
+        db::work_items::insert_dependency(&conn, &dep).unwrap();
+
+        // Create tasks under story 1
+        let task1 = WorkItem::new_task(
+            story1.id,
+            session.id,
+            "Task 1".into(),
+            "desc".into(),
+            "ac".into(),
+            "T1".into(),
+            0,
+        );
+        db::work_items::insert_work_item(&conn, &task1).unwrap();
+
+        let mut task1v = WorkItem::new_task(
+            story1.id,
+            session.id,
+            "Verify Task 1".into(),
+            "desc".into(),
+            "ac".into(),
+            "T1v".into(),
+            1,
+        );
+        task1v.kind = Some(TaskKind::Verify);
+        db::work_items::insert_work_item(&conn, &task1v).unwrap();
+
+        drop(conn);
+
+        let req = Request {
+            id: "203".to_string(),
+            command: "plan.show".to_string(),
+            params: serde_json::json!({ "project_name": "plan-show-tree" }),
+        };
+        match dispatch(req, &state) {
+            HandlerResult::Single(resp) => {
+                assert_eq!(resp.status, crate::socket::ResponseStatus::Ok);
+                let data = &resp.data;
+                assert_eq!(data["wave_number"], 1);
+                assert_eq!(data["status"], "approved");
+
+                let epics = data["epics"].as_array().unwrap();
+                assert_eq!(epics.len(), 1);
+                assert_eq!(epics[0]["short_id"], "W1-E1");
+                assert_eq!(epics[0]["title"], "Epic 1");
+
+                let stories = epics[0]["stories"].as_array().unwrap();
+                assert_eq!(stories.len(), 2);
+                assert_eq!(stories[0]["short_id"], "W1-S1");
+                assert_eq!(stories[0]["progress"], "0/2");
+
+                // Story 2 depends on Story 1
+                let depends = stories[1]["depends_on"].as_array().unwrap();
+                assert_eq!(depends.len(), 1);
+                assert_eq!(depends[0], "W1-S1");
+
+                // Tasks under story 1
+                let tasks = stories[0]["tasks"].as_array().unwrap();
+                assert_eq!(tasks.len(), 2);
+                assert_eq!(tasks[0]["kind"], "impl");
+                assert_eq!(tasks[1]["kind"], "verify");
+            }
+            _ => panic!("expected Single response"),
+        }
+        cleanup_db(&db_dir);
+    }
+
+    #[test]
+    fn test_plan_show_dag_format() {
+        use nflow_core::decomposition::{DecompositionSession, DecompositionStatus};
+        use nflow_core::work_item::{Dependency, WorkItem};
+
+        let (state, db_dir) = make_db_state("plan_show_dag");
+        let project_id = insert_test_project(&state, "plan-show-dag");
+        let conn = db::open_connection(&state.db_path).unwrap();
+
+        let session = DecompositionSession {
+            id: uuid::Uuid::new_v4(),
+            project_id,
+            wave_number: 1,
+            status: DecompositionStatus::Approved,
+            claude_session_id: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        db::decomposition_sessions::insert_decomposition_session(&conn, &session).unwrap();
+
+        let epic = WorkItem::new_epic(session.id, "Epic 1".into(), "desc".into(), "E1".into(), 0);
+        db::work_items::insert_work_item(&conn, &epic).unwrap();
+
+        let story1 = WorkItem::new_story(
+            epic.id,
+            session.id,
+            "Story A".into(),
+            "desc".into(),
+            "ac".into(),
+            "S1".into(),
+            0,
+        );
+        db::work_items::insert_work_item(&conn, &story1).unwrap();
+
+        let story2 = WorkItem::new_story(
+            epic.id,
+            session.id,
+            "Story B".into(),
+            "desc".into(),
+            "ac".into(),
+            "S2".into(),
+            1,
+        );
+        db::work_items::insert_work_item(&conn, &story2).unwrap();
+
+        let dep = Dependency {
+            blocker_id: story1.id,
+            blocked_id: story2.id,
+        };
+        db::work_items::insert_dependency(&conn, &dep).unwrap();
+
+        drop(conn);
+
+        let req = Request {
+            id: "204".to_string(),
+            command: "plan.show".to_string(),
+            params: serde_json::json!({
+                "project_name": "plan-show-dag",
+                "dag": true,
+            }),
+        };
+        match dispatch(req, &state) {
+            HandlerResult::Single(resp) => {
+                assert_eq!(resp.status, crate::socket::ResponseStatus::Ok);
+                let data = &resp.data;
+                assert_eq!(data["wave_number"], 1);
+
+                let adjacency = data["adjacency"].as_object().unwrap();
+                // S1 blocks S2
+                let s1_blocks = adjacency["W1-S1"].as_array().unwrap();
+                assert_eq!(s1_blocks.len(), 1);
+                assert_eq!(s1_blocks[0], "W1-S2");
+                // S2 blocks nobody
+                let s2_blocks = adjacency["W1-S2"].as_array().unwrap();
+                assert!(s2_blocks.is_empty());
+            }
+            _ => panic!("expected Single response"),
+        }
+        cleanup_db(&db_dir);
+    }
+
+    #[test]
+    fn test_plan_show_specific_wave() {
+        use nflow_core::decomposition::{DecompositionSession, DecompositionStatus};
+        use nflow_core::work_item::WorkItem;
+
+        let (state, db_dir) = make_db_state("plan_show_wave");
+        let project_id = insert_test_project(&state, "plan-show-wave");
+        let conn = db::open_connection(&state.db_path).unwrap();
+
+        // Create two waves
+        let session1 = DecompositionSession {
+            id: uuid::Uuid::new_v4(),
+            project_id,
+            wave_number: 1,
+            status: DecompositionStatus::Approved,
+            claude_session_id: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        db::decomposition_sessions::insert_decomposition_session(&conn, &session1).unwrap();
+
+        let session2 = DecompositionSession {
+            id: uuid::Uuid::new_v4(),
+            project_id,
+            wave_number: 2,
+            status: DecompositionStatus::InProgress,
+            claude_session_id: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        db::decomposition_sessions::insert_decomposition_session(&conn, &session2).unwrap();
+
+        // Add an epic to wave 1
+        let epic1 =
+            WorkItem::new_epic(session1.id, "W1 Epic".into(), "desc".into(), "E1".into(), 0);
+        db::work_items::insert_work_item(&conn, &epic1).unwrap();
+
+        // Add an epic to wave 2
+        let epic2 =
+            WorkItem::new_epic(session2.id, "W2 Epic".into(), "desc".into(), "E1".into(), 0);
+        db::work_items::insert_work_item(&conn, &epic2).unwrap();
+
+        drop(conn);
+
+        // Default shows latest wave (wave 2)
+        let req = Request {
+            id: "205".to_string(),
+            command: "plan.show".to_string(),
+            params: serde_json::json!({ "project_name": "plan-show-wave" }),
+        };
+        match dispatch(req, &state) {
+            HandlerResult::Single(resp) => {
+                assert_eq!(resp.status, crate::socket::ResponseStatus::Ok);
+                assert_eq!(resp.data["wave_number"], 2);
+                let epics = resp.data["epics"].as_array().unwrap();
+                assert_eq!(epics[0]["title"], "W2 Epic");
+            }
+            _ => panic!("expected Single response"),
+        }
+
+        // Specific wave=1
+        let req = Request {
+            id: "206".to_string(),
+            command: "plan.show".to_string(),
+            params: serde_json::json!({ "project_name": "plan-show-wave", "wave": 1 }),
+        };
+        match dispatch(req, &state) {
+            HandlerResult::Single(resp) => {
+                assert_eq!(resp.status, crate::socket::ResponseStatus::Ok);
+                assert_eq!(resp.data["wave_number"], 1);
+                let epics = resp.data["epics"].as_array().unwrap();
+                assert_eq!(epics[0]["title"], "W1 Epic");
+            }
+            _ => panic!("expected Single response"),
+        }
+
+        // Nonexistent wave=99
+        let req = Request {
+            id: "207".to_string(),
+            command: "plan.show".to_string(),
+            params: serde_json::json!({ "project_name": "plan-show-wave", "wave": 99 }),
+        };
+        match dispatch(req, &state) {
+            HandlerResult::Single(resp) => {
+                assert_eq!(resp.status, crate::socket::ResponseStatus::Error);
+                assert!(resp.data["message"].as_str().unwrap().contains("NOT_FOUND"));
+            }
+            _ => panic!("expected Single response"),
+        }
+
         cleanup_db(&db_dir);
     }
 }

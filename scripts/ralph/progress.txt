@@ -1293,3 +1293,25 @@ Started: Sat Feb  7 03:49:10 PM MSK 2026
   - Pre-check for in_progress session, then pass |_| false closure to DecompositionSession::new to avoid double-check
   - build_and_persist_work_items opens its own DB connection (runs in async context via tokio::spawn)
 ---
+
+## 2026-02-07 - US-049
+- What was implemented: Command handler — plan show
+  - handle_plan_show: non-streaming handler returning hierarchical wave structure
+  - Tree format (default): wave_number, status, epics → stories → tasks with short_id, title, status
+  - DAG format (dag=true): adjacency list mapping story short_ids to blocked story short_ids
+  - Wave selection: optional --wave N parameter, defaults to latest wave
+  - Story dependencies shown as depends_on array of blocker short_ids (W{n}-{id} format)
+  - Task kind (impl/verify) included for display differentiation
+  - Progress counts per story: {done}/{total} tasks computed from in-memory filtering
+  - Added dispatch route: "plan.show" => HandlerResult::Single(handle_plan_show)
+  - Added imports: ItemType, WorkItemStatus to work_item use statement
+  - 6 tests: missing param, project not found, no waves, tree format, DAG format, specific wave selection
+- Files changed:
+  - crates/nflow-daemon/src/handlers.rs (handle_plan_show function + dispatch route + 6 tests)
+- **Learnings for future iterations:**
+  - Non-streaming handlers return Response directly, wrapped in HandlerResult::Single at dispatch
+  - Tree hierarchy built from in-memory filtering of all_items (parent_id matching), not separate DB queries per level
+  - DAG adjacency built by iterating stories and finding blocked_id matches in dependencies list
+  - Progress counts computed in-memory from task status filtering rather than count_tasks_by_status DB call
+  - list_sessions_by_project returns sessions ordered by wave_number — last() gives latest
+---
