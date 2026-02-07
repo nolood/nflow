@@ -1,0 +1,1835 @@
+{
+  "project": "nflow",
+  "branchName": "ralph/nflow-orchestrator",
+  "description": "nflow — CLI/TUI orchestrator for Claude Code agents. Manages spec writing, DAG decomposition, and parallel agent execution across git worktrees. Six-crate Rust workspace.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Rust workspace skeleton",
+      "description": "As a developer, I want the six-crate Rust workspace scaffolded so that all crates compile and depend on each other correctly.",
+      "acceptanceCriteria": [
+        "Cargo.toml workspace with members: nflow-core, nflow-claude, nflow-git, nflow-daemon, nflow-cli, nflow-tui",
+        "Each crate has Cargo.toml with correct inter-crate dependencies",
+        "nflow-core has zero dependencies on tokio, no async code, no IO (std::fs, std::net, etc.)",
+        "All other crates depend on nflow-core",
+        "cargo build --workspace succeeds",
+        "cargo clippy --workspace passes",
+        "cargo fmt --check passes"
+      ],
+      "priority": 1,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-002",
+      "title": "Project model and CRUD logic",
+      "description": "As a developer, I want a project model in nflow-core so that projects can be created, listed, and deleted with proper validation.",
+      "acceptanceCriteria": [
+        "Project struct with fields: id (UUID), name, path, base_branch, git_provider (github|gitlab), execution_enabled (bool), created_at, updated_at",
+        "ProjectService::create() validates: name is non-empty, name is unique (given a name-existence checker), path is non-empty",
+        "ProjectService::create() detects git provider from remote URL string (github.com -> github, gitlab.com -> gitlab) with manual override",
+        "ProjectService::create() detects base branch from provided HEAD ref or defaults to 'main'",
+        "ProjectService::delete() returns error if project has running agents (given a running-count checker)",
+        "All functions are pure — accept trait/closure for external checks, no IO",
+        "Typecheck passes"
+      ],
+      "priority": 2,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-003",
+      "title": "Spec model and state machine",
+      "description": "As a developer, I want a spec model with enforced state transitions so that specs progress through their lifecycle correctly.",
+      "acceptanceCriteria": [
+        "Spec struct with fields: id (UUID), project_id, name, file_path, status (draft|approved|decomposed|deleted), session_active (bool), claude_session_id (Option), created_at, updated_at",
+        "State machine enforces: draft -> approved, approved -> draft (reopen), approved -> decomposed, decomposed -> approved (via plan discard), draft|approved -> deleted",
+        "Invalid transitions return typed error (e.g., Error::InvalidTransition { from, to })",
+        "reopen() fails if status is decomposed",
+        "delete() fails if status is decomposed (must discard wave first)",
+        "start_session() fails if session_active is already true",
+        "end_session() sets session_active = false, stores claude_session_id",
+        "Pure logic, no IO",
+        "Typecheck passes"
+      ],
+      "priority": 3,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-004",
+      "title": "Work item model — epics and stories",
+      "description": "As a developer, I want epic and story models so that work can be organized hierarchically with story-level dependencies.",
+      "acceptanceCriteria": [
+        "WorkItem struct with fields: id (UUID), parent_id (Option<UUID>), decomposition_session_id, item_type (epic|story|task), kind (Option: impl|verify), title, description, acceptance_criteria, status, short_id, sort_order, branch_name (Option), worktree_path (Option), mr_url (Option), commit_hash (Option), created_at, updated_at",
+        "Epic status: pending|in_progress|done|failed|cancelled — materialized from child stories, stored in DB and recalculated on every child story status change",
+        "Story state machine: pending -> ready -> in_progress -> done|failed|cancelled",
+        "Story transitions: ready requires all blockers done, in_progress requires ready|failed(retry), cancelled from pending|ready|in_progress",
+        "propagate_epic_status() rules: pending when all stories pending; in_progress when any story in_progress or ready; done when all stories done (or mix of done+cancelled); failed when any story failed and none in_progress; cancelled when all stories cancelled",
+        "Dependency model: Dependency { blocker_id: UUID, blocked_id: UUID } — story-level only",
+        "Pure logic, no IO",
+        "Typecheck passes"
+      ],
+      "priority": 4,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-005",
+      "title": "Work item model — tasks (impl and verify)",
+      "description": "As a developer, I want task models with impl/verify pairing so that each implementation step has automatic verification.",
+      "acceptanceCriteria": [
+        "Task state machine: pending -> in_progress -> done|failed|cancelled",
+        "Task transitions: failed -> in_progress (retry), failed -> done (skip with metadata), pending -> cancelled",
+        "auto_generate_verify_tasks() inserts a verify task after each impl task with kind=verify, short_id='{id}v', sort_order = impl.sort_order + 1",
+        "skip_task() on impl task also marks paired verify task as skipped",
+        "find_paired_verify() finds verify task by matching parent_id and adjacent sort_order",
+        "find_paired_impl() finds impl task for a given verify task",
+        "get_next_pending_task() returns next task by sort_order within a story",
+        "commit_hash stored on impl task completion",
+        "Pure logic, no IO",
+        "Typecheck passes"
+      ],
+      "priority": 5,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-006",
+      "title": "Short ID system",
+      "description": "As a developer, I want wave-prefixed short IDs so that users can reference work items concisely in CLI commands.",
+      "acceptanceCriteria": [
+        "Generate short IDs: E1, E2 (epics), S1, S2 (stories), T1, T2 (tasks) — scoped per decomposition session",
+        "Wave-prefixed display: W1-E1, W1-S1, W1-T1, W1-T1v",
+        "Verify tasks: short_id = '{impl_short_id}v' (e.g., T1 -> T1v)",
+        "resolve_short_id(wave_prefix, short_id) -> Result<UUID> resolves display IDs to internal UUIDs",
+        "Error if short ID not found or ambiguous",
+        "Parse user input: accepts both 'W1-S1' and 'S1' (when wave is unambiguous or provided by context)",
+        "Pure logic, no IO",
+        "Typecheck passes"
+      ],
+      "priority": 6,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-007",
+      "title": "DAG construction and validation",
+      "description": "As a developer, I want DAG construction from work items so that story dependencies are validated and circular references detected.",
+      "acceptanceCriteria": [
+        "build_dag(stories, dependencies) -> Result<Dag> constructs adjacency list",
+        "Topological sort returns stories in valid execution order",
+        "Circular dependency detection returns Error::CyclicDependency { cycle: Vec<UUID> }",
+        "Validate all depends_on references exist within the same decomposition session",
+        "Validate no cross-wave dependencies (all deps within same session)",
+        "find_ready_stories(dag, statuses) -> Vec<UUID> returns stories with all blockers in done|cancelled state (cancelled stories do not block dependents — treated same as done for unblocking purposes)",
+        "find_blocked_stories(dag, statuses) -> Vec<UUID> returns stories with at least one incomplete blocker",
+        "Pure logic, no IO",
+        "Typecheck passes"
+      ],
+      "priority": 7,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-008",
+      "title": "Scheduler algorithm",
+      "description": "As a developer, I want a pure scheduling algorithm so that the daemon can pick the next stories to execute respecting parallelism and dependencies.",
+      "acceptanceCriteria": [
+        "schedule(state: &SchedulerState) -> Vec<SchedulerAction> returns actions to take",
+        "SchedulerState contains: all work items, dependencies, running_count, max_parallel, execution_enabled",
+        "Respects max_parallel: never returns more start actions than available slots",
+        "Prioritizes stories by wave_number (lower first), then sort_order",
+        "Propagates story readiness: pending -> ready when all blockers done",
+        "Propagates epic status from child stories",
+        "Skips stories in waves that are not approved",
+        "Skips projects with execution_enabled = false",
+        "Returns no actions when execution_enabled = false globally",
+        "Pure logic, no IO, no async",
+        "Typecheck passes"
+      ],
+      "priority": 8,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-009",
+      "title": "Decomposition session model",
+      "description": "As a developer, I want a decomposition session model so that waves are tracked with their specs and lifecycle.",
+      "acceptanceCriteria": [
+        "DecompositionSession struct: id (UUID), project_id, wave_number (auto-incremented), status (in_progress|approved|discarded), claude_session_id (Option), created_at, updated_at",
+        "decomposition_specs mapping: session_id <-> spec_id (many-to-many)",
+        "State machine: in_progress -> approved, in_progress -> discarded",
+        "Only one in_progress session per project at a time",
+        "approve() transitions status and makes stories schedulable",
+        "discard() deletes associated work items and frees specs back to approved status",
+        "Auto-increment wave_number per project (max existing + 1)",
+        "Pure logic, no IO",
+        "Typecheck passes"
+      ],
+      "priority": 9,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-010",
+      "title": "Config model and merging",
+      "description": "As a developer, I want a config model with layered merging so that defaults, global config, per-project overrides, and env vars are composed correctly.",
+      "acceptanceCriteria": [
+        "Config struct with all keys: max_parallel (u32), git_provider (String), base_branch (String), cleanup_worktrees (bool), max_turns_per_task (u32), auto_execute (bool), max_time_per_task (u64 secs), log_level (String), branch_template (String), worktree_dir (String)",
+        "Defaults: max_parallel=3, git_provider='github', base_branch='main', cleanup_worktrees=false, max_turns_per_task=50, auto_execute=false, max_time_per_task=1800, log_level='info'",
+        "merge(base: Config, overlay: PartialConfig) -> Config — overlay fields override base when present",
+        "Merging order: defaults -> global toml -> per-project toml -> env vars",
+        "Env var mapping: NFLOW_HOME, NFLOW_SOCKET, NFLOW_LOG_LEVEL, NFLOW_MAX_PARALLEL",
+        "Validation: max_parallel > 0, max_time_per_task > 0, git_provider in ['github', 'gitlab']",
+        "branch_template supports variables: {project}, {story_id}, {story_slug}",
+        "Pure logic (parsing from TOML/env is in daemon/cli)",
+        "Typecheck passes"
+      ],
+      "priority": 10,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-011",
+      "title": "Database schema and migration runner",
+      "description": "As a developer, I want a SQLite schema and migration system so that all tables are created and versioned correctly.",
+      "acceptanceCriteria": [
+        "001_init.sql creates tables: projects, specs, work_items, dependencies, agent_runs, decomposition_sessions, decomposition_specs, schema_version",
+        "work_items table: unified for epics/stories/tasks with item_type discriminator and kind (impl|verify) for tasks",
+        "All primary keys are TEXT (UUID strings)",
+        "Foreign keys with ON DELETE CASCADE for project -> specs -> work_items chain",
+        "Indexes on: work_items(parent_id), work_items(decomposition_session_id), specs(project_id), dependencies(blocker_id), dependencies(blocked_id)",
+        "Migration runner (~50 LOC): reads numbered files, applies unapplied ones in transaction, tracks in schema_version",
+        "Migration files embedded at compile time via include_str!",
+        "Backup nflow.db to nflow.db.bak-v{version} before applying new migrations",
+        "WAL mode enabled on connection open",
+        "Typecheck passes"
+      ],
+      "priority": 11,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-012",
+      "title": "Database CRUD — projects",
+      "description": "As a developer, I want database CRUD for projects so that project records are persisted and queryable.",
+      "acceptanceCriteria": [
+        "insert_project(project: &Project) -> Result<()>",
+        "get_project_by_name(name: &str) -> Result<Option<Project>>",
+        "get_project_by_id(id: &Uuid) -> Result<Option<Project>>",
+        "list_projects() -> Result<Vec<Project>>",
+        "update_project(project: &Project) -> Result<()>",
+        "delete_project(id: &Uuid) -> Result<()> — cascades to specs, work_items, agent_runs",
+        "project_name_exists(name: &str) -> Result<bool>",
+        "All queries use parameterized statements (no SQL injection)",
+        "Typecheck passes"
+      ],
+      "priority": 12,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-013",
+      "title": "Database CRUD — specs",
+      "description": "As a developer, I want database CRUD for specs so that spec records and their sessions are persisted.",
+      "acceptanceCriteria": [
+        "insert_spec(spec: &Spec) -> Result<()>",
+        "get_spec_by_name(project_id, name) -> Result<Option<Spec>>",
+        "list_specs_by_project(project_id) -> Result<Vec<Spec>>",
+        "list_specs_by_status(project_id, status) -> Result<Vec<Spec>>",
+        "update_spec_status(id, status) -> Result<()>",
+        "update_spec_session(id, session_active, claude_session_id) -> Result<()>",
+        "find_latest_draft_spec(project_id) -> Result<Option<Spec>> for spec resume without name",
+        "find_unassigned_approved_specs(project_id) -> Result<Vec<Spec>> for plan generate",
+        "reset_active_sessions(project_id) -> Result<u64> for crash recovery",
+        "Typecheck passes"
+      ],
+      "priority": 13,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-014",
+      "title": "Database CRUD — work items and dependencies",
+      "description": "As a developer, I want database CRUD for work items and dependencies so that the full DAG is persisted.",
+      "acceptanceCriteria": [
+        "insert_work_item(item) and insert_dependency(dep) functions",
+        "get_work_item_by_id(id) -> Result<Option<WorkItem>>",
+        "list_work_items_by_session(session_id) and list_work_items_by_parent(parent_id) ordered by sort_order",
+        "list_dependencies_by_session(session_id) and list_blockers_for_story(story_id)",
+        "update_work_item_status, update_work_item_commit, update_story_worktree, update_story_mr",
+        "delete_work_items_by_session(session_id) for plan feedback regeneration",
+        "count_tasks_by_status(story_id) -> Result<HashMap<Status, u32>> for progress display",
+        "All queries use parameterized statements",
+        "Typecheck passes"
+      ],
+      "priority": 14,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-015",
+      "title": "Database CRUD — agent runs and decomposition sessions",
+      "description": "As a developer, I want database CRUD for agent runs and decomposition sessions so that execution history and wave state are tracked.",
+      "acceptanceCriteria": [
+        "insert_agent_run with fields: id, work_item_id, pid, session_id, pid_start_time, status, exit_code, log_path, error_message, started_at, finished_at",
+        "update_agent_run_status(id, status, exit_code, error_message, finished_at)",
+        "find_running_agent_runs() for crash recovery",
+        "count_agent_runs_for_task(work_item_id) for retry warning",
+        "insert_decomposition_session and insert_decomposition_spec",
+        "get_decomposition_session(id), find_draft_session(project_id), list_sessions_by_project(project_id)",
+        "update_session_status(id, status)",
+        "next_wave_number(project_id) -> max existing + 1",
+        "Typecheck passes"
+      ],
+      "priority": 15,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-016",
+      "title": "NflowError type system",
+      "description": "As a developer, I want a typed error system so that all crates return structured errors with context.",
+      "acceptanceCriteria": [
+        "NflowError enum in nflow-core with variants: InvalidTransition, CyclicDependency, NotFound, AlreadyExists, InvalidState, InvalidParams, ValidationError",
+        "Each variant carries enough context for meaningful error messages",
+        "impl Display for NflowError produces human-readable messages",
+        "impl std::error::Error for NflowError",
+        "nflow-daemon and nflow-cli add IO/system error wrappers: Io, Db, Git, Claude, Socket",
+        "Typecheck passes"
+      ],
+      "priority": 16,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-017",
+      "title": "Claude process runner — core spawning",
+      "description": "As a developer, I want to spawn Claude CLI processes with correct arguments so that agents run with proper configuration.",
+      "acceptanceCriteria": [
+        "ClaudeRunner::spawn(config: &RunConfig) -> Result<ClaudeProcess> spawns claude binary",
+        "RunConfig specifies: prompt, system_prompt_file, allowed_tools, max_turns, resume_session, working_dir, output_format (stream-json), verbose, include_partial_messages",
+        "Returns ClaudeProcess with: child process handle, PID, stdout reader, stderr reader",
+        "Process spawned with stdout and stderr piped",
+        "Handles claude binary not found in PATH with clear error message",
+        "Cross-platform (Linux + macOS)",
+        "Typecheck passes"
+      ],
+      "priority": 17,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-018",
+      "title": "Claude process runner — invocation modes",
+      "description": "As a developer, I want preset invocation modes for spec/decompose/impl/verify so that each Claude interaction uses the correct tools and limits.",
+      "acceptanceCriteria": [
+        "RunConfig::for_spec(with_codebase) — with_codebase: allowedTools: Read,Glob,Grep,Write,AskUserQuestion; without: allowedTools: Write,AskUserQuestion; no max_turns",
+        "RunConfig::for_decompose(with_codebase) — with_codebase: allowedTools: Read,Glob,Grep, working_dir=project_path; without: no allowedTools, working_dir=specs_dir; no max_turns",
+        "RunConfig::for_impl_task() — allowedTools: Read,Write,Edit,Bash,Glob,Grep, max_turns: 50",
+        "RunConfig::for_verify_task() — allowedTools: Read,Bash,Glob,Grep (NO Write/Edit), max_turns: 30",
+        "--with-codebase changes working_dir to project root (otherwise specs dir)",
+        "All modes include --output-format stream-json --verbose --include-partial-messages",
+        "Typecheck passes"
+      ],
+      "priority": 18,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-019",
+      "title": "Stream-JSON parser",
+      "description": "As a developer, I want a stream-json parser so that Claude's output is parsed into structured events in real-time.",
+      "acceptanceCriteria": [
+        "StreamParser reads lines from stdout, parses each as JSON",
+        "Emits typed events: TextDelta, ToolUse { name, input }, ToolResult { content }, Result { text, session_id }, Error { message }",
+        "Handles partial lines (buffers until newline)",
+        "Handles malformed JSON lines (emits ParseError event, does not crash)",
+        "Extracts session_id from final result event",
+        "Detects AskUserQuestion tool calls (for spec dialogue)",
+        "Processes line-by-line without buffering entire output in memory",
+        "Typecheck passes"
+      ],
+      "priority": 19,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-020",
+      "title": "Stream-JSON — success criteria evaluation",
+      "description": "As a developer, I want to evaluate task success from stream output so that impl and verify tasks are correctly marked as done or failed.",
+      "acceptanceCriteria": [
+        "evaluate_impl_result(exit_code, head_before, head_after, commit_message) -> TaskResult",
+        "Impl success: exit_code == 0 AND head_after != head_before AND commit_message contains [{short_id}]",
+        "Impl failure reasons: non-zero exit, no new commit, wrong commit message format",
+        "evaluate_verify_result(exit_code, result_text) -> TaskResult where result_text is from the 'result' field of the final stream-json {type: result} event only (not full agent output)",
+        "Verify success: exit_code == 0 AND result_text contains 'VERIFICATION PASSED'; contains 'VERIFICATION FAILED' -> failed; neither marker -> failed (ambiguous treated as failure)",
+        "TaskResult enum: Success, Failed { reason: String }",
+        "Pure logic, no IO",
+        "Typecheck passes"
+      ],
+      "priority": 20,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-021",
+      "title": "Session tracker",
+      "description": "As a developer, I want session tracking so that spec dialogues and plan feedback can be resumed across Claude invocations.",
+      "acceptanceCriteria": [
+        "SessionTracker stores mapping: entity_id -> claude_session_id",
+        "start_session(entity_id) -> session_id = None (first invocation, no resume)",
+        "update_session(entity_id, session_id) called after first Claude result",
+        "get_resume_id(entity_id) -> Option<String> returns session_id for --resume flag",
+        "Works for both specs (multi-turn Q&A) and decomposition sessions (feedback loop)",
+        "Session IDs persisted via database (spec.claude_session_id, decomposition_session.claude_session_id)",
+        "Typecheck passes"
+      ],
+      "priority": 21,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-022",
+      "title": "Prompt template loader and renderer",
+      "description": "As a developer, I want prompt template loading and rendering so that prompts are embedded at compile time but overridable at runtime.",
+      "acceptanceCriteria": [
+        "Templates embedded via include_str!: spec_session.md, decompose.md, task_execution.md, verify_task.md, mr_body.md",
+        "load_template(name, override_dir) checks override dir first, falls back to embedded",
+        "render_template(template, vars) replaces {variable} placeholders",
+        "Returns error for unresolved {variable} placeholders (missing required variable)",
+        "Ignores {text} that doesn't match any variable key (literal braces)",
+        "Typecheck passes"
+      ],
+      "priority": 22,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-023",
+      "title": "Prompt context generation",
+      "description": "As a developer, I want prompt context builders so that each Claude invocation gets the right context variables.",
+      "acceptanceCriteria": [
+        "build_task_context(task, story, completed_tasks, previous_error) -> HashMap for task_execution.md",
+        "build_verify_context(verify_task, impl_task, impl_result) -> HashMap for verify_task.md",
+        "build_mr_context(story, tasks, project) -> HashMap for mr_body.md",
+        "build_spec_context(spec) -> HashMap for spec_session.md",
+        "build_decompose_prompt(specs) -> String concatenates spec file contents",
+        "completed_tasks formatted as list: '- [{short_id}] {title}: {commit_hash}'",
+        "previous_error included only on retry (empty string on first attempt)",
+        "tasks_list for MR body: '- {commit_hash} {title}' or '- [SKIPPED] {title}'",
+        "Typecheck passes"
+      ],
+      "priority": 23,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-024",
+      "title": "Claude process termination",
+      "description": "As a developer, I want graceful and forced process termination so that agents can be stopped cleanly.",
+      "acceptanceCriteria": [
+        "ClaudeProcess::terminate() sends SIGTERM, waits 10 seconds, then SIGKILL if still alive",
+        "ClaudeProcess::kill() sends SIGKILL immediately",
+        "ClaudeProcess::wait_with_timeout(duration) -> Result<Option<ExitStatus>> returns None on timeout",
+        "Cross-platform signal handling (Linux + macOS via nix crate)",
+        "Returns exit code and captures any final stderr output",
+        "Typecheck passes"
+      ],
+      "priority": 24,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-025",
+      "title": "Worktree creation",
+      "description": "As a developer, I want git worktree creation so that each story runs in its own isolated directory.",
+      "acceptanceCriteria": [
+        "create_worktree(repo_path, worktree_path, base_branch) -> Result<()>",
+        "Runs: git fetch origin {base_branch} then git worktree add {worktree_path} origin/{base_branch}",
+        "Validates worktree_path doesn't already exist (returns error if it does)",
+        "Validates repo_path is a git repository",
+        "Uses git2 crate with CLI fallback for operations git2 doesn't support well",
+        "Typecheck passes"
+      ],
+      "priority": 25,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-026",
+      "title": "Worktree removal and cleanup",
+      "description": "As a developer, I want worktree removal and bulk cleanup so that stale worktrees don't accumulate.",
+      "acceptanceCriteria": [
+        "remove_worktree(repo_path, worktree_path) runs git worktree remove",
+        "list_worktrees(repo_path) parses git worktree list --porcelain",
+        "prune_worktrees(repo_path) runs git worktree prune",
+        "cleanup_all(repo_path, worktree_dir) removes all nflow worktrees, returns removed paths",
+        "Handles already-removed worktrees gracefully (not an error)",
+        "Typecheck passes"
+      ],
+      "priority": 26,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-027",
+      "title": "Branch management",
+      "description": "As a developer, I want branch creation and naming so that each story gets a properly named branch.",
+      "acceptanceCriteria": [
+        "create_branch(worktree_path, branch_name) runs git checkout -b in worktree",
+        "format_branch_name(template, vars) applies template: nflow/{project}/{story_id}-{story_slug}",
+        "Slugify story title: lowercase, replace spaces/special chars with hyphens, truncate to 50 chars",
+        "get_current_branch(worktree_path), get_head_commit(worktree_path), get_commit_message(worktree_path)",
+        "Typecheck passes"
+      ],
+      "priority": 27,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-028",
+      "title": "Rebase and push operations",
+      "description": "As a developer, I want rebase and push so that story branches are up-to-date and delivered to the remote.",
+      "acceptanceCriteria": [
+        "fetch_and_rebase(worktree_path, base_branch) runs git fetch origin && git rebase origin/{base}",
+        "On rebase conflict: abort rebase (git rebase --abort), return Error::RebaseConflict { details }",
+        "push_branch(worktree_path, branch_name) runs git push -u origin {branch_name}",
+        "Handle push failures: auth error, network error, branch protection — each with distinct error",
+        "Typecheck passes"
+      ],
+      "priority": 28,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-029",
+      "title": "Worktree reset for retry",
+      "description": "As a developer, I want worktree reset so that retried tasks start from a clean state.",
+      "acceptanceCriteria": [
+        "reset_to_commit(worktree_path, commit_hash) resets worktree to last good commit: git reset --hard {hash} && git clean -fd (handles both uncommitted changes and bad commits left by failed agent)",
+        "Used when retrying an impl task: reset to commit_hash of previous successful task (or base if first)",
+        "get_base_commit(worktree_path) returns the commit the worktree was created from",
+        "Verify the commit_hash exists before reset",
+        "Typecheck passes"
+      ],
+      "priority": 29,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-030",
+      "title": "MR/PR creation — GitHub",
+      "description": "As a developer, I want PR creation via gh so that completed stories automatically get pull requests on GitHub.",
+      "acceptanceCriteria": [
+        "create_github_pr(worktree_path, title, body, base_branch) -> Result<String> returns PR URL",
+        "Runs gh pr create --title --body --base in worktree directory",
+        "Validates gh is in PATH (clear error if not found)",
+        "Handles auth errors (gh auth status check)",
+        "Parses PR URL from stdout",
+        "Typecheck passes"
+      ],
+      "priority": 30,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-031",
+      "title": "MR/PR creation — GitLab",
+      "description": "As a developer, I want MR creation via glab so that completed stories automatically get merge requests on GitLab.",
+      "acceptanceCriteria": [
+        "create_gitlab_mr(worktree_path, title, body, base_branch) -> Result<String> returns MR URL",
+        "Runs glab mr create --title --description --target-branch in worktree directory",
+        "Validates glab is in PATH (clear error if not found)",
+        "Handles auth errors",
+        "Parses MR URL from stdout",
+        "Typecheck passes"
+      ],
+      "priority": 31,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-032",
+      "title": "Commit validation",
+      "description": "As a developer, I want commit validation so that impl task success criteria are checked against git state.",
+      "acceptanceCriteria": [
+        "has_new_commit(worktree_path, previous_head) -> Result<bool> compares current HEAD to previous",
+        "validate_commit_message(worktree_path, expected_prefix) -> Result<bool> checks latest commit contains [{prefix}]",
+        "expected_prefix is the wave-prefixed task short ID (e.g., W1-T1)",
+        "Returns false (not error) when validation fails — caller decides how to handle",
+        "Typecheck passes"
+      ],
+      "priority": 32,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-033",
+      "title": "Daemon process spawning and daemonization",
+      "description": "As a developer, I want the daemon to spawn as a background process so that it runs independently of the terminal.",
+      "acceptanceCriteria": [
+        "nflow daemon start spawns daemon via Command::new('nflow-daemon').spawn()",
+        "After spawn, daemon calls setsid() via nix crate to detach from terminal",
+        "Ignores SIGHUP before setsid, restores after",
+        "Writes PID to ~/.nflow/daemon.pid",
+        "Redirects stdout/stderr to ~/.nflow/logs/daemon.log",
+        "Creates ~/.nflow/logs/ directory if it doesn't exist",
+        "Works on both Linux and macOS",
+        "Typecheck passes"
+      ],
+      "priority": 33,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-034",
+      "title": "Daemon foreground mode",
+      "description": "As a developer, I want foreground mode so that I can debug the daemon with visible log output.",
+      "acceptanceCriteria": [
+        "nflow daemon start --foreground runs daemon in the current terminal",
+        "Logs output to stderr (not redirected to file)",
+        "Still writes PID file and binds socket",
+        "Ctrl+C triggers graceful shutdown (same as SIGTERM)",
+        "Typecheck passes"
+      ],
+      "priority": 34,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-035",
+      "title": "Daemon auto-start with flock",
+      "description": "As a developer, I want the daemon to auto-start on first command so that I never manually start it.",
+      "acceptanceCriteria": [
+        "CLI checks if daemon is running (PID file exists + process alive) before sending commands",
+        "If not running, acquires flock on ~/.nflow/daemon.lock (exclusive, with 5s timeout)",
+        "If lock acquired, spawns daemon process, waits up to 5s for socket to appear",
+        "If lock not acquired (another client is starting), waits for socket to appear",
+        "Returns error if daemon doesn't start within timeout",
+        "Typecheck passes"
+      ],
+      "priority": 35,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-036",
+      "title": "Daemon status and stop",
+      "description": "As a developer, I want daemon status checking and clean stopping so that I can monitor and control the background process.",
+      "acceptanceCriteria": [
+        "nflow daemon status reads PID file, checks if process is alive, reports status + PID + uptime",
+        "Reports 'not running' if PID file missing or process dead (cleans up stale PID file)",
+        "nflow daemon stop sends SIGTERM to daemon PID",
+        "Daemon handles SIGTERM: sets shutting_down flag, stops accepting new connections",
+        "Returns confirmation message with PID",
+        "Typecheck passes"
+      ],
+      "priority": 36,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-037",
+      "title": "Crash recovery — stale agent detection",
+      "description": "As a developer, I want crash recovery so that stale agents are detected and cleaned up on daemon restart.",
+      "acceptanceCriteria": [
+        "On startup, query agent_runs WHERE status = 'running'",
+        "For each stale run: check if PID is alive using kill(pid, 0)",
+        "If PID alive: compare pid_start_time with actual process start time",
+        "Linux: read start time from /proc/{pid}/stat field 22",
+        "macOS: read start time via libproc or sysctl kern.proc.pid",
+        "If PID dead OR start time mismatch: mark agent_run as failed ('daemon crashed'), update work_item to failed",
+        "If PID alive AND start time matches: adopt process (resume reading stdout)",
+        "Typecheck passes"
+      ],
+      "priority": 37,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-038",
+      "title": "Crash recovery — session and state reset",
+      "description": "As a developer, I want session and state cleanup on crash recovery so that no stuck state remains after a crash.",
+      "acceptanceCriteria": [
+        "Reset all specs with session_active = 1 to session_active = 0",
+        "Work items in in_progress state with no running agent_run -> set to failed",
+        "Stories in in_progress with all tasks done -> trigger completion flow (rebase/push/MR)",
+        "Remove stale socket file if it exists from previous run",
+        "Remove stale PID file if PID doesn't match current process",
+        "Log all recovery actions at INFO level",
+        "Typecheck passes"
+      ],
+      "priority": 38,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-039",
+      "title": "Graceful shutdown",
+      "description": "As a developer, I want graceful shutdown so that running agents finish cleanly when the daemon stops.",
+      "acceptanceCriteria": [
+        "On SIGTERM: set shutting_down flag",
+        "Stop accepting new socket connections",
+        "Stop scheduler (no new tasks started)",
+        "Wait up to 60 seconds for running agents to finish naturally",
+        "After 60s: send SIGTERM to remaining agent processes",
+        "Wait 10 more seconds, then SIGKILL any survivors",
+        "Close database connection, remove socket file and PID file",
+        "Exit with code 0",
+        "Typecheck passes"
+      ],
+      "priority": 39,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-040",
+      "title": "Unix socket server",
+      "description": "As a developer, I want a Unix socket server so that CLI and TUI clients can connect and send commands.",
+      "acceptanceCriteria": [
+        "Bind Unix domain socket at ~/.nflow/nflow.sock",
+        "Set socket file mode to 0600 (owner-only)",
+        "Accept concurrent client connections (tokio task per client)",
+        "Read NDJSON from each client (split on newline)",
+        "Parse JSON: {id, command, params}",
+        "Route to command handler, await response",
+        "Send JSON response: {id, status: ok|error, data}",
+        "Detect and clean up disconnected clients",
+        "Typecheck passes"
+      ],
+      "priority": 40,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-041",
+      "title": "Streaming responses and event broadcast",
+      "description": "As a developer, I want streaming responses so that log following and real-time TUI updates work.",
+      "acceptanceCriteria": [
+        "Streaming response: multiple JSON lines with same id, final line has done: true",
+        "subscribe_to_events(client_id) registers a client for broadcast events",
+        "Events broadcast: StatusChange, AgentOutput, StoryCompleted",
+        "Client disconnect removes subscription",
+        "nflow log -f {task_id} streams agent output via streaming response",
+        "Typecheck passes"
+      ],
+      "priority": 41,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-042",
+      "title": "NDJSON protocol handshake",
+      "description": "As a developer, I want a protocol handshake so that version mismatches between CLI and daemon are detected early.",
+      "acceptanceCriteria": [
+        "Client sends first message: {protocol_version: 1}",
+        "Daemon responds: {protocol_version: 1, status: ok} or error for unsupported version",
+        "Handshake must complete before any commands are accepted",
+        "Handshake timeout: 5 seconds",
+        "Typecheck passes"
+      ],
+      "priority": 42,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-043",
+      "title": "Command handler — project init",
+      "description": "As a developer, I want project init handling so that nflow init creates and persists a new project.",
+      "acceptanceCriteria": [
+        "Receives: { name, path, base_branch?, git_provider? }",
+        "Validates using ProjectService::create() from nflow-core",
+        "Creates directories: ~/.nflow/projects/{name}/specs/ and agent-logs/",
+        "Inserts project record into SQLite",
+        "Returns: { project_id, name, path, base_branch, git_provider }",
+        "Error if name already exists: ALREADY_EXISTS",
+        "Error if path is not a git repo: INVALID_PARAMS",
+        "Typecheck passes"
+      ],
+      "priority": 43,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-044",
+      "title": "Command handler — project list and delete",
+      "description": "As a developer, I want project list and delete handling so that projects can be managed.",
+      "acceptanceCriteria": [
+        "project.list returns all projects with: name, path, base_branch, git_provider, execution_enabled, spec_count, story_count",
+        "project.delete receives: { name, force? }",
+        "Without --force: returns confirmation prompt; error if project has running agents: INVALID_STATE",
+        "With --force: marks in-progress items as cancelled and proceeds (for crashed daemon scenarios)",
+        "Deletes: project record (cascades to specs, work_items, agent_runs), removes ~/.nflow/projects/{name}/ directory, removes all worktrees for this project (git worktree remove for each)",
+        "Typecheck passes"
+      ],
+      "priority": 44,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-045",
+      "title": "Command handler — spec new (start session)",
+      "description": "As a developer, I want spec creation handling so that nflow spec new starts a Claude dialogue session.",
+      "acceptanceCriteria": [
+        "Receives: { project_name, spec_name, with_codebase? }",
+        "Validates no active spec session for this project",
+        "Creates spec record with status=draft, session_active=true",
+        "Loads spec_session.md template, spawns Claude with RunConfig::for_spec()",
+        "Sets working_dir to project root (with_codebase) or specs dir",
+        "Begins streaming Claude output to connected clients",
+        "Returns: { spec_id, name, status: draft }",
+        "Typecheck passes"
+      ],
+      "priority": 45,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-046",
+      "title": "Command handler — spec Q&A flow",
+      "description": "As a developer, I want spec Q&A handling so that the multi-turn Claude dialogue works via resume chains.",
+      "acceptanceCriteria": [
+        "Detects AskUserQuestion tool call in Claude stream output",
+        "Sends question to client as streaming event: { type: question, text, options? }",
+        "spec.answer receives: { spec_id, answer_text }",
+        "Spawns new Claude process with --resume {session_id} and -p {answer_text}",
+        "Chains session: each answer starts a new Claude invocation resuming the previous",
+        "On Claude exit code 0 + spec file exists: marks session as completed",
+        "Sets session_active = false, stores final claude_session_id",
+        "Typecheck passes"
+      ],
+      "priority": 46,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-047",
+      "title": "Command handler — spec CRUD (list/view/approve/reopen/delete)",
+      "description": "As a developer, I want spec CRUD handling so that all spec lifecycle commands work.",
+      "acceptanceCriteria": [
+        "spec.list returns specs with: name, status, session_active, created_at",
+        "spec.view returns spec markdown content (reads file from disk)",
+        "spec.approve transitions draft -> approved (validates via state machine); if spec has active session (session_active=true), stops Claude process (SIGTERM) first, then approves",
+        "spec.reopen transitions approved -> draft (validates not decomposed)",
+        "spec.delete is a soft-delete: sets status to 'deleted', record remains in DB but hidden from listings, markdown file preserved on disk; if draft with active session stops session first; if approved requires confirmation (--force to skip); if decomposed fails (must discard wave first)",
+        "spec.resume finds latest draft spec or by name, validates session not active, starts Claude with --resume",
+        "All commands return appropriate error codes for invalid states",
+        "Typecheck passes"
+      ],
+      "priority": 47,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-048",
+      "title": "Command handler — plan generate",
+      "description": "As a developer, I want plan generation handling so that nflow plan generate invokes Claude decomposition.",
+      "acceptanceCriteria": [
+        "Receives: { project_name, spec_names?, with_codebase? }",
+        "Validates no draft wave exists for this project",
+        "Finds unassigned approved specs, creates DecompositionSession with auto-incremented wave_number",
+        "Concatenates spec contents, spawns Claude with RunConfig::for_decompose() and decompose.md",
+        "Parses Claude JSON output into work items (epics -> stories -> tasks)",
+        "Auto-generates verify tasks after each impl task",
+        "Builds and validates DAG (cycle check), inserts all work items and dependencies",
+        "Marks specs as decomposed",
+        "Returns: { wave_number, epic_count, story_count, task_count }",
+        "Typecheck passes"
+      ],
+      "priority": 48,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-049",
+      "title": "Command handler — plan show",
+      "description": "As a developer, I want plan display so that the current wave's structure is visible.",
+      "acceptanceCriteria": [
+        "plan.show returns hierarchical tree: wave -> epics -> stories -> tasks",
+        "Each item includes: short_id, title, status, depends_on (for stories)",
+        "--wave N selects specific wave (default: latest)",
+        "--dag returns adjacency list representation of story dependencies",
+        "Tasks include kind (impl|verify) for display differentiation",
+        "Progress counts per story: {done}/{total} tasks",
+        "Typecheck passes"
+      ],
+      "priority": 49,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-050",
+      "title": "Command handler — plan feedback",
+      "description": "As a developer, I want plan feedback handling so that the decomposition can be refined through Claude dialogue.",
+      "acceptanceCriteria": [
+        "Receives: { message, wave_number? }",
+        "Validates wave is in draft (in_progress) state",
+        "Deletes existing work items for this session (plan feedback = full regeneration)",
+        "Spawns Claude with --resume {session_id} and feedback message as prompt",
+        "Parses new JSON output, validates DAG, inserts new work items",
+        "Auto-generates verify tasks for new plan",
+        "Returns updated plan structure",
+        "Typecheck passes"
+      ],
+      "priority": 50,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-051",
+      "title": "Command handler — plan approve and discard",
+      "description": "As a developer, I want plan approval and discard so that waves are locked for execution or removed.",
+      "acceptanceCriteria": [
+        "plan.approve validates wave is in draft state, transitions to approved",
+        "Stories in approved wave become schedulable",
+        "If auto_execute is true: sets execution_enabled = true for the project",
+        "plan.discard can target any wave (draft or approved), fails if wave has stories with status in_progress (must stop them first), transitions to discarded",
+        "Discard deletes all work items, transitions specs back from decomposed -> approved",
+        "Returns confirmation with wave_number",
+        "Typecheck passes"
+      ],
+      "priority": 51,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-052",
+      "title": "Scheduler loop — main integration",
+      "description": "As a developer, I want the scheduler running on the main event loop so that it ticks every 2 seconds without race conditions.",
+      "acceptanceCriteria": [
+        "Scheduler runs as tokio::time::interval(Duration::from_secs(2)) on the main task",
+        "Each tick: calls schedule() from nflow-core, then executes returned actions",
+        "Serialized with command handling (no concurrent DB writes)",
+        "Skips tick if shutting_down flag is set",
+        "Skips tick if no projects have execution_enabled = true",
+        "Logs scheduler actions at DEBUG level",
+        "Typecheck passes"
+      ],
+      "priority": 52,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-053",
+      "title": "Scheduler — reap finished processes",
+      "description": "As a developer, I want process reaping so that finished agents are detected and their results processed.",
+      "acceptanceCriteria": [
+        "On each tick: check all running agent_runs PIDs via waitpid(WNOHANG) or tokio process handle",
+        "For finished processes: read exit code, update agent_run record",
+        "Parse final stream-json output for session_id and result text",
+        "Evaluate task result using evaluate_impl_result() or evaluate_verify_result()",
+        "Update work_item status based on evaluation (done or failed with reason)",
+        "Store commit_hash on successful impl task",
+        "Broadcast status change events to subscribed clients",
+        "Typecheck passes"
+      ],
+      "priority": 53,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-054",
+      "title": "Scheduler — start story execution",
+      "description": "As a developer, I want story start logic so that ready stories get a worktree and begin their first task.",
+      "acceptanceCriteria": [
+        "When scheduler selects a ready story: set status to in_progress",
+        "Format branch name from branch_template",
+        "Create git worktree via nflow-git::create_worktree()",
+        "Store worktree_path and branch_name on story",
+        "Start first task (lowest sort_order with status=pending)",
+        "If worktree creation fails: set story to failed with error details",
+        "Typecheck passes"
+      ],
+      "priority": 54,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-055",
+      "title": "Scheduler — start task execution",
+      "description": "As a developer, I want task start logic so that Claude agents are spawned for each task.",
+      "acceptanceCriteria": [
+        "Set task status to in_progress",
+        "Record head_before commit hash (for impl tasks)",
+        "Load and render prompt template (task_execution.md or verify_task.md)",
+        "Write rendered context to temp file for --append-system-prompt-file",
+        "Spawn Claude process via ClaudeRunner::spawn()",
+        "Create agent_run record with: PID, pid_start_time, log_path, status=running",
+        "Pipe agent stdout to log file at ~/.nflow/projects/{name}/agent-logs/{short_id}.log",
+        "Stream agent output to subscribed clients",
+        "Typecheck passes"
+      ],
+      "priority": 55,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-056",
+      "title": "Scheduler — task completion and story progression",
+      "description": "As a developer, I want task completion logic so that stories progress through their task sequence correctly.",
+      "acceptanceCriteria": [
+        "On impl task success: mark done, store commit_hash, start paired verify task",
+        "On verify task success: mark done, start next impl task (next pending by sort_order)",
+        "On verify task failure: mark failed, set story to failed (stop immediately)",
+        "On impl task failure: mark failed, set story to failed",
+        "When all tasks in story are done: trigger story completion flow",
+        "When story has mix of done and skipped tasks: still trigger completion",
+        "Typecheck passes"
+      ],
+      "priority": 56,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-057",
+      "title": "Scheduler — story completion (rebase, push, MR)",
+      "description": "As a developer, I want story completion so that finished stories are rebased, pushed, and get MRs created.",
+      "acceptanceCriteria": [
+        "When all tasks done: run fetch_and_rebase() from nflow-git",
+        "On rebase success: run push_branch()",
+        "On push success: render MR body from mr_body.md template",
+        "Create MR/PR via create_github_pr() or create_gitlab_mr() based on project config",
+        "Store mr_url on story, set status to done",
+        "If cleanup_worktrees=true: remove worktree after MR creation",
+        "On rebase/push/MR failure: set story to failed, all tasks stay done",
+        "Broadcast StoryCompleted event",
+        "Typecheck passes"
+      ],
+      "priority": 57,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-058",
+      "title": "Scheduler — wall-clock timeout",
+      "description": "As a developer, I want wall-clock timeout so that hung agents are killed after a configurable time.",
+      "acceptanceCriteria": [
+        "Track task start time in agent_runs.started_at",
+        "On each scheduler tick: compare now - started_at against max_time_per_task",
+        "On timeout: send SIGTERM, wait 10 seconds, then SIGKILL if still alive",
+        "Mark task as failed with reason 'wall-clock timeout exceeded ({max_time}s)'",
+        "Mark story as failed",
+        "Log timeout at WARN level",
+        "Typecheck passes"
+      ],
+      "priority": 58,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-059",
+      "title": "Command handler — exec run and pause",
+      "description": "As a developer, I want run/pause commands so that execution can be enabled and disabled.",
+      "acceptanceCriteria": [
+        "exec.run sets execution_enabled = true for current project",
+        "--parallel N temporarily overrides max_parallel for this run (stored in memory)",
+        "--story {id} limits execution to a specific story",
+        "exec.pause sets execution_enabled = false — running agents continue, no new ones started",
+        "Returns current execution state: enabled/disabled, running_count, pending_count",
+        "Typecheck passes"
+      ],
+      "priority": 59,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-060",
+      "title": "Command handler — exec status",
+      "description": "As a developer, I want status display so that I can see the current state of all work items.",
+      "acceptanceCriteria": [
+        "Returns hierarchical status: waves -> epics -> stories -> tasks",
+        "Each item: short_id, title, status, started_at, finished_at",
+        "Stories additionally: branch_name, mr_url, worktree_path",
+        "Tasks additionally: kind (impl|verify), agent exit_code, retry_count",
+        "--wave N filters to specific wave",
+        "Summary counts: total/pending/ready/running/done/failed/cancelled per wave",
+        "Typecheck passes"
+      ],
+      "priority": 60,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-061",
+      "title": "Command handler — exec retry",
+      "description": "As a developer, I want retry handling so that failed tasks can be re-executed.",
+      "acceptanceCriteria": [
+        "Receives: { task_id } (wave-prefixed short ID)",
+        "Validates task is in failed state",
+        "For impl tasks: reset worktree to previous task's commit_hash (or base if first task)",
+        "For verify tasks: no worktree reset needed",
+        "Set task to in_progress, spawn new Claude agent with previous_error in prompt context",
+        "Count retries via count_agent_runs_for_task(), warn at 3+",
+        "Set story status back to in_progress",
+        "Returns: { task_id, retry_count, warning? }",
+        "Typecheck passes"
+      ],
+      "priority": 61,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-062",
+      "title": "Command handler — exec skip",
+      "description": "As a developer, I want skip handling so that failed tasks can be bypassed.",
+      "acceptanceCriteria": [
+        "Receives: { task_id }",
+        "Validates task is in failed state",
+        "Marks task as done with metadata skipped = true",
+        "If impl task: also marks paired verify task as skipped",
+        "Resumes story execution from next pending task",
+        "If no more pending tasks: trigger story completion",
+        "Returns: { task_id, skipped_verify?: task_id }",
+        "Typecheck passes"
+      ],
+      "priority": 62,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-063",
+      "title": "Command handler — exec continue",
+      "description": "As a developer, I want continue handling so that failed stories can resume from the next task.",
+      "acceptanceCriteria": [
+        "Receives: { story_id, force? }",
+        "Validates story is in failed or cancelled state",
+        "Marks current failed task as done (skipped = true)",
+        "If cancelled story has worktree: set to in_progress, resume from first pending task",
+        "If cancelled story has no worktree: set to ready or pending (based on dependency state)",
+        "--force skips confirmation for cancelled stories with dependents",
+        "Returns: { story_id, next_task_id?, resumed: bool }",
+        "Typecheck passes"
+      ],
+      "priority": 63,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-064",
+      "title": "Command handler — exec stop and cancel",
+      "description": "As a developer, I want stop/cancel so that running and pending stories can be halted.",
+      "acceptanceCriteria": [
+        "exec.stop {story_id}: single story sends SIGTERM to agent, sets story to cancelled",
+        "--wave N stops all running stories in specific wave",
+        "Without story_id: stops all running agents in the current project (determined by --project flag or cwd)",
+        "--all stops all running agents across all projects",
+        "exec.cancel: validates story is pending or ready, sets to cancelled without process termination",
+        "Warns if cancelled story has dependents that will be blocked",
+        "Typecheck passes"
+      ],
+      "priority": 64,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-065",
+      "title": "Command handler — log viewing",
+      "description": "As a developer, I want log viewing so that agent output can be inspected.",
+      "acceptanceCriteria": [
+        "exec.log receives: { task_id, follow? }",
+        "Without follow: reads log file and returns content",
+        "With follow: streams new log content as it's written",
+        "Returns parsed output: tool calls with timestamps, text output, errors",
+        "Error if no log file exists for the task",
+        "Typecheck passes"
+      ],
+      "priority": 65,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-066",
+      "title": "Command handler — worktree and cleanup",
+      "description": "As a developer, I want worktree and cleanup commands so that disk space can be managed.",
+      "acceptanceCriteria": [
+        "worktree.list returns all active worktrees: path, branch, story_id, story_status",
+        "worktree.clean removes worktrees for done/cancelled stories",
+        "worktree.clean --all removes all nflow worktrees (with warning)",
+        "cleanup.logs: --older-than duration, --all, --dry-run flags",
+        "Returns: list of removed (or would-remove) files with sizes",
+        "Typecheck passes"
+      ],
+      "priority": 66,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-067",
+      "title": "Command handler — config get and set",
+      "description": "As a developer, I want config commands so that configuration can be viewed and modified at runtime.",
+      "acceptanceCriteria": [
+        "config.show returns effective config: merged defaults + global + per-project + env",
+        "Shows which layer each value comes from (default, global, project, env)",
+        "config.set receives: { key, value, project? }",
+        "Without --project: writes to global ~/.nflow/config.toml",
+        "With --project: writes to per-project section",
+        "Validates key is known and value type matches expected",
+        "Returns updated effective value",
+        "Typecheck passes"
+      ],
+      "priority": 67,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-068",
+      "title": "Filesystem security enforcement",
+      "description": "As a developer, I want filesystem permission enforcement so that nflow data is protected from other users.",
+      "acceptanceCriteria": [
+        "On daemon start: ensure ~/.nflow/ exists with mode 0700",
+        "If directory mode is too open: fix permissions and log warning",
+        "Socket file created with mode 0600",
+        "Database file permissions inherited from directory",
+        "Works on both Linux and macOS",
+        "Typecheck passes"
+      ],
+      "priority": 68,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-069",
+      "title": "CLI skeleton with clap",
+      "description": "As a developer, I want the CLI structure defined so that all commands and flags are parseable.",
+      "acceptanceCriteria": [
+        "All commands defined via clap::Parser derive macro",
+        "Command groups: daemon, init, projects, project, spec, plan, run, pause, status, log, retry, skip, continue, stop, cancel, worktree, cleanup, config, tui",
+        "Global flags: --project, --verbose, --json, --no-color",
+        "Each subcommand has correct flags matching documentation",
+        "Help text for all commands and flags",
+        "cargo build -p nflow-cli succeeds",
+        "Typecheck passes"
+      ],
+      "priority": 69,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-070",
+      "title": "CLI socket client",
+      "description": "As a developer, I want a socket client so that CLI commands are sent to the daemon and responses displayed.",
+      "acceptanceCriteria": [
+        "Connect to Unix socket at ~/.nflow/nflow.sock (or NFLOW_SOCKET override)",
+        "Perform protocol handshake (send protocol_version, verify response)",
+        "Send NDJSON request with generated UUID, wait for response with matching UUID",
+        "Connection timeout: 5 seconds",
+        "Command timeout: configurable (default 60s, 300s for spec/plan)",
+        "Clear error if socket doesn't exist: 'Daemon not running. Starting...'",
+        "Typecheck passes"
+      ],
+      "priority": 70,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-071",
+      "title": "CLI streaming client",
+      "description": "As a developer, I want streaming support so that log -f and spec dialogues work in the terminal.",
+      "acceptanceCriteria": [
+        "Handle streaming responses: read lines until done: true",
+        "For log -f: print each line as received, handle Ctrl+C to stop following",
+        "For spec dialogue: display Claude output, detect question events, prompt user for input, send answer",
+        "User input via stdin (line-oriented)",
+        "Graceful exit on Ctrl+C (send cancel to daemon)",
+        "Typecheck passes"
+      ],
+      "priority": 71,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-072",
+      "title": "CLI output formatting",
+      "description": "As a developer, I want formatted output so that CLI results are readable and scriptable.",
+      "acceptanceCriteria": [
+        "Default: pretty-printed human-readable output with colors",
+        "--json: raw JSON output (one object per line for lists)",
+        "--no-color: strip ANSI color codes (for piping)",
+        "Status colors: green (done), yellow (running/ready), red (failed), gray (pending), dim (cancelled)",
+        "Tree rendering for plan show: indented ASCII tree with status icons",
+        "Error messages include suggested actions",
+        "Typecheck passes"
+      ],
+      "priority": 72,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-073",
+      "title": "CLI exit codes",
+      "description": "As a developer, I want consistent exit codes so that scripts can check command results.",
+      "acceptanceCriteria": [
+        "0: success, 1: general error, 2: daemon not running, 3: entity not found, 4: invalid arguments, 5: invalid state transition",
+        "All exit codes documented in --help",
+        "Typecheck passes"
+      ],
+      "priority": 73,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-074",
+      "title": "TUI app skeleton",
+      "description": "As a developer, I want the TUI framework set up so that views can be rendered and input handled.",
+      "acceptanceCriteria": [
+        "nflow tui [--project <name>] launches full-screen TUI via ratatui + crossterm",
+        "Connects to daemon via Unix socket on startup",
+        "If daemon not running: shows 'Starting daemon...' and auto-starts",
+        "If --project not specified: detects from cwd or shows project selector",
+        "Main loop: handle input events -> update state -> render frame",
+        "Clean terminal restore on exit (raw mode cleanup, cursor visible)",
+        "Typecheck passes"
+      ],
+      "priority": 74,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-075",
+      "title": "TUI global navigation",
+      "description": "As a developer, I want global keyboard navigation so that views are accessible from anywhere.",
+      "acceptanceCriteria": [
+        "1/2/3/4 switches to Specs/Plan/Execute/Logs views",
+        "Tab/Shift+Tab cycles through views",
+        "q quits TUI (daemon continues), ? toggles help overlay, p opens project switcher, / opens filter",
+        "Status bar at bottom: daemon state, project name, current wave, active agent count",
+        "Header with view tabs, active tab highlighted",
+        "Typecheck passes"
+      ],
+      "priority": 75,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-076",
+      "title": "TUI — specs list view",
+      "description": "As a developer, I want a specs list so that I can see and manage all specifications.",
+      "acceptanceCriteria": [
+        "Lists all specs with columns: name, status, updated",
+        "Status shown with colored badge: draft (yellow), approved (green), decomposed (blue)",
+        "Arrow keys to navigate, highlighted selection",
+        "n (new), a (approve), d (delete), v (view), r (resume) keybindings",
+        "Typecheck passes"
+      ],
+      "priority": 76,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-077",
+      "title": "TUI — spec dialogue sub-view",
+      "description": "As a developer, I want a dialogue interface so that I can have Claude conversations for spec creation in the TUI.",
+      "acceptanceCriteria": [
+        "Shown when a spec session is active (after n or r)",
+        "Split layout: scrollable chat history (top 80%) + input field (bottom 20%)",
+        "Claude messages with 'Claude:' prefix, user messages with 'You:' prefix",
+        "When Claude asks a question: input field becomes active",
+        "Enter sends answer, Ctrl+D ends session, Esc returns to specs list",
+        "Auto-scroll to latest message",
+        "Typecheck passes"
+      ],
+      "priority": 77,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-078",
+      "title": "TUI — spec content pager",
+      "description": "As a developer, I want a pager view so that I can read full spec content in the TUI.",
+      "acceptanceCriteria": [
+        "Full-screen markdown content display (plain text)",
+        "Scrollable: j/k (line), Ctrl+d/Ctrl+u (page), G (bottom), g (top)",
+        "Line wrapping at terminal width",
+        "q or Esc returns to specs list",
+        "Shows spec name in header",
+        "Typecheck passes"
+      ],
+      "priority": 78,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-079",
+      "title": "TUI — plan tree view",
+      "description": "As a developer, I want a tree visualization so that I can see the full decomposition structure.",
+      "acceptanceCriteria": [
+        "Collapsible tree: Wave -> Epic -> Story -> Task",
+        "Each node shows: short_id, title, status icon",
+        "Status icons: circle (pending), filled circle (ready), play (running), check (done), x (failed), slash-circle (cancelled)",
+        "Stories show dependency indicators (blockers)",
+        "Progress per story: (X/Y tasks)",
+        "h toggles verify task visibility",
+        "Typecheck passes"
+      ],
+      "priority": 79,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-080",
+      "title": "TUI — plan actions",
+      "description": "As a developer, I want plan action keybindings so that I can generate, refine, and approve plans from the TUI.",
+      "acceptanceCriteria": [
+        "g opens generate dialog (select specs, --with-codebase checkbox)",
+        "f opens feedback input (multi-line text, Enter to submit, Esc to cancel)",
+        "a approves current draft wave (with confirmation popup)",
+        "d discards current draft wave (with confirmation popup)",
+        "Enter on selected item shows detail popup: description, acceptance_criteria, dependencies",
+        "Typecheck passes"
+      ],
+      "priority": 80,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-081",
+      "title": "TUI — execute split view",
+      "description": "As a developer, I want a split execution view so that I can see the work tree and agent output simultaneously.",
+      "acceptanceCriteria": [
+        "Vertical split: task tree (left 40%) + agent output (right 60%)",
+        "Left pane: wave -> story -> task tree with status icons",
+        "Right pane: streaming output of currently selected task",
+        "Selecting a task switches right pane to that task's output",
+        "Running tasks show live output; done/failed show historical log",
+        "Auto-select the currently running task on view entry",
+        "Typecheck passes"
+      ],
+      "priority": 81,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-082",
+      "title": "TUI — execute real-time updates",
+      "description": "As a developer, I want real-time status updates so that the execution view reflects current state.",
+      "acceptanceCriteria": [
+        "Subscribe to daemon events on view entry",
+        "StatusChange events update tree node status icons and colors",
+        "AgentOutput events append to right pane (if matching selected task)",
+        "StoryCompleted events show MR URL inline",
+        "Running counts updated in header: 'Running: 2/3 | Done: 5 | Failed: 1'",
+        "Typecheck passes"
+      ],
+      "priority": 82,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-083",
+      "title": "TUI — execute actions",
+      "description": "As a developer, I want execution control actions so that I can manage running work from the TUI.",
+      "acceptanceCriteria": [
+        "r starts execution (equivalent to nflow run)",
+        "s stops selected story (with confirmation)",
+        "c cancels selected story (with confirmation, only if pending/ready)",
+        "Enter opens selected task's full log in Logs view",
+        "e escalates: stops story, displays worktree path for manual intervention",
+        "Actions only available for items in appropriate states",
+        "Typecheck passes"
+      ],
+      "priority": 83,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-084",
+      "title": "TUI — logs view",
+      "description": "As a developer, I want a full-screen log viewer so that I can inspect agent output in detail.",
+      "acceptanceCriteria": [
+        "Full-screen scrollable text display of selected task's log",
+        "Navigation: j/k (line), G (bottom), g (top), Ctrl+d/Ctrl+u (page)",
+        "Running tasks: streams new output in real-time, auto-scroll to bottom",
+        "Done/failed tasks: static display of historical log",
+        "Tool calls parsed and displayed with timestamps",
+        "Esc returns to Execute view",
+        "Typecheck passes"
+      ],
+      "priority": 84,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-085",
+      "title": "TUI — help overlay",
+      "description": "As a developer, I want a help overlay so that I can discover keybindings for the current view.",
+      "acceptanceCriteria": [
+        "? toggles floating help panel",
+        "Shows keybindings specific to current active view plus global keybindings",
+        "Semi-transparent background (dim underlying content)",
+        "Any key press dismisses the overlay",
+        "Typecheck passes"
+      ],
+      "priority": 85,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-086",
+      "title": "TUI — project switcher",
+      "description": "As a developer, I want a project switcher so that I can change projects without restarting the TUI.",
+      "acceptanceCriteria": [
+        "p opens project selector popup",
+        "Lists all projects with: name, path, active agent count",
+        "Arrow keys to navigate, Enter to select, Esc to cancel",
+        "On selection: reload all views with new project's data",
+        "Current project highlighted in list",
+        "Typecheck passes"
+      ],
+      "priority": 86,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-087",
+      "title": "TUI — filter and search",
+      "description": "As a developer, I want filtering so that I can find specific items in large plans/execution views.",
+      "acceptanceCriteria": [
+        "/ opens search input at bottom of screen",
+        "Filters tree items by title text match (case-insensitive)",
+        "Non-matching items hidden or dimmed",
+        "Enter confirms filter, Esc clears filter",
+        "Shows match count: 'Showing X/Y items'",
+        "Typecheck passes"
+      ],
+      "priority": 87,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-088",
+      "title": "Platform abstraction — PID detection",
+      "description": "As a developer, I want platform-abstracted PID detection so that crash recovery works on both Linux and macOS.",
+      "acceptanceCriteria": [
+        "get_pid_start_time(pid) -> Result<u64> returns process start time",
+        "Linux: parse /proc/{pid}/stat field 22 (starttime in clock ticks)",
+        "macOS: use libproc crate or sysctl kern.proc.pid to get p_starttime",
+        "is_process_alive(pid) -> bool checks via kill(pid, 0)",
+        "verify_process(pid, expected_start_time) -> ProcessState returns: Alive, Dead, PidReused",
+        "Compile-time platform selection via #[cfg(target_os)]",
+        "Typecheck passes"
+      ],
+      "priority": 88,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-089",
+      "title": "Platform abstraction — signal handling",
+      "description": "As a developer, I want cross-platform signal handling so that process management works on both Linux and macOS.",
+      "acceptanceCriteria": [
+        "send_signal(pid, signal) wraps nix::sys::signal::kill",
+        "Signal enum: SIGTERM, SIGKILL, SIGHUP",
+        "install_signal_handler(signal, handler) for daemon shutdown",
+        "Works identically on Linux and macOS (both POSIX)",
+        "Typecheck passes"
+      ],
+      "priority": 89,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-090",
+      "title": "Unit tests — DAG and topological sort",
+      "description": "As a developer, I want DAG tests so that dependency resolution is proven correct.",
+      "acceptanceCriteria": [
+        "Test: build DAG from 5 stories with linear dependencies -> correct topological sort order",
+        "Test: diamond dependency -> valid sort order",
+        "Test: detect cycle in 3-story circular dependency -> CyclicDependency error",
+        "Test: DAG with no dependencies -> all stories independent",
+        "Test: find_ready_stories with mix of done/pending blockers",
+        "Test: cross-wave dependency rejected",
+        "Tests pass: cargo test -p nflow-core dag"
+      ],
+      "priority": 90,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-091",
+      "title": "Unit tests — scheduler algorithm",
+      "description": "As a developer, I want scheduler tests so that story selection and parallel limits are verified.",
+      "acceptanceCriteria": [
+        "Test: 5 ready stories, max_parallel=3 -> returns 3 start actions",
+        "Test: 2 running + 3 ready, max_parallel=3 -> returns 1 start action",
+        "Test: all stories done -> returns no actions",
+        "Test: story with unmet dependencies -> not selected",
+        "Test: propagation: blocker done -> blocked story becomes ready",
+        "Test: execution_enabled=false -> no start actions",
+        "Test: wave ordering: W1 before W2",
+        "Test: epic status materialization from child stories",
+        "Tests pass: cargo test -p nflow-core scheduler"
+      ],
+      "priority": 91,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-092",
+      "title": "Unit tests — work item state machines",
+      "description": "As a developer, I want state machine tests so that all valid and invalid transitions are covered.",
+      "acceptanceCriteria": [
+        "Test all valid story transitions: pending->ready->in_progress->done, in_progress->failed, failed->in_progress, cancelled from pending/ready/in_progress",
+        "Test all valid task transitions: pending->in_progress->done, in_progress->failed, failed->in_progress(retry), failed->done(skip), pending->cancelled",
+        "Test invalid transitions return error: done->in_progress, pending->done, cancelled->done",
+        "Test skip_task marks paired verify as skipped",
+        "Test auto_generate_verify_tasks produces correct sort_order and short_ids",
+        "Tests pass: cargo test -p nflow-core work_item"
+      ],
+      "priority": 92,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-093",
+      "title": "Unit tests — spec state machine",
+      "description": "As a developer, I want spec state machine tests so that lifecycle transitions are verified.",
+      "acceptanceCriteria": [
+        "Test valid: draft->approved, approved->draft(reopen), approved->decomposed, decomposed->approved(via plan discard), draft->deleted, approved->deleted",
+        "Test invalid: decomposed->draft(reopen), decomposed->deleted(must discard first), deleted->draft",
+        "Test session_active: can't start when already active",
+        "Test end_session stores claude_session_id",
+        "Tests pass: cargo test -p nflow-core spec"
+      ],
+      "priority": 93,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-094",
+      "title": "Unit tests — short ID system",
+      "description": "As a developer, I want short ID tests so that generation and resolution work correctly.",
+      "acceptanceCriteria": [
+        "Test: generate short IDs for 3 epics, 5 stories, 10 tasks -> E1-E3, S1-S5, T1-T10",
+        "Test: verify tasks get 'v' suffix: T1v, T2v",
+        "Test: wave prefix: W1-S1, W2-T3v",
+        "Test: resolve W1-S1 -> correct UUID",
+        "Test: resolve S1 with multiple waves -> ambiguity error",
+        "Test: resolve non-existent ID -> NotFound error",
+        "Tests pass: cargo test -p nflow-core short_id"
+      ],
+      "priority": 94,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-095",
+      "title": "Unit tests — config merging",
+      "description": "As a developer, I want config merge tests so that layered configuration works correctly.",
+      "acceptanceCriteria": [
+        "Test: defaults only -> all default values",
+        "Test: global overrides one key -> that key overridden, others default",
+        "Test: per-project overrides global -> project value wins",
+        "Test: env var overrides all -> env value wins",
+        "Test: validation rejects max_parallel=0, invalid git_provider",
+        "Tests pass: cargo test -p nflow-core config"
+      ],
+      "priority": 95,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-096",
+      "title": "Unit tests — stream-JSON parser",
+      "description": "As a developer, I want parser tests so that all stream-json message types are handled correctly.",
+      "acceptanceCriteria": [
+        "Test: parse text delta, tool_use, tool_result, result events",
+        "Test: parse malformed JSON -> ParseError (not crash)",
+        "Test: parse partial line -> buffered until newline",
+        "Test: detect AskUserQuestion tool call",
+        "Test: evaluate impl success criteria (all 3 conditions)",
+        "Test: evaluate verify success criteria",
+        "Tests pass: cargo test -p nflow-claude"
+      ],
+      "priority": 96,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-097",
+      "title": "Unit tests — prompt template rendering",
+      "description": "As a developer, I want template tests so that variable substitution works correctly.",
+      "acceptanceCriteria": [
+        "Test: render with all variables present -> correct output",
+        "Test: missing required variable -> error",
+        "Test: extra variables -> ignored",
+        "Test: literal braces not matching any var -> preserved",
+        "Test: override template loaded from file instead of embedded",
+        "Tests pass: cargo test -p nflow-claude prompt"
+      ],
+      "priority": 97,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-098",
+      "title": "Integration tests — daemon lifecycle",
+      "description": "As a developer, I want daemon lifecycle tests so that start/stop/crash recovery are verified end-to-end.",
+      "acceptanceCriteria": [
+        "Test fixture: temporary NFLOW_HOME directory, isolated daemon instance",
+        "Test: start daemon -> PID file created, socket exists, status reports running",
+        "Test: stop daemon -> PID file removed, socket removed",
+        "Test: crash recovery: kill daemon (SIGKILL), restart -> stale agents marked failed",
+        "Test: flock prevents two daemons starting simultaneously",
+        "Test: auto-start from CLI command",
+        "Cleanup: all temp dirs and processes removed",
+        "Tests pass: cargo test -p nflow-daemon lifecycle"
+      ],
+      "priority": 98,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-099",
+      "title": "Integration tests — NDJSON protocol",
+      "description": "As a developer, I want protocol tests so that client-server communication is verified.",
+      "acceptanceCriteria": [
+        "Test: valid request -> valid response with matching UUID",
+        "Test: malformed JSON -> error response",
+        "Test: unknown command -> NOT_FOUND error",
+        "Test: handshake succeeds/fails",
+        "Test: streaming response -> multiple lines until done=true",
+        "Test: client disconnects mid-stream -> daemon handles gracefully",
+        "Tests pass: cargo test -p nflow-daemon protocol"
+      ],
+      "priority": 99,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-100",
+      "title": "Integration tests — project and spec commands",
+      "description": "As a developer, I want command integration tests so that project and spec CRUD work through the socket.",
+      "acceptanceCriteria": [
+        "Test: project.init -> created in DB, directories exist",
+        "Test: project.init duplicate name -> ALREADY_EXISTS",
+        "Test: project.list, project.delete cascade",
+        "Test: spec.new, spec.list, spec.approve, spec.approve on approved -> INVALID_STATE",
+        "Test: spec.delete on decomposed -> error",
+        "Tests pass: cargo test -p nflow-daemon commands_project_spec"
+      ],
+      "priority": 100,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-101",
+      "title": "Integration tests — plan commands",
+      "description": "As a developer, I want plan integration tests so that decomposition and approval work through the socket.",
+      "acceptanceCriteria": [
+        "Test: plan.generate with mock Claude -> wave created, work items in DB",
+        "Test: plan.generate with no approved specs -> error",
+        "Test: plan.generate with existing draft wave -> error",
+        "Test: plan.show, plan.feedback, plan.approve, plan.discard",
+        "Uses mock Claude binary for deterministic output",
+        "Tests pass: cargo test -p nflow-daemon commands_plan"
+      ],
+      "priority": 101,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-102",
+      "title": "Integration tests — execution commands",
+      "description": "As a developer, I want execution integration tests so that run/stop/retry/skip work through the socket.",
+      "acceptanceCriteria": [
+        "Test: exec.run, exec.pause, exec.status",
+        "Test: exec.stop -> agent terminated, story cancelled",
+        "Test: exec.retry -> failed task restarted",
+        "Test: exec.skip -> task done, verify skipped, story continues",
+        "Test: exec.continue, exec.cancel",
+        "Uses mock Claude binary",
+        "Tests pass: cargo test -p nflow-daemon commands_exec"
+      ],
+      "priority": 102,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-103",
+      "title": "E2E test — mock Claude binary",
+      "description": "As a developer, I want a mock Claude binary so that E2E tests run without real API calls.",
+      "acceptanceCriteria": [
+        "Mock binary reads -p prompt and returns canned stream-json responses",
+        "Spec mode: outputs questions, reads answers via --resume, writes spec file",
+        "Decompose mode: returns valid JSON DAG",
+        "Impl task mode: creates a commit with correct [W{n}-{id}] message format",
+        "Verify task mode: outputs 'VERIFICATION PASSED' in result",
+        "Supports --resume flag (tracks session IDs)",
+        "Configurable: can simulate failures (non-zero exit, no commit, wrong message)",
+        "Typecheck passes"
+      ],
+      "priority": 103,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-104",
+      "title": "E2E test — full happy path",
+      "description": "As a developer, I want a full happy-path E2E test so that the entire workflow is verified end-to-end.",
+      "acceptanceCriteria": [
+        "Setup: temporary git repo, temporary NFLOW_HOME, mock Claude in PATH",
+        "nflow init -> project registered",
+        "Spec creation via mock Claude -> spec file written",
+        "nflow spec approve, nflow plan generate, nflow plan approve",
+        "nflow run -> stories execute in worktrees, tasks create commits",
+        "All stories complete -> branches pushed, MRs created (mock gh/glab)",
+        "nflow status -> all items show done",
+        "Test passes on Linux and macOS"
+      ],
+      "priority": 104,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-105",
+      "title": "E2E test — failure and recovery scenarios",
+      "description": "As a developer, I want failure E2E tests so that error recovery paths are verified.",
+      "acceptanceCriteria": [
+        "Test: impl task fails -> task and story marked failed",
+        "Test: nflow retry -> task re-executed, succeeds -> story continues",
+        "Test: nflow skip -> task skipped, verify skipped -> story continues",
+        "Test: verify task fails -> story marked failed immediately",
+        "Test: nflow stop -> agent terminated, story cancelled",
+        "Test: nflow continue on cancelled story -> story resumes",
+        "Test: wall-clock timeout -> agent killed, task failed",
+        "Tests pass on Linux and macOS"
+      ],
+      "priority": 105,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-106",
+      "title": "E2E test — parallel execution",
+      "description": "As a developer, I want parallel execution E2E tests so that concurrent story execution is verified.",
+      "acceptanceCriteria": [
+        "Setup: plan with 3 independent stories (no dependencies)",
+        "nflow run --parallel 3 -> all 3 stories start simultaneously",
+        "Each story creates its own worktree and branch",
+        "All 3 complete independently -> 3 MRs created",
+        "No data corruption in SQLite",
+        "Test passes on Linux and macOS"
+      ],
+      "priority": 106,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-107",
+      "title": "Cross-platform CI",
+      "description": "As a developer, I want CI running on both platforms so that cross-platform support is continuously verified.",
+      "acceptanceCriteria": [
+        "GitHub Actions workflow with matrix: [ubuntu-latest, macos-latest]",
+        "Steps: cargo fmt --check, cargo clippy, cargo test --workspace, E2E tests",
+        "Mock Claude binary built and available in PATH for tests",
+        "All tests pass on both platforms",
+        "CI runs on every push and PR"
+      ],
+      "priority": 107,
+      "passes": false,
+      "notes": ""
+    }
+  ]
+}
