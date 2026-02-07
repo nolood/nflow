@@ -1,4 +1,6 @@
 ## Codebase Patterns
+- recovery.rs uses db::Result (DbError), not error::Result (DaemonError) — DB-centric modules should use the db error type
+- /proc/{pid}/stat field 22 (starttime) is 1-indexed; after skipping comm field (past last ')'), it's at index 19 in the remaining fields
 - nix crate needs features = ["signal", "process", "fs"] for dup2/setsid/signal handling in daemon
 - Tests sharing filesystem state (PID files) must be serialized in a single test to avoid parallel race conditions
 - Avoid TOCTOU in read_pid_file: use fs::read_to_string directly and catch NotFound, instead of checking exists() then reading
@@ -924,4 +926,28 @@ Started: Sat Feb  7 03:49:10 PM MSK 2026
   - PID file modification time is a reasonable proxy for daemon start time / uptime
   - Tests sharing PID file must be serialized — consolidate into single sequential test function
   - DaemonStatus::Display uses hour/minute/second breakdown for human-readable uptime
+---
+
+## 2026-02-07 - US-037
+- What was implemented: Crash recovery — stale agent detection in nflow-daemon
+  - ProcessState enum (Alive, Dead, PidReused) for process verification results
+  - AgentRecoveryAction enum (MarkFailed, Adopt) for recovery decisions
+  - verify_process(pid, expected_start_time) -> ProcessState: signal 0 check + start time comparison
+  - read_process_start_time(): Linux via /proc/{pid}/stat field 22, macOS via sysctl kern.proc.pid, fallback returns None
+  - is_process_alive(): signal 0 probe (ESRCH=dead, EPERM=alive)
+  - detect_stale_agents(): queries running agent_runs, checks each PID
+  - check_agent_run(): determines Adopt vs MarkFailed for a single run
+  - execute_recovery_actions(): marks failed agents/work_items, returns list of adopted (run_id, pid) pairs
+  - recover_stale_agents(): full recovery pipeline (detect + execute)
+  - 17 new tests (615 workspace total) covering dead PIDs, alive PIDs, PID reuse, start time matching, no-PID agents, mixed scenarios
+- Files changed:
+  - crates/nflow-daemon/src/recovery.rs (new — full crash recovery module)
+  - crates/nflow-daemon/src/main.rs (added recovery module)
+- **Learnings for future iterations:**
+  - recovery.rs uses db::Result (DbError), not error::Result (DaemonError) — DB functions return DbError
+  - /proc/{pid}/stat comm field (field 2) can contain spaces/parens — parse from last ')' to skip it safely
+  - Field 22 (starttime) is at index 19 after splitting remaining fields post-comm (field 3 = index 0)
+  - PID 4_000_000_000 is a safe "nonexistent PID" for tests (beyond Linux's max PID)
+  - #[cfg(target_os = "linux")] gates platform-specific tests — they run only on the right OS
+  - Conservative approach: if we can't read start time but process is alive, assume it's the right process
 ---

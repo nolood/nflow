@@ -1,6 +1,7 @@
 mod daemon;
 mod db;
 pub mod error;
+mod recovery;
 
 use std::env;
 
