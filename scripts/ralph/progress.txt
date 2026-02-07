@@ -460,6 +460,9 @@ Started: Sat Feb  7 03:49:10 PM MSK 2026
 - Use `echo` as a test stand-in for claude binary — validates arg passing via piped stdout
 - Context builders return HashMap<String, String> — caller converts to &str refs for render_template
 - build_verify_context uses impl_task's title/description/AC, not verify_task's auto-generated ones
+- nix crate v0.29 with features=["signal","process"] for cross-platform signal handling (SIGTERM/SIGKILL)
+- Don't use ClaudeRunner to spawn non-claude processes in tests — spawn directly with tokio::process::Command
+- tokio "time" feature needed for tokio::time::timeout
 - tokio::process::Command + Stdio::piped for stdout/stderr + Stdio::null for stdin
 - Lines<BufReader<ChildStdout>> for line-by-line async streaming from spawned process
 ---
@@ -622,4 +625,26 @@ Started: Sat Feb  7 03:49:10 PM MSK 2026
   - format_tasks_list and format_completed_tasks filter for TaskKind::Impl only — verify tasks are excluded from display
   - build_decompose_prompt takes &[(Spec, String)] — caller is responsible for reading spec files from disk
   - cargo fmt collapses single-arg Spec::new to single line but expands 3-arg to multi-line
+---
+
+## 2026-02-07 - US-024
+- What was implemented: Claude process termination in nflow-claude
+  - ClaudeProcess::terminate() sends SIGTERM, waits 10 seconds, then SIGKILL if still alive
+  - ClaudeProcess::terminate_with_timeout(duration) for custom grace period before SIGKILL escalation
+  - ClaudeProcess::kill() sends SIGKILL immediately
+  - ClaudeProcess::wait_with_timeout(duration) -> Result<Option<ExitStatus>> returns None on timeout
+  - Both terminate() and kill() return (ExitStatus, String) — exit status + captured stderr output
+  - Cross-platform signal handling via nix crate (Linux + macOS)
+  - Added SignalFailed and TerminationTimeout variants to ClaudeError
+  - 7 new tests (147 nflow-claude, 486 total) covering SIGTERM, SIGKILL, timeout, stderr capture, SIGTERM-trap escalation
+- Files changed:
+  - crates/nflow-claude/Cargo.toml (added nix crate, tokio "time" feature)
+  - crates/nflow-claude/src/error.rs (added SignalFailed, TerminationTimeout variants)
+  - crates/nflow-claude/src/runner.rs (added terminate/kill/wait_with_timeout methods + tests)
+- **Learnings for future iterations:**
+  - nix crate v0.29 needs features = ["signal", "process"] for signal::kill and Pid
+  - Don't use ClaudeRunner to spawn non-claude processes in tests (it adds -p and other flags) — spawn directly with tokio::process::Command
+  - tokio "time" feature is needed for tokio::time::timeout used in wait_with_timeout
+  - SIGTERM escalation to SIGKILL test: use `bash -c "trap '' TERM; sleep 60"` to ignore SIGTERM
+  - cargo fmt collapses short .map_err closures with single-field structs to one line
 ---
