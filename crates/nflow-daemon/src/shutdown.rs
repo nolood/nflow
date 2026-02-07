@@ -6,7 +6,7 @@ use nix::unistd::Pid;
 use tracing::info;
 
 use crate::db::agent_runs::{find_running_agent_runs, AgentRun};
-use crate::recovery::is_process_alive;
+use crate::platform::is_process_alive;
 
 /// Default grace period for agents to finish naturally after shutdown signal.
 const AGENT_GRACE_PERIOD: Duration = Duration::from_secs(60);

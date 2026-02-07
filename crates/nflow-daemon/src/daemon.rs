@@ -356,16 +356,7 @@ fn spawn_daemon_with_mode(daemon_binary: &Path, mode: &str) -> Result<u32> {
 pub fn is_daemon_running() -> Result<bool> {
     match read_pid_file()? {
         None => Ok(false),
-        Some(pid) => {
-            // Check if process is alive by sending signal 0
-            let pid = nix::unistd::Pid::from_raw(pid as i32);
-            match nix::sys::signal::kill(pid, None) {
-                Ok(()) => Ok(true),
-                Err(nix::errno::Errno::ESRCH) => Ok(false), // No such process
-                Err(nix::errno::Errno::EPERM) => Ok(true),  // Process exists but we can't signal it
-                Err(_) => Ok(false),
-            }
-        }
+        Some(pid) => Ok(crate::platform::is_process_alive(pid)),
     }
 }
 

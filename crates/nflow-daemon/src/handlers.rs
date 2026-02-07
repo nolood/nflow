@@ -3357,7 +3357,7 @@ fn handle_exec_retry(req: Request, state: &HandlerState) -> Response {
     };
 
     let pid = process.pid;
-    let pid_start_time = crate::recovery::read_process_start_time(pid);
+    let pid_start_time = crate::platform::get_pid_start_time(pid);
 
     let log_path = agent_logs_dir.join(format!("{}.log", task.short_id));
     let log_path_str = log_path.to_string_lossy().to_string();
@@ -3701,7 +3701,7 @@ fn handle_exec_skip(req: Request, state: &HandlerState) -> Response {
         };
 
         let pid = process.pid;
-        let pid_start_time = crate::recovery::read_process_start_time(pid);
+        let pid_start_time = crate::platform::get_pid_start_time(pid);
 
         let log_path = agent_logs_dir.join(format!("{}.log", next_task.short_id));
         let log_path_str = log_path.to_string_lossy().to_string();
@@ -4669,7 +4669,7 @@ fn spawn_agent_for_task(
     };
 
     let pid = process.pid;
-    let pid_start_time = crate::recovery::read_process_start_time(pid);
+    let pid_start_time = crate::platform::get_pid_start_time(pid);
 
     let log_path = agent_logs_dir.join(format!("{}.log", task.short_id));
     let log_path_str = log_path.to_string_lossy().to_string();

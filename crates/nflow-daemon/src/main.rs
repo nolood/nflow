@@ -3,6 +3,7 @@ mod db;
 pub mod error;
 pub mod events;
 pub mod handlers;
+pub mod platform;
 mod recovery;
 mod scheduler_loop;
 mod shutdown;

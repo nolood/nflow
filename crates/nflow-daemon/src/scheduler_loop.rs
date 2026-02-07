@@ -17,7 +17,7 @@ use nflow_core::work_item::{ItemType, TaskKind, WorkItem, WorkItemStatus};
 use crate::db;
 use crate::db::agent_runs::{AgentRun, AgentRunStatus};
 use crate::events::{Event, SharedEventBus};
-use crate::recovery::{read_process_start_time, verify_process, ProcessState};
+use crate::platform::{get_pid_start_time, verify_process, ProcessState};
 
 /// An action to progress a story after a task completes.
 ///
@@ -1183,7 +1183,7 @@ pub async fn start_task_execution(
     };
 
     let pid = process.pid;
-    let pid_start_time = read_process_start_time(pid);
+    let pid_start_time = get_pid_start_time(pid);
 
     // 5. Create agent_run record
     let log_path = agent_logs_dir.join(format!("{}.log", short_id));
@@ -1645,7 +1645,7 @@ fn terminate_agent_process(pid: u32) {
     // Wait up to 10 seconds for the process to exit
     for _ in 0..100 {
         std::thread::sleep(std::time::Duration::from_millis(100));
-        if !crate::recovery::is_process_alive(pid) {
+        if !crate::platform::is_process_alive(pid) {
             info!("timeout: agent pid={} exited after SIGTERM", pid);
             return;
         }
