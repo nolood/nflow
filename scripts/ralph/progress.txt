@@ -123,6 +123,13 @@
 - DecompositionSession::discard() allows both InProgress→Discarded and Approved→Discarded (plan.discard targets any non-discarded wave)
 - plan.discard must check has_in_progress_stories_by_session before proceeding — in_progress stories must be stopped first
 - plan.approve accepts auto_execute param: when true, sets project.execution_enabled = true via update_project
+- scheduler_tick() now takes (conn, Option<&SharedEventBus>) — event_bus is optional for tests (pass None)
+- reap_finished_agents() checks all Running agent_runs, uses verify_process() to detect dead PIDs
+- parse_log_file() reads agent log files line-by-line, extracts session_id (from Result event) and result_text + commit info (from ToolResult with git output)
+- evaluate_impl_result delegates to nflow_claude::evaluate, using "" as head_before and commit_hash as head_after (presence of commit = new code)
+- extract_commit_info() parses git branch/commit output format: "[branch hash] message" → (hash, message)
+- broadcast_status_change() sends Event::StatusChange via event_bus when work_item status transitions happen during reaping
+- update_agent_run_session_id() is a lightweight DB helper for storing session_id parsed from stream output
 
 # Ralph Progress Log
 Started: Sat Feb  7 03:49:10 PM MSK 2026
@@ -1390,4 +1397,31 @@ Started: Sat Feb  7 03:49:10 PM MSK 2026
   - max_parallel is hardcoded to 3 — will be read from config in a future US
   - Action execution (applying MarkStoryReady, StartStory, UpdateEpicStatus to DB and spawning agents) deferred to US-053+
   - The main tokio runtime is needed for the scheduler interval; socket server already uses tokio::spawn internally
+---
+
+## US-053: Scheduler — reap finished processes (priority 53)
+- **Status:** PASS
+- **Commit:** feat: [US-053] - Scheduler — reap finished processes
+- What was done:
+  - Implemented reap_finished_agents() in scheduler_loop.rs — Phase 0 of scheduler_tick
+  - On each tick: queries all Running agent_runs, checks PIDs via verify_process() (Dead/PidReused → reap, Alive → skip)
+  - Reads agent log files to extract session_id, result_text, commit_hash, commit_message from stream-json output
+  - Evaluates task results: evaluate_impl_result() for impl tasks, evaluate_verify_result() for verify tasks
+  - Updates work_item status: Done on success, Failed with error message on failure
+  - Stores commit_hash on successful impl tasks via update_work_item_commit()
+  - Stores session_id via new update_agent_run_session_id() DB helper
+  - Broadcasts StatusChange events to subscribed clients via EventBus
+  - Updated scheduler_tick() signature to accept Option<&SharedEventBus>
+  - Updated main.rs call site accordingly
+  - 18 new tests covering: evaluate_impl/verify with various exit codes, extract_commit_info parsing, is_hex_hash, reap scenarios (no agents, alive agent, dead agent, no-pid agent), broadcast integration, parse_log_file variants
+- Files changed:
+  - crates/nflow-daemon/src/scheduler_loop.rs (+855 lines — reaping logic, evaluation, parsing, broadcasting, tests)
+  - crates/nflow-daemon/src/db/agent_runs.rs (+9 lines — update_agent_run_session_id helper)
+  - crates/nflow-daemon/src/main.rs (+3/-5 lines — updated scheduler_tick call)
+- **Learnings for future iterations:**
+  - verify_process() returns ProcessState::Dead/PidReused/Alive — use both Dead and PidReused as "finished" signals
+  - Can't get exit code from already-dead processes not spawned by us — use exit_code from agent_run DB record if present
+  - For evaluate_impl_result head_before/head_after: use "" vs commit_hash to signal whether a commit was produced
+  - parse_log_file reads line-by-line (not full JSON parse) — efficient for large log files
+  - Tests use tempdir for log file tests to avoid filesystem pollution
 ---
