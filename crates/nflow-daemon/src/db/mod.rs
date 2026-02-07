@@ -17,6 +17,7 @@ pub type Result<T> = std::result::Result<T, DbError>;
 
 /// Embedded migration files, ordered by version number.
 pub mod projects;
+pub mod specs;
 
 const MIGRATIONS: &[(u32, &str)] = &[(1, include_str!("../../migrations/001_init.sql"))];
 

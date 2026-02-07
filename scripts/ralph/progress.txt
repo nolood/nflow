@@ -48,6 +48,9 @@
 - WAL mode set via `PRAGMA journal_mode = WAL` on connection open
 - In-memory SQLite uses "memory" journal mode even when WAL is requested — tests should accept both
 - DB module is a directory (`db/mod.rs` + submodules): convert single-file `db.rs` → `db/mod.rs` when adding CRUD submodules
+- SpecStatus↔string conversion in db layer: "draft"/"approved"/"decomposed"/"deleted" strings, default to Draft for unknown
+- find_unassigned_approved_specs uses NOT IN (SELECT spec_id FROM decomposition_specs) — no session filter needed
+- reset_active_sessions returns u64 count of affected rows via conn.execute() return value cast
 - When db.rs becomes db/mod.rs, update `include_str!` paths (add one more `../` level)
 - Use `test_conn()` in `db/mod.rs` as shared test helper: creates in-memory conn + runs migrations
 - GitProvider↔string conversion in db layer: "github"/"gitlab" strings, default to Github for unknown
@@ -315,4 +318,28 @@ Started: Sat Feb  7 03:49:10 PM MSK 2026
   - Timestamps use RFC 3339 format for storage/retrieval (to_rfc3339 / parse::<DateTime<Utc>>)
   - params! macro handles type conversion automatically (bool → INTEGER, etc.)
   - cargo fmt collapses single-line parse chains and expands short delete_project calls — follow its lead
+---
+
+## 2026-02-07 - US-013
+- What was implemented: Database CRUD for specs in nflow-daemon
+  - Created db/specs.rs module following same pattern as db/projects.rs
+  - insert_spec(conn, spec) — inserts Spec struct into SQLite with parameterized queries
+  - get_spec_by_name(conn, project_id, name) — scoped lookup by project and name
+  - list_specs_by_project(conn, project_id) — returns all specs for a project ordered by name
+  - list_specs_by_status(conn, project_id, status) — filters by project and status
+  - update_spec_status(conn, id, status) — updates status and updated_at timestamp
+  - update_spec_session(conn, id, session_active, claude_session_id) — manages session state
+  - find_latest_draft_spec(conn, project_id) — returns most recently updated draft spec
+  - find_unassigned_approved_specs(conn, project_id) — approved specs not in any decomposition session
+  - reset_active_sessions(conn, project_id) — resets all active sessions for crash recovery, returns count
+  - Helper functions: spec_status_to_str/from_str, parse_datetime, row_to_spec
+  - 18 new tests (287 total) covering all CRUD operations, session management, unassigned spec detection, crash recovery, SQL injection resistance
+- Files changed:
+  - crates/nflow-daemon/src/db/mod.rs (added specs module)
+  - crates/nflow-daemon/src/db/specs.rs (new — full spec CRUD with tests)
+- **Learnings for future iterations:**
+  - SpecStatus has a Display impl in nflow-core that matches the DB string format — but using a separate to_str/from_str in DB layer is cleaner and doesn't couple layers
+  - find_unassigned_approved_specs uses NOT IN subquery on decomposition_specs — no need to filter by session status
+  - reset_active_sessions returns conn.execute() as u64 — rusqlite returns usize for rows affected
+  - cargo fmt collapses short function signatures to single lines — don't add manual line breaks for 3-param functions
 ---
