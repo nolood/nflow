@@ -720,3 +720,21 @@ Started: Sat Feb  7 03:49:10 PM MSK 2026
   - slugify needs to handle: empty strings, all-special-char strings, Unicode (non-ASCII → hyphen), truncation at 50 chars
   - cargo fmt expands format_branch_name signature to multi-line due to 4 params
 ---
+
+## 2026-02-07 - US-028
+- What was implemented: Rebase and push operations in nflow-git
+  - fetch_and_rebase(worktree_path, base_branch) runs `git fetch origin {base_branch}` then `git rebase origin/{base_branch}`
+  - On rebase conflict: aborts rebase (`git rebase --abort`) and returns GitError::RebaseConflict { details }
+  - push_branch(worktree_path, branch_name) runs `git push -u origin {branch_name}`
+  - Push failure classification: AuthError (authentication/permission), NetworkError (connectivity), BranchProtection (pre-receive hooks, protected branches), CommandFailed (other)
+  - Added RebaseConflict, AuthError, NetworkError, BranchProtection variants to GitError enum
+  - 8 new tests (54 nflow-git total) covering rebase success, upstream changes, conflicts, push success, upstream tracking, error cases
+- Files changed:
+  - crates/nflow-git/src/error.rs (added RebaseConflict, AuthError, NetworkError, BranchProtection variants)
+  - crates/nflow-git/src/branch.rs (added fetch_and_rebase, push_branch functions + tests)
+- **Learnings for future iterations:**
+  - Push error classification uses lowercase string matching on stderr: "authentication", "permission denied", "could not resolve host", "protected branch", "pre-receive hook declined"
+  - fetch_and_rebase catches CommandFailed from rebase, aborts rebase, then wraps as RebaseConflict — always leaves worktree clean
+  - `git push -u` sets upstream tracking — verify with `git rev-parse --abbrev-ref --symbolic-full-name @{u}`
+  - cargo fmt collapses `run_git_command(worktree_path, &["push", "-u", "origin", branch_name])` to single line
+---
