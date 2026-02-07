@@ -13,7 +13,7 @@ pub struct WorktreeInfo {
 }
 
 /// Validates that the given path is a git repository via `git rev-parse`.
-async fn validate_git_repo(repo_path: &Path) -> Result<()> {
+pub(crate) async fn validate_git_repo(repo_path: &Path) -> Result<()> {
     let output = tokio::process::Command::new("git")
         .args(["rev-parse", "--is-inside-work-tree"])
         .current_dir(repo_path)
@@ -31,7 +31,7 @@ async fn validate_git_repo(repo_path: &Path) -> Result<()> {
 
 /// Runs a git command in the given directory, returning stdout on success
 /// or a GitError::CommandFailed on failure.
-async fn run_git_command(repo_path: &Path, args: &[&str]) -> Result<String> {
+pub(crate) async fn run_git_command(repo_path: &Path, args: &[&str]) -> Result<String> {
     let output = tokio::process::Command::new("git")
         .args(args)
         .current_dir(repo_path)
