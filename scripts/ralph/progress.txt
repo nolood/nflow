@@ -116,6 +116,8 @@
 - Wave-prefix story short IDs: format!("W{}-{}", wave_number, story_short_id) for uniqueness across waves
 - Task sort_order uses step of 2 (0, 2, 4...) to leave room for verify tasks at sort_order + 1
 - Decomposition session pre-check: validate no in_progress session exists before creating new one, then pass |_| false to constructor
+- Use update_session_claude_id() for updating claude_session_id (not re-insert which fails on uniqueness)
+- Feedback handlers: find existing draft session, delete work items, revert spec status to approved, resume Claude with --resume, re-parse and persist
 
 # Ralph Progress Log
 Started: Sat Feb  7 03:49:10 PM MSK 2026
@@ -1314,4 +1316,30 @@ Started: Sat Feb  7 03:49:10 PM MSK 2026
   - DAG adjacency built by iterating stories and finding blocked_id matches in dependencies list
   - Progress counts computed in-memory from task status filtering rather than count_tasks_by_status DB call
   - list_sessions_by_project returns sessions ordered by wave_number — last() gives latest
+---
+
+## 2026-02-07 - US-050
+- What was implemented: Command handler — plan feedback in nflow-daemon
+  - handle_plan_feedback(): streaming handler for plan.feedback command
+  - Receives { project_name, message, wave_number? } params
+  - Finds existing draft session (by wave_number or latest draft via find_draft_session)
+  - Validates session is in_progress state and has a Claude session ID for --resume
+  - Deletes existing work items for the session (full regeneration)
+  - Reverts linked specs from decomposed back to approved status
+  - Spawns Claude with --resume {claude_session_id} and feedback message as prompt
+  - Reuses stream_claude_decompose() for streaming, JSON parsing, work item creation
+  - Auto-generates verify tasks for new plan via existing build_and_persist_work_items
+  - Added dispatch route "plan.feedback" in dispatch()
+  - Added 3 new DB functions: get_session_by_wave(), list_spec_ids_by_session(), update_session_claude_id()
+  - Fixed stream_claude_decompose() to use update_session_claude_id() instead of broken re-insert
+  - 4 new DB tests (312 total)
+- Files changed:
+  - crates/nflow-daemon/src/handlers.rs (handle_plan_feedback function + dispatch route + fixed stream_claude_decompose session update)
+  - crates/nflow-daemon/src/db/decomposition_sessions.rs (3 new functions + 4 new tests)
+- **Learnings for future iterations:**
+  - Feedback is structurally similar to generate but reuses existing session (no new session creation)
+  - Must revert spec status to approved before calling build_and_persist_work_items (which re-marks them as decomposed)
+  - stream_claude_decompose is reusable for both generate and feedback — just needs different RunConfig
+  - insert_decomposition_session was being used for updates (silently failing) — use dedicated update functions
+  - get_session_by_wave enables targeting specific waves; find_draft_session finds latest draft
 ---

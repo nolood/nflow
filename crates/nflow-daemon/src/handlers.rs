@@ -49,6 +49,7 @@ fn dispatch(req: Request, state: &HandlerState) -> HandlerResult {
         "spec.resume" => handle_spec_resume(req, state),
         "plan.generate" => handle_plan_generate(req, state),
         "plan.show" => HandlerResult::Single(handle_plan_show(req, state)),
+        "plan.feedback" => handle_plan_feedback(req, state),
         _ => HandlerResult::Single(Response::error(
             req.id,
             &format!("unknown command: {}", req.command),
@@ -1654,21 +1655,7 @@ async fn stream_claude_decompose(
     // Store claude_session_id
     let claude_session_id = parser.session_id().map(|s| s.to_string());
     if let (Ok(conn), Some(ref csid)) = (db::open_connection(db_path), &claude_session_id) {
-        let mut session_update =
-            match db::decomposition_sessions::get_decomposition_session(&conn, &session_id) {
-                Ok(Some(s)) => s,
-                _ => {
-                    let _ = tx
-                        .send(StreamingResponseLine::error(
-                            req_id,
-                            "failed to retrieve session for update",
-                        ))
-                        .await;
-                    return;
-                }
-            };
-        session_update.set_claude_session_id(csid.clone());
-        let _ = db::decomposition_sessions::insert_decomposition_session(&conn, &session_update);
+        let _ = db::decomposition_sessions::update_session_claude_id(&conn, &session_id, csid);
     }
 
     // Parse Claude's JSON output into work items
@@ -2280,6 +2267,184 @@ fn handle_plan_show(req: Request, state: &HandlerState) -> Response {
             "epics": epics_data,
         }),
     )
+}
+
+/// Handle "plan.feedback" command.
+///
+/// Sends feedback to an existing draft wave's decomposition session via Claude --resume.
+/// Deletes existing work items and replaces them with the new Claude output.
+///
+/// Params:
+///   - project_name (required): project name
+///   - message (required): feedback message to send to Claude
+///   - wave_number (optional): specific wave to target (defaults to latest draft)
+fn handle_plan_feedback(req: Request, state: &HandlerState) -> HandlerResult {
+    let id = req.id.clone();
+
+    // Parse required params
+    let project_name = match req.params.get("project_name").and_then(|v| v.as_str()) {
+        Some(n) => n.to_string(),
+        None => {
+            return HandlerResult::Single(Response::error(
+                id,
+                "missing required parameter: project_name",
+            ));
+        }
+    };
+
+    let message = match req.params.get("message").and_then(|v| v.as_str()) {
+        Some(m) => m.to_string(),
+        None => {
+            return HandlerResult::Single(Response::error(
+                id,
+                "missing required parameter: message",
+            ));
+        }
+    };
+
+    let wave_number: Option<u32> = req
+        .params
+        .get("wave_number")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as u32);
+
+    // Open DB connection
+    let conn = match db::open_connection(&state.db_path) {
+        Ok(c) => c,
+        Err(e) => {
+            return HandlerResult::Single(Response::error(id, &format!("database error: {}", e)));
+        }
+    };
+
+    // Find project
+    let project = match db::projects::get_project_by_name(&conn, &project_name) {
+        Ok(Some(p)) => p,
+        Ok(None) => {
+            return HandlerResult::Single(Response::error(
+                id,
+                &format!("NOT_FOUND: project '{}' not found", project_name),
+            ));
+        }
+        Err(e) => {
+            return HandlerResult::Single(Response::error(id, &format!("database error: {}", e)));
+        }
+    };
+
+    // Find draft session (by wave_number or latest draft)
+    let session = if let Some(wave) = wave_number {
+        match db::decomposition_sessions::get_session_by_wave(&conn, &project.id, wave) {
+            Ok(Some(s)) => s,
+            Ok(None) => {
+                return HandlerResult::Single(Response::error(
+                    id,
+                    &format!("NOT_FOUND: wave W{} not found", wave),
+                ));
+            }
+            Err(e) => {
+                return HandlerResult::Single(Response::error(
+                    id,
+                    &format!("database error: {}", e),
+                ));
+            }
+        }
+    } else {
+        match db::decomposition_sessions::find_draft_session(&conn, &project.id) {
+            Ok(Some(s)) => s,
+            Ok(None) => {
+                return HandlerResult::Single(Response::error(
+                    id,
+                    "NOT_FOUND: no draft wave found for this project",
+                ));
+            }
+            Err(e) => {
+                return HandlerResult::Single(Response::error(
+                    id,
+                    &format!("database error: {}", e),
+                ));
+            }
+        }
+    };
+
+    // Validate session is in draft (in_progress) state
+    if session.status != nflow_core::decomposition::DecompositionStatus::InProgress {
+        return HandlerResult::Single(Response::error(
+            id,
+            &format!(
+                "INVALID_STATE: wave W{} is {} (must be in_progress for feedback)",
+                session.wave_number, session.status
+            ),
+        ));
+    }
+
+    // Get the Claude session ID for --resume
+    let claude_session_id = match &session.claude_session_id {
+        Some(csid) => csid.clone(),
+        None => {
+            return HandlerResult::Single(Response::error(
+                id,
+                &format!(
+                    "INVALID_STATE: wave W{} has no Claude session ID (cannot resume)",
+                    session.wave_number
+                ),
+            ));
+        }
+    };
+
+    // Get spec IDs linked to this session
+    let spec_ids = match db::decomposition_sessions::list_spec_ids_by_session(&conn, &session.id) {
+        Ok(ids) => ids,
+        Err(e) => {
+            return HandlerResult::Single(Response::error(id, &format!("database error: {}", e)));
+        }
+    };
+
+    // Delete existing work items for this session (feedback = full regeneration)
+    if let Err(e) = db::work_items::delete_work_items_by_session(&conn, &session.id) {
+        return HandlerResult::Single(Response::error(id, &format!("database error: {}", e)));
+    }
+
+    // Revert specs from decomposed back to approved so build_and_persist can re-mark them
+    for spec_id in &spec_ids {
+        if let Err(e) = db::specs::update_spec_status(&conn, spec_id, SpecStatus::Approved) {
+            return HandlerResult::Single(Response::error(id, &format!("database error: {}", e)));
+        }
+    }
+
+    // Determine working directory
+    let working_dir = PathBuf::from(&project.path);
+
+    // Build RunConfig for decomposition with --resume
+    let mut run_config = nflow_claude::runner::RunConfig::for_decompose(message, true, working_dir);
+    run_config.resume_session = Some(claude_session_id);
+
+    // Create streaming channel and spawn Claude streaming
+    let (tx, rx) = tokio::sync::mpsc::channel(64);
+    let session_id = session.id;
+    let w = session.wave_number;
+    let db_path = state.db_path.clone();
+
+    let initial_id = id.clone();
+    tokio::spawn(async move {
+        // Send initial response with session info
+        let _ = tx
+            .send(StreamingResponseLine::data(
+                initial_id.clone(),
+                serde_json::json!({
+                    "session_id": session_id.to_string(),
+                    "wave_number": w,
+                    "spec_count": spec_ids.len(),
+                    "feedback": true,
+                }),
+            ))
+            .await;
+
+        stream_claude_decompose(
+            tx, initial_id, run_config, session_id, w, spec_ids, &db_path,
+        )
+        .await;
+    });
+
+    HandlerResult::Streaming(rx)
 }
 
 #[cfg(test)]

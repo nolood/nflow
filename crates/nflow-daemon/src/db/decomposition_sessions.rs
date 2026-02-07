@@ -141,6 +141,47 @@ pub fn update_session_status(
     Ok(())
 }
 
+pub fn get_session_by_wave(
+    conn: &Connection,
+    project_id: &Uuid,
+    wave_number: u32,
+) -> Result<Option<DecompositionSession>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, project_id, wave_number, status, claude_session_id, created_at, updated_at
+         FROM decomposition_sessions WHERE project_id = ?1 AND wave_number = ?2",
+    )?;
+    let mut rows = stmt.query_map(params![project_id.to_string(), wave_number], row_to_session)?;
+    match rows.next() {
+        Some(row) => Ok(Some(row?)),
+        None => Ok(None),
+    }
+}
+
+pub fn list_spec_ids_by_session(conn: &Connection, session_id: &Uuid) -> Result<Vec<Uuid>> {
+    let mut stmt = conn.prepare("SELECT spec_id FROM decomposition_specs WHERE session_id = ?1")?;
+    let rows = stmt.query_map(params![session_id.to_string()], |row| {
+        let id_str: String = row.get(0)?;
+        Ok(id_str.parse::<Uuid>().unwrap())
+    })?;
+    let mut ids = Vec::new();
+    for row in rows {
+        ids.push(row?);
+    }
+    Ok(ids)
+}
+
+pub fn update_session_claude_id(
+    conn: &Connection,
+    id: &Uuid,
+    claude_session_id: &str,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE decomposition_sessions SET claude_session_id = ?1, updated_at = ?2 WHERE id = ?3",
+        params![claude_session_id, Utc::now().to_rfc3339(), id.to_string()],
+    )?;
+    Ok(())
+}
+
 pub fn next_wave_number(conn: &Connection, project_id: &Uuid) -> Result<u32> {
     let max: Option<u32> = conn.query_row(
         "SELECT MAX(wave_number) FROM decomposition_sessions WHERE project_id = ?1",
@@ -315,6 +356,28 @@ mod tests {
         assert_eq!(sessions2.len(), 1);
     }
 
+    // --- get_session_by_wave ---
+
+    #[test]
+    fn test_get_session_by_wave() {
+        let conn = test_conn();
+        let pid = make_project(&conn);
+        let session = make_session(pid, 3);
+        insert_decomposition_session(&conn, &session).unwrap();
+
+        let found = get_session_by_wave(&conn, &pid, 3).unwrap().unwrap();
+        assert_eq!(found.id, session.id);
+        assert_eq!(found.wave_number, 3);
+    }
+
+    #[test]
+    fn test_get_session_by_wave_not_found() {
+        let conn = test_conn();
+        let pid = make_project(&conn);
+        let found = get_session_by_wave(&conn, &pid, 99).unwrap();
+        assert!(found.is_none());
+    }
+
     // --- update_session_status ---
 
     #[test]
@@ -345,6 +408,26 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(retrieved.status, DecompositionStatus::Discarded);
+    }
+
+    // --- update_session_claude_id ---
+
+    #[test]
+    fn test_update_session_claude_id() {
+        let conn = test_conn();
+        let pid = make_project(&conn);
+        let session = make_session(pid, 1);
+        insert_decomposition_session(&conn, &session).unwrap();
+
+        update_session_claude_id(&conn, &session.id, "claude-session-abc").unwrap();
+
+        let retrieved = get_decomposition_session(&conn, &session.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            retrieved.claude_session_id.as_deref(),
+            Some("claude-session-abc")
+        );
     }
 
     // --- next_wave_number ---
@@ -382,6 +465,42 @@ mod tests {
 
         assert_eq!(next_wave_number(&conn, &pid1).unwrap(), 6);
         assert_eq!(next_wave_number(&conn, &pid2).unwrap(), 2);
+    }
+
+    // --- list_spec_ids_by_session ---
+
+    #[test]
+    fn test_list_spec_ids_by_session() {
+        let conn = test_conn();
+        let pid = make_project(&conn);
+
+        let session = make_session(pid, 1);
+        insert_decomposition_session(&conn, &session).unwrap();
+
+        let spec1 = Spec::new(pid, "spec-a".into(), "/specs/a.md".into());
+        let spec2 = Spec::new(pid, "spec-b".into(), "/specs/b.md".into());
+        insert_spec(&conn, &spec1).unwrap();
+        insert_spec(&conn, &spec2).unwrap();
+
+        insert_decomposition_spec(&conn, &DecompositionSpec::new(session.id, spec1.id)).unwrap();
+        insert_decomposition_spec(&conn, &DecompositionSpec::new(session.id, spec2.id)).unwrap();
+
+        let ids = list_spec_ids_by_session(&conn, &session.id).unwrap();
+        assert_eq!(ids.len(), 2);
+        assert!(ids.contains(&spec1.id));
+        assert!(ids.contains(&spec2.id));
+    }
+
+    #[test]
+    fn test_list_spec_ids_by_session_empty() {
+        let conn = test_conn();
+        let pid = make_project(&conn);
+
+        let session = make_session(pid, 1);
+        insert_decomposition_session(&conn, &session).unwrap();
+
+        let ids = list_spec_ids_by_session(&conn, &session.id).unwrap();
+        assert!(ids.is_empty());
     }
 
     // --- insert_decomposition_spec ---
