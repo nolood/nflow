@@ -39,6 +39,14 @@
 - Config uses PartialConfig (all-optional) for layered merging: defaults → global toml → per-project toml → env vars
 - partial_config_from_env() takes &[(&str, &str)] to keep nflow-core IO-free — caller reads actual env vars
 - render_branch_template() supports {project}, {story_id}, {story_slug} variable substitution
+- DB schema lives in nflow-daemon (not nflow-core) since it does IO via rusqlite
+- Migration files go in `crates/nflow-daemon/migrations/` and are embedded via `include_str!`
+- MIGRATIONS const is &[(u32, &str)] — version number paired with SQL string
+- Use `unchecked_transaction()` for rusqlite transactions (doesn't require &mut Connection)
+- SQLite stores UUIDs as TEXT, booleans as INTEGER (0/1), timestamps as TEXT (ISO 8601)
+- Foreign keys need `PRAGMA foreign_keys = ON` on every connection open
+- WAL mode set via `PRAGMA journal_mode = WAL` on connection open
+- In-memory SQLite uses "memory" journal mode even when WAL is requested — tests should accept both
 
 # Ralph Progress Log
 Started: Sat Feb  7 03:49:10 PM MSK 2026
@@ -250,4 +258,29 @@ Started: Sat Feb  7 03:49:10 PM MSK 2026
   - partial_config_from_env takes &[(&str, &str)] slice to keep nflow-core IO-free — caller reads actual env vars
   - cargo fmt breaks long unwrap_or chains to multi-line for max_turns_per_task (field name too long)
   - resolve() is the main entry point for full config resolution — compose all layers in one call
+---
+
+## 2026-02-07 - US-011
+- What was implemented: Database schema and migration runner in nflow-daemon
+  - 001_init.sql migration creating all 8 tables: projects, specs, work_items, dependencies, agent_runs, decomposition_sessions, decomposition_specs, schema_version
+  - Unified work_items table with item_type discriminator and kind for tasks
+  - All primary keys are TEXT (UUID strings)
+  - Foreign keys with ON DELETE CASCADE for project→specs, project→decomposition_sessions, session→work_items, work_items→dependencies chains
+  - Indexes on: specs(project_id), work_items(parent_id), work_items(decomposition_session_id), dependencies(blocker_id), dependencies(blocked_id)
+  - Migration runner (~50 LOC): reads embedded numbered SQL files, applies unapplied ones in transaction, tracks in schema_version
+  - Migration files embedded at compile time via include_str!
+  - Backup nflow.db to nflow.db.bak-v{version} before applying new migrations
+  - WAL mode and foreign keys enabled on connection open
+  - 12 new tests (256 total) covering all acceptance criteria
+- Files changed:
+  - crates/nflow-daemon/migrations/001_init.sql (initial schema)
+  - crates/nflow-daemon/src/db.rs (migration runner with open_connection, run_migrations, tests)
+  - crates/nflow-daemon/src/main.rs (added db module)
+- **Learnings for future iterations:**
+  - DB code goes in nflow-daemon, not nflow-core (daemon is the sole writer to SQLite)
+  - rusqlite's `unchecked_transaction()` doesn't require &mut Connection — useful when conn is shared
+  - In-memory SQLite returns "memory" for journal_mode pragma even when WAL is set — handle in tests
+  - SQLite stores booleans as INTEGER (0/1), UUIDs as TEXT, timestamps as TEXT
+  - Foreign keys require PRAGMA foreign_keys = ON on each connection open
+  - cargo fmt collapses short format! calls to single lines — don't fight it
 ---
