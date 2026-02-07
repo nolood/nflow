@@ -54,6 +54,7 @@ fn dispatch(req: Request, state: &HandlerState) -> HandlerResult {
         "plan.discard" => HandlerResult::Single(handle_plan_discard(req, state)),
         "exec.run" => HandlerResult::Single(handle_exec_run(req, state)),
         "exec.pause" => HandlerResult::Single(handle_exec_pause(req, state)),
+        "exec.status" => HandlerResult::Single(handle_exec_status(req, state)),
         _ => HandlerResult::Single(Response::error(
             req.id,
             &format!("unknown command: {}", req.command),
@@ -2810,6 +2811,207 @@ fn handle_exec_pause(req: Request, state: &HandlerState) -> Response {
             "execution_enabled": false,
             "running_count": running_count,
             "pending_count": pending_count,
+        }),
+    )
+}
+
+/// Handle "exec.status" command.
+///
+/// Returns hierarchical status of all work items for a project.
+/// Waves -> epics -> stories -> tasks, with summary counts per wave.
+///
+/// Params:
+///   - project_name (required): project name
+///   - wave (optional): filter to specific wave number
+fn handle_exec_status(req: Request, state: &HandlerState) -> Response {
+    let id = req.id.clone();
+
+    let project_name = match req.params.get("project_name").and_then(|v| v.as_str()) {
+        Some(n) => n.to_string(),
+        None => return Response::error(id, "missing required parameter: project_name"),
+    };
+
+    let wave_filter: Option<u32> = req
+        .params
+        .get("wave")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as u32);
+
+    let conn = match db::open_connection(&state.db_path) {
+        Ok(c) => c,
+        Err(e) => return Response::error(id, &format!("database error: {}", e)),
+    };
+
+    let project = match db::projects::get_project_by_name(&conn, &project_name) {
+        Ok(Some(p)) => p,
+        Ok(None) => {
+            return Response::error(
+                id,
+                &format!("NOT_FOUND: project '{}' not found", project_name),
+            )
+        }
+        Err(e) => return Response::error(id, &format!("database error: {}", e)),
+    };
+
+    let all_sessions =
+        match db::decomposition_sessions::list_sessions_by_project(&conn, &project.id) {
+            Ok(s) => s,
+            Err(e) => return Response::error(id, &format!("database error: {}", e)),
+        };
+
+    // Filter sessions by wave number if specified
+    let sessions: Vec<_> = if let Some(wave) = wave_filter {
+        match all_sessions.iter().find(|s| s.wave_number == wave) {
+            Some(s) => vec![s.clone()],
+            None => {
+                return Response::error(id, &format!("NOT_FOUND: wave W{} not found", wave));
+            }
+        }
+    } else {
+        all_sessions
+    };
+
+    let running_count = match db::agent_runs::find_running_agent_runs_by_project(&conn, &project.id)
+    {
+        Ok(runs) => runs.len() as u32,
+        Err(e) => return Response::error(id, &format!("database error: {}", e)),
+    };
+
+    let mut waves_data = Vec::new();
+
+    for session in &sessions {
+        let all_items = match db::work_items::list_work_items_by_session(&conn, &session.id) {
+            Ok(items) => items,
+            Err(e) => return Response::error(id, &format!("database error: {}", e)),
+        };
+
+        // Compute summary counts for this wave
+        let mut summary = serde_json::Map::new();
+        let stories: Vec<&WorkItem> = all_items
+            .iter()
+            .filter(|item| item.item_type == ItemType::Story)
+            .collect();
+        let total = stories.len() as u32;
+        let mut pending: u32 = 0;
+        let mut ready: u32 = 0;
+        let mut running: u32 = 0;
+        let mut done: u32 = 0;
+        let mut failed: u32 = 0;
+        let mut cancelled: u32 = 0;
+        for story in &stories {
+            match story.status {
+                WorkItemStatus::Pending => pending += 1,
+                WorkItemStatus::Ready => ready += 1,
+                WorkItemStatus::InProgress => running += 1,
+                WorkItemStatus::Done => done += 1,
+                WorkItemStatus::Failed => failed += 1,
+                WorkItemStatus::Cancelled => cancelled += 1,
+            }
+        }
+        summary.insert("total".to_string(), serde_json::json!(total));
+        summary.insert("pending".to_string(), serde_json::json!(pending));
+        summary.insert("ready".to_string(), serde_json::json!(ready));
+        summary.insert("running".to_string(), serde_json::json!(running));
+        summary.insert("done".to_string(), serde_json::json!(done));
+        summary.insert("failed".to_string(), serde_json::json!(failed));
+        summary.insert("cancelled".to_string(), serde_json::json!(cancelled));
+
+        // Build hierarchical tree
+        let epics: Vec<&WorkItem> = all_items
+            .iter()
+            .filter(|item| item.item_type == ItemType::Epic)
+            .collect();
+
+        let mut epics_data = Vec::new();
+        for epic in &epics {
+            let epic_stories: Vec<&WorkItem> = all_items
+                .iter()
+                .filter(|item| item.item_type == ItemType::Story && item.parent_id == Some(epic.id))
+                .collect();
+
+            let mut stories_data = Vec::new();
+            for story in &epic_stories {
+                let story_tasks: Vec<&WorkItem> = all_items
+                    .iter()
+                    .filter(|item| {
+                        item.item_type == ItemType::Task && item.parent_id == Some(story.id)
+                    })
+                    .collect();
+
+                let mut tasks_data = Vec::new();
+                for task in &story_tasks {
+                    // Get agent run info for exit_code and retry_count
+                    let retry_count =
+                        db::agent_runs::count_agent_runs_for_task(&conn, &task.id).unwrap_or(0);
+                    let latest_run =
+                        db::agent_runs::find_latest_agent_run_for_task(&conn, &task.id)
+                            .ok()
+                            .flatten();
+
+                    let exit_code = latest_run.as_ref().and_then(|r| r.exit_code);
+                    let task_started_at = latest_run.as_ref().map(|r| r.started_at.to_rfc3339());
+                    let task_finished_at = latest_run
+                        .as_ref()
+                        .and_then(|r| r.finished_at.map(|t| t.to_rfc3339()));
+
+                    tasks_data.push(serde_json::json!({
+                        "short_id": format!("W{}-{}", session.wave_number, task.short_id),
+                        "title": task.title,
+                        "status": task.status.to_string(),
+                        "kind": task.kind.as_ref().map(|k| k.to_string()),
+                        "exit_code": exit_code,
+                        "retry_count": retry_count,
+                        "started_at": task_started_at,
+                        "finished_at": task_finished_at,
+                    }));
+                }
+
+                stories_data.push(serde_json::json!({
+                    "short_id": format!("W{}-{}", session.wave_number, story.short_id),
+                    "title": story.title,
+                    "status": story.status.to_string(),
+                    "branch_name": story.branch_name,
+                    "mr_url": story.mr_url,
+                    "worktree_path": story.worktree_path,
+                    "started_at": story.created_at.to_rfc3339(),
+                    "finished_at": if story.status == WorkItemStatus::Done || story.status == WorkItemStatus::Failed || story.status == WorkItemStatus::Cancelled {
+                        Some(story.updated_at.to_rfc3339())
+                    } else {
+                        None
+                    },
+                    "tasks": tasks_data,
+                }));
+            }
+
+            epics_data.push(serde_json::json!({
+                "short_id": format!("W{}-{}", session.wave_number, epic.short_id),
+                "title": epic.title,
+                "status": epic.status.to_string(),
+                "started_at": epic.created_at.to_rfc3339(),
+                "finished_at": if epic.status == WorkItemStatus::Done || epic.status == WorkItemStatus::Failed || epic.status == WorkItemStatus::Cancelled {
+                    Some(epic.updated_at.to_rfc3339())
+                } else {
+                    None
+                },
+                "stories": stories_data,
+            }));
+        }
+
+        waves_data.push(serde_json::json!({
+            "wave_number": session.wave_number,
+            "status": session.status.to_string(),
+            "summary": summary,
+            "epics": epics_data,
+        }));
+    }
+
+    Response::ok(
+        id,
+        serde_json::json!({
+            "project_name": project.name,
+            "execution_enabled": project.execution_enabled,
+            "running_count": running_count,
+            "waves": waves_data,
         }),
     )
 }
@@ -5687,6 +5889,471 @@ mod tests {
             params: serde_json::json!({}),
         };
         // Should route to exec.pause (get error for missing param, not unknown command)
+        match dispatch(req, &state) {
+            HandlerResult::Single(resp) => {
+                assert_eq!(resp.status, crate::socket::ResponseStatus::Error);
+                assert!(resp.data["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("missing required parameter"));
+            }
+            _ => panic!("expected Single response"),
+        }
+        cleanup_db(&db_dir);
+    }
+
+    // --- exec.status tests ---
+
+    #[test]
+    fn test_exec_status_missing_project_name() {
+        let (state, db_dir) = make_db_state("exec_status_missing");
+        let req = Request {
+            id: "400".to_string(),
+            command: "exec.status".to_string(),
+            params: serde_json::json!({}),
+        };
+        match dispatch(req, &state) {
+            HandlerResult::Single(resp) => {
+                assert_eq!(resp.status, crate::socket::ResponseStatus::Error);
+                assert!(resp.data["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("missing required parameter"));
+            }
+            _ => panic!("expected Single response"),
+        }
+        cleanup_db(&db_dir);
+    }
+
+    #[test]
+    fn test_exec_status_project_not_found() {
+        let (state, db_dir) = make_db_state("exec_status_notfound");
+        let req = Request {
+            id: "401".to_string(),
+            command: "exec.status".to_string(),
+            params: serde_json::json!({ "project_name": "nonexistent" }),
+        };
+        match dispatch(req, &state) {
+            HandlerResult::Single(resp) => {
+                assert_eq!(resp.status, crate::socket::ResponseStatus::Error);
+                assert!(resp.data["message"].as_str().unwrap().contains("NOT_FOUND"));
+            }
+            _ => panic!("expected Single response"),
+        }
+        cleanup_db(&db_dir);
+    }
+
+    #[test]
+    fn test_exec_status_empty_project() {
+        let (state, db_dir) = make_db_state("exec_status_empty");
+        let _pid = insert_test_project(&state, "exec-status-empty");
+
+        let req = Request {
+            id: "402".to_string(),
+            command: "exec.status".to_string(),
+            params: serde_json::json!({ "project_name": "exec-status-empty" }),
+        };
+        match dispatch(req, &state) {
+            HandlerResult::Single(resp) => {
+                assert_eq!(resp.status, crate::socket::ResponseStatus::Ok);
+                assert_eq!(resp.data["project_name"], "exec-status-empty");
+                assert_eq!(resp.data["execution_enabled"], true);
+                assert_eq!(resp.data["running_count"], 0);
+                let waves = resp.data["waves"].as_array().unwrap();
+                assert!(waves.is_empty());
+            }
+            _ => panic!("expected Single response"),
+        }
+        cleanup_db(&db_dir);
+    }
+
+    #[test]
+    fn test_exec_status_hierarchical_structure() {
+        let (state, db_dir) = make_db_state("exec_status_hierarchy");
+        let project_id = insert_test_project(&state, "exec-status-hier");
+        let conn = db::open_connection(&state.db_path).unwrap();
+
+        // Insert session
+        let session_id = uuid::Uuid::new_v4();
+        conn.execute(
+            "INSERT INTO decomposition_sessions (id, project_id, wave_number, status, created_at, updated_at)
+             VALUES (?1, ?2, 1, 'approved', '2024-01-01T00:00:00Z', '2024-01-01T00:00:00Z')",
+            rusqlite::params![session_id.to_string(), project_id.to_string()],
+        )
+        .unwrap();
+
+        // Insert epic
+        let epic_id = uuid::Uuid::new_v4();
+        conn.execute(
+            "INSERT INTO work_items (id, decomposition_session_id, item_type, title, description, status, short_id, sort_order, created_at, updated_at)
+             VALUES (?1, ?2, 'epic', 'Test Epic', 'epic desc', 'in_progress', 'E1', 0, '2024-01-01T00:00:00Z', '2024-01-01T00:00:00Z')",
+            rusqlite::params![epic_id.to_string(), session_id.to_string()],
+        )
+        .unwrap();
+
+        // Insert story
+        let story_id = uuid::Uuid::new_v4();
+        conn.execute(
+            "INSERT INTO work_items (id, parent_id, decomposition_session_id, item_type, title, description, status, short_id, sort_order, branch_name, worktree_path, created_at, updated_at)
+             VALUES (?1, ?2, ?3, 'story', 'Test Story', 'story desc', 'in_progress', 'S1', 0, 'feat/story-1', '/tmp/worktree/s1', '2024-01-01T00:00:00Z', '2024-01-01T00:00:00Z')",
+            rusqlite::params![story_id.to_string(), epic_id.to_string(), session_id.to_string()],
+        )
+        .unwrap();
+
+        // Insert impl task
+        let task_id = uuid::Uuid::new_v4();
+        conn.execute(
+            "INSERT INTO work_items (id, parent_id, decomposition_session_id, item_type, kind, title, description, status, short_id, sort_order, created_at, updated_at)
+             VALUES (?1, ?2, ?3, 'task', 'impl', 'Implement feature', 'task desc', 'done', 'T1', 0, '2024-01-01T00:00:00Z', '2024-01-01T00:00:00Z')",
+            rusqlite::params![task_id.to_string(), story_id.to_string(), session_id.to_string()],
+        )
+        .unwrap();
+
+        // Insert verify task
+        let verify_task_id = uuid::Uuid::new_v4();
+        conn.execute(
+            "INSERT INTO work_items (id, parent_id, decomposition_session_id, item_type, kind, title, description, status, short_id, sort_order, created_at, updated_at)
+             VALUES (?1, ?2, ?3, 'task', 'verify', 'Verify feature', 'verify desc', 'in_progress', 'T1v', 1, '2024-01-01T00:00:00Z', '2024-01-01T00:00:00Z')",
+            rusqlite::params![verify_task_id.to_string(), story_id.to_string(), session_id.to_string()],
+        )
+        .unwrap();
+
+        // Insert agent run for impl task
+        let run_id = uuid::Uuid::new_v4();
+        conn.execute(
+            "INSERT INTO agent_runs (id, work_item_id, status, exit_code, started_at, finished_at)
+             VALUES (?1, ?2, 'succeeded', 0, '2024-01-01T00:01:00Z', '2024-01-01T00:05:00Z')",
+            rusqlite::params![run_id.to_string(), task_id.to_string()],
+        )
+        .unwrap();
+
+        drop(conn);
+
+        let req = Request {
+            id: "403".to_string(),
+            command: "exec.status".to_string(),
+            params: serde_json::json!({ "project_name": "exec-status-hier" }),
+        };
+        match dispatch(req, &state) {
+            HandlerResult::Single(resp) => {
+                assert_eq!(resp.status, crate::socket::ResponseStatus::Ok);
+                assert_eq!(resp.data["project_name"], "exec-status-hier");
+
+                let waves = resp.data["waves"].as_array().unwrap();
+                assert_eq!(waves.len(), 1);
+
+                let wave = &waves[0];
+                assert_eq!(wave["wave_number"], 1);
+                assert_eq!(wave["status"], "approved");
+
+                // Check summary counts
+                let summary = &wave["summary"];
+                assert_eq!(summary["total"], 1); // 1 story
+                assert_eq!(summary["running"], 1); // in_progress
+                assert_eq!(summary["pending"], 0);
+
+                // Check hierarchy
+                let epics = wave["epics"].as_array().unwrap();
+                assert_eq!(epics.len(), 1);
+                assert_eq!(epics[0]["short_id"], "W1-E1");
+                assert_eq!(epics[0]["title"], "Test Epic");
+                assert_eq!(epics[0]["status"], "in_progress");
+
+                let stories = epics[0]["stories"].as_array().unwrap();
+                assert_eq!(stories.len(), 1);
+                assert_eq!(stories[0]["short_id"], "W1-S1");
+                assert_eq!(stories[0]["title"], "Test Story");
+                assert_eq!(stories[0]["branch_name"], "feat/story-1");
+                assert_eq!(stories[0]["worktree_path"], "/tmp/worktree/s1");
+
+                let tasks = stories[0]["tasks"].as_array().unwrap();
+                assert_eq!(tasks.len(), 2);
+                assert_eq!(tasks[0]["short_id"], "W1-T1");
+                assert_eq!(tasks[0]["kind"], "impl");
+                assert_eq!(tasks[0]["status"], "done");
+                assert_eq!(tasks[0]["exit_code"], 0);
+                assert_eq!(tasks[0]["retry_count"], 1); // 1 agent run
+
+                assert_eq!(tasks[1]["short_id"], "W1-T1v");
+                assert_eq!(tasks[1]["kind"], "verify");
+                assert_eq!(tasks[1]["status"], "in_progress");
+            }
+            _ => panic!("expected Single response"),
+        }
+        cleanup_db(&db_dir);
+    }
+
+    #[test]
+    fn test_exec_status_wave_filter() {
+        let (state, db_dir) = make_db_state("exec_status_wave");
+        let project_id = insert_test_project(&state, "exec-status-wave");
+        let conn = db::open_connection(&state.db_path).unwrap();
+
+        // Insert two sessions (wave 1 and wave 2)
+        let session1_id = uuid::Uuid::new_v4();
+        conn.execute(
+            "INSERT INTO decomposition_sessions (id, project_id, wave_number, status, created_at, updated_at)
+             VALUES (?1, ?2, 1, 'approved', '2024-01-01T00:00:00Z', '2024-01-01T00:00:00Z')",
+            rusqlite::params![session1_id.to_string(), project_id.to_string()],
+        )
+        .unwrap();
+        let session2_id = uuid::Uuid::new_v4();
+        conn.execute(
+            "INSERT INTO decomposition_sessions (id, project_id, wave_number, status, created_at, updated_at)
+             VALUES (?1, ?2, 2, 'in_progress', '2024-01-02T00:00:00Z', '2024-01-02T00:00:00Z')",
+            rusqlite::params![session2_id.to_string(), project_id.to_string()],
+        )
+        .unwrap();
+
+        // Insert epic + story in wave 1
+        let epic1_id = uuid::Uuid::new_v4();
+        conn.execute(
+            "INSERT INTO work_items (id, decomposition_session_id, item_type, title, description, status, short_id, sort_order, created_at, updated_at)
+             VALUES (?1, ?2, 'epic', 'Wave 1 Epic', 'desc', 'done', 'E1', 0, '2024-01-01T00:00:00Z', '2024-01-01T00:00:00Z')",
+            rusqlite::params![epic1_id.to_string(), session1_id.to_string()],
+        )
+        .unwrap();
+        let story1_id = uuid::Uuid::new_v4();
+        conn.execute(
+            "INSERT INTO work_items (id, parent_id, decomposition_session_id, item_type, title, description, status, short_id, sort_order, created_at, updated_at)
+             VALUES (?1, ?2, ?3, 'story', 'Wave 1 Story', 'desc', 'done', 'S1', 0, '2024-01-01T00:00:00Z', '2024-01-02T00:00:00Z')",
+            rusqlite::params![story1_id.to_string(), epic1_id.to_string(), session1_id.to_string()],
+        )
+        .unwrap();
+
+        // Insert epic + story in wave 2
+        let epic2_id = uuid::Uuid::new_v4();
+        conn.execute(
+            "INSERT INTO work_items (id, decomposition_session_id, item_type, title, description, status, short_id, sort_order, created_at, updated_at)
+             VALUES (?1, ?2, 'epic', 'Wave 2 Epic', 'desc', 'pending', 'E1', 0, '2024-01-02T00:00:00Z', '2024-01-02T00:00:00Z')",
+            rusqlite::params![epic2_id.to_string(), session2_id.to_string()],
+        )
+        .unwrap();
+        let story2_id = uuid::Uuid::new_v4();
+        conn.execute(
+            "INSERT INTO work_items (id, parent_id, decomposition_session_id, item_type, title, description, status, short_id, sort_order, created_at, updated_at)
+             VALUES (?1, ?2, ?3, 'story', 'Wave 2 Story', 'desc', 'pending', 'S1', 0, '2024-01-02T00:00:00Z', '2024-01-02T00:00:00Z')",
+            rusqlite::params![story2_id.to_string(), epic2_id.to_string(), session2_id.to_string()],
+        )
+        .unwrap();
+
+        drop(conn);
+
+        // Without wave filter: should return both waves
+        let req = Request {
+            id: "404".to_string(),
+            command: "exec.status".to_string(),
+            params: serde_json::json!({ "project_name": "exec-status-wave" }),
+        };
+        match dispatch(req, &state) {
+            HandlerResult::Single(resp) => {
+                assert_eq!(resp.status, crate::socket::ResponseStatus::Ok);
+                let waves = resp.data["waves"].as_array().unwrap();
+                assert_eq!(waves.len(), 2);
+            }
+            _ => panic!("expected Single response"),
+        }
+
+        // With wave filter = 1: should return only wave 1
+        let req = Request {
+            id: "405".to_string(),
+            command: "exec.status".to_string(),
+            params: serde_json::json!({ "project_name": "exec-status-wave", "wave": 1 }),
+        };
+        match dispatch(req, &state) {
+            HandlerResult::Single(resp) => {
+                assert_eq!(resp.status, crate::socket::ResponseStatus::Ok);
+                let waves = resp.data["waves"].as_array().unwrap();
+                assert_eq!(waves.len(), 1);
+                assert_eq!(waves[0]["wave_number"], 1);
+
+                let summary = &waves[0]["summary"];
+                assert_eq!(summary["total"], 1);
+                assert_eq!(summary["done"], 1);
+            }
+            _ => panic!("expected Single response"),
+        }
+
+        // With non-existent wave: should return error
+        let req = Request {
+            id: "406".to_string(),
+            command: "exec.status".to_string(),
+            params: serde_json::json!({ "project_name": "exec-status-wave", "wave": 99 }),
+        };
+        match dispatch(req, &state) {
+            HandlerResult::Single(resp) => {
+                assert_eq!(resp.status, crate::socket::ResponseStatus::Error);
+                assert!(resp.data["message"].as_str().unwrap().contains("NOT_FOUND"));
+                assert!(resp.data["message"].as_str().unwrap().contains("W99"));
+            }
+            _ => panic!("expected Single response"),
+        }
+
+        cleanup_db(&db_dir);
+    }
+
+    #[test]
+    fn test_exec_status_summary_counts() {
+        let (state, db_dir) = make_db_state("exec_status_counts");
+        let project_id = insert_test_project(&state, "exec-status-counts");
+        let conn = db::open_connection(&state.db_path).unwrap();
+
+        let session_id = uuid::Uuid::new_v4();
+        conn.execute(
+            "INSERT INTO decomposition_sessions (id, project_id, wave_number, status, created_at, updated_at)
+             VALUES (?1, ?2, 1, 'approved', '2024-01-01T00:00:00Z', '2024-01-01T00:00:00Z')",
+            rusqlite::params![session_id.to_string(), project_id.to_string()],
+        )
+        .unwrap();
+
+        let epic_id = uuid::Uuid::new_v4();
+        conn.execute(
+            "INSERT INTO work_items (id, decomposition_session_id, item_type, title, description, status, short_id, sort_order, created_at, updated_at)
+             VALUES (?1, ?2, 'epic', 'Epic', 'desc', 'in_progress', 'E1', 0, '2024-01-01T00:00:00Z', '2024-01-01T00:00:00Z')",
+            rusqlite::params![epic_id.to_string(), session_id.to_string()],
+        )
+        .unwrap();
+
+        // Insert stories with different statuses
+        let statuses = [
+            "pending",
+            "ready",
+            "in_progress",
+            "done",
+            "failed",
+            "cancelled",
+        ];
+        for (i, status) in statuses.iter().enumerate() {
+            let sid = uuid::Uuid::new_v4();
+            conn.execute(
+                "INSERT INTO work_items (id, parent_id, decomposition_session_id, item_type, title, description, status, short_id, sort_order, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, 'story', ?4, 'desc', ?5, ?6, ?7, '2024-01-01T00:00:00Z', '2024-01-01T00:00:00Z')",
+                rusqlite::params![
+                    sid.to_string(),
+                    epic_id.to_string(),
+                    session_id.to_string(),
+                    format!("Story {}", i + 1),
+                    status,
+                    format!("S{}", i + 1),
+                    i as i32,
+                ],
+            )
+            .unwrap();
+        }
+        drop(conn);
+
+        let req = Request {
+            id: "407".to_string(),
+            command: "exec.status".to_string(),
+            params: serde_json::json!({ "project_name": "exec-status-counts" }),
+        };
+        match dispatch(req, &state) {
+            HandlerResult::Single(resp) => {
+                assert_eq!(resp.status, crate::socket::ResponseStatus::Ok);
+                let wave = &resp.data["waves"].as_array().unwrap()[0];
+                let summary = &wave["summary"];
+                assert_eq!(summary["total"], 6);
+                assert_eq!(summary["pending"], 1);
+                assert_eq!(summary["ready"], 1);
+                assert_eq!(summary["running"], 1);
+                assert_eq!(summary["done"], 1);
+                assert_eq!(summary["failed"], 1);
+                assert_eq!(summary["cancelled"], 1);
+            }
+            _ => panic!("expected Single response"),
+        }
+        cleanup_db(&db_dir);
+    }
+
+    #[test]
+    fn test_exec_status_task_agent_details() {
+        let (state, db_dir) = make_db_state("exec_status_agent");
+        let project_id = insert_test_project(&state, "exec-status-agent");
+        let conn = db::open_connection(&state.db_path).unwrap();
+
+        let session_id = uuid::Uuid::new_v4();
+        conn.execute(
+            "INSERT INTO decomposition_sessions (id, project_id, wave_number, status, created_at, updated_at)
+             VALUES (?1, ?2, 1, 'approved', '2024-01-01T00:00:00Z', '2024-01-01T00:00:00Z')",
+            rusqlite::params![session_id.to_string(), project_id.to_string()],
+        )
+        .unwrap();
+
+        let epic_id = uuid::Uuid::new_v4();
+        conn.execute(
+            "INSERT INTO work_items (id, decomposition_session_id, item_type, title, description, status, short_id, sort_order, created_at, updated_at)
+             VALUES (?1, ?2, 'epic', 'Epic', 'desc', 'in_progress', 'E1', 0, '2024-01-01T00:00:00Z', '2024-01-01T00:00:00Z')",
+            rusqlite::params![epic_id.to_string(), session_id.to_string()],
+        )
+        .unwrap();
+
+        let story_id = uuid::Uuid::new_v4();
+        conn.execute(
+            "INSERT INTO work_items (id, parent_id, decomposition_session_id, item_type, title, description, status, short_id, sort_order, created_at, updated_at)
+             VALUES (?1, ?2, ?3, 'story', 'Story', 'desc', 'in_progress', 'S1', 0, '2024-01-01T00:00:00Z', '2024-01-01T00:00:00Z')",
+            rusqlite::params![story_id.to_string(), epic_id.to_string(), session_id.to_string()],
+        )
+        .unwrap();
+
+        // Task with multiple retries
+        let task_id = uuid::Uuid::new_v4();
+        conn.execute(
+            "INSERT INTO work_items (id, parent_id, decomposition_session_id, item_type, kind, title, description, status, short_id, sort_order, created_at, updated_at)
+             VALUES (?1, ?2, ?3, 'task', 'impl', 'Impl Task', 'desc', 'done', 'T1', 0, '2024-01-01T00:00:00Z', '2024-01-01T00:00:00Z')",
+            rusqlite::params![task_id.to_string(), story_id.to_string(), session_id.to_string()],
+        )
+        .unwrap();
+
+        // First attempt (failed)
+        let run1_id = uuid::Uuid::new_v4();
+        conn.execute(
+            "INSERT INTO agent_runs (id, work_item_id, status, exit_code, started_at, finished_at)
+             VALUES (?1, ?2, 'failed', 1, '2024-01-01T00:01:00Z', '2024-01-01T00:03:00Z')",
+            rusqlite::params![run1_id.to_string(), task_id.to_string()],
+        )
+        .unwrap();
+
+        // Second attempt (succeeded)
+        let run2_id = uuid::Uuid::new_v4();
+        conn.execute(
+            "INSERT INTO agent_runs (id, work_item_id, status, exit_code, started_at, finished_at)
+             VALUES (?1, ?2, 'succeeded', 0, '2024-01-01T00:05:00Z', '2024-01-01T00:10:00Z')",
+            rusqlite::params![run2_id.to_string(), task_id.to_string()],
+        )
+        .unwrap();
+
+        drop(conn);
+
+        let req = Request {
+            id: "408".to_string(),
+            command: "exec.status".to_string(),
+            params: serde_json::json!({ "project_name": "exec-status-agent" }),
+        };
+        match dispatch(req, &state) {
+            HandlerResult::Single(resp) => {
+                assert_eq!(resp.status, crate::socket::ResponseStatus::Ok);
+                let wave = &resp.data["waves"].as_array().unwrap()[0];
+                let task = &wave["epics"][0]["stories"][0]["tasks"][0];
+                assert_eq!(task["retry_count"], 2); // 2 agent runs total
+                assert_eq!(task["exit_code"], 0); // latest run exit code
+                                                  // latest run started_at/finished_at should be present
+                assert!(task["started_at"].as_str().is_some());
+                assert!(task["finished_at"].as_str().is_some());
+            }
+            _ => panic!("expected Single response"),
+        }
+        cleanup_db(&db_dir);
+    }
+
+    #[test]
+    fn test_dispatch_exec_status_route() {
+        let (state, db_dir) = make_db_state("dispatch_exec_status");
+        let req = Request {
+            id: "409".to_string(),
+            command: "exec.status".to_string(),
+            params: serde_json::json!({}),
+        };
+        // Should route to exec.status (get error for missing param, not unknown command)
         match dispatch(req, &state) {
             HandlerResult::Single(resp) => {
                 assert_eq!(resp.status, crate::socket::ResponseStatus::Error);

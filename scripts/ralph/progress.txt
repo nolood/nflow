@@ -1550,3 +1550,25 @@ Started: Sat Feb  7 03:49:10 PM MSK 2026
   - --parallel and --story params are parsed but stored in-memory only (not persisted to DB) — scheduler will read them from HandlerState in future
   - Idempotent enable/disable: only call update_project when state actually changes (avoids unnecessary DB write)
 ---
+
+## 2026-02-07 - US-060
+- What was implemented: Command handler — exec status in nflow-daemon
+  - handle_exec_status() returns hierarchical status: waves → epics → stories → tasks
+  - Each item includes short_id (wave-prefixed), title, status, started_at, finished_at
+  - Stories additionally: branch_name, mr_url, worktree_path
+  - Tasks additionally: kind (impl|verify), exit_code (from latest agent run), retry_count (total agent runs)
+  - Optional --wave N filter to show specific wave only (NOT_FOUND error for non-existent wave)
+  - Summary counts per wave: total/pending/ready/running/done/failed/cancelled
+  - Project-level fields: project_name, execution_enabled, running_count
+  - Added dispatch route: "exec.status" in dispatch()
+  - 8 new tests: missing params, not found, empty project, hierarchical structure, wave filter, summary counts, agent details, dispatch routing
+- Files changed:
+  - crates/nflow-daemon/src/handlers.rs (handle_exec_status, dispatch route + 8 tests)
+- **Learnings for future iterations:**
+  - WorkItemStatus::Display uses lowercase: "pending", "in_progress", "done" — not capitalized
+  - DecompositionStatus::Display also lowercase: "approved", "in_progress", "discarded"
+  - Task started_at/finished_at from AgentRun (latest by started_at DESC), not from WorkItem
+  - Story/epic started_at from created_at, finished_at from updated_at only when in terminal state (Done/Failed/Cancelled)
+  - Reuses existing DB queries: count_agent_runs_for_task, find_latest_agent_run_for_task, list_work_items_by_session
+  - Summary counts iterate stories and match on WorkItemStatus enum variants — no DB aggregation needed
+---
