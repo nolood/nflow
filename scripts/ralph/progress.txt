@@ -39,6 +39,10 @@
 - TUI list state pattern: XxxListState struct with items Vec, selected usize, select_prev/select_next, update_from_response
 - centered_rect(percent_x, percent_y, area) computes a centered Rect for popup overlays; use Clear widget before rendering popup
 - TUI pager sub-view pattern: SpecPagerState with lines Vec, scroll_offset, total_lines; handle_pager_key checked before handle_dialogue_key; pager blocks all global keys (q exits pager, not app); spec.view command returns { name, status, content }
+- TUI plan sub-view pattern: PlanGenerateState, PlanFeedbackState, PlanConfirmState, PlanDetailState as Option fields on App; in_plan_sub_view() checks all four; handle_plan_sub_view_key dispatches; Esc always returns PlanSubViewExit
+- Confirmation popup pattern: ConfirmAction enum carries the action type; y/Y confirms → returns the action as ViewAction; n/N cancels → ViewAction::None; Esc also cancels
+- Generate dialog filters specs_list.items by status=="approved" to populate PlanGenerateState.specs
+- Plan view Enter now opens detail popup (not collapse toggle); Space toggles collapse instead
 - TUI plan tree view: PlanTreeState with flat Vec<PlanTreeNode>, visible_nodes() filters collapsed/verify; depth=0 wave, 1 epic, 2 story, 3 task; status icons mapped from string status; collapsible via toggle_collapse(); h toggles hide_verify
 - plan.show daemon command returns { wave_number, status, epics: [{ short_id, title, status, stories: [{ ..., progress, depends_on, tasks }] }] }
 - visible_nodes() pattern: iterate all nodes, skip children when parent.collapsed, filter verify tasks when hide_verify — returns Vec<(real_index, &node)> for mapping back to flat array
@@ -2015,4 +2019,19 @@ Started: Sat Feb  7 03:49:10 PM MSK 2026
   - Status icon mapping: pending=○, ready=●, in_progress=▶, done=✓, failed=✗, cancelled=⊘
   - plan.show response is hierarchical JSON: wave→epics→stories→tasks, flattened on client side with depth markers
   - handle_view_key dispatch pattern: just add new arm for View::Plan → handle_plan_key(app, key)
+---
+
+## 2026-02-08 - US-080
+- What was implemented: TUI plan action keybindings (g=generate, f=feedback, a=approve, d=discard, Enter=detail)
+- Files changed:
+  - crates/nflow-tui/src/app.rs: Added PlanGenerateState, PlanFeedbackState, PlanConfirmState, PlanDetailState, ConfirmAction enum; App fields for plan sub-views; open_*/close_plan_sub_view methods; tests
+  - crates/nflow-tui/src/event.rs: Added ViewAction variants (PlanGenerate, PlanFeedback, PlanApprove, PlanDiscard, PlanSubViewExit); handle_plan_sub_view_key, handle_generate_key, handle_feedback_key, handle_confirm_key; updated handle_plan_key with g/f/a/d/Enter; 30+ new tests
+  - crates/nflow-tui/src/main.rs: Added handler functions handle_plan_generate, handle_plan_feedback, handle_plan_approve, handle_plan_discard; ViewAction dispatch
+  - crates/nflow-tui/src/ui.rs: Added render_generate_dialog, render_feedback_input, render_confirm_popup, render_detail_popup; updated plan tree title hints
+- **Learnings for future iterations:**
+  - Plan sub-views use the same exclusive-handling pattern as dialogue/pager: checked early in handle_key_event before global keys
+  - Enter in plan view now opens detail (not collapse); Space toggles collapse. This is a behavioral change from US-079
+  - Generate dialog only shows approved specs — filter from specs_list.items by status
+  - Confirmation popup uses ConfirmAction enum to carry intent; y/n dispatches the actual action
+  - Detail popup shows basic node info; "any key dismisses" pattern (except Esc which goes through PlanSubViewExit)
 ---
