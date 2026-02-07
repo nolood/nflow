@@ -813,6 +813,68 @@ mod tests {
         assert!(dag.nodes.contains(&s1.id));
     }
 
+    // --- 5-story linear chain ---
+
+    #[test]
+    fn build_dag_5_stories_linear_chain_topological_sort() {
+        let session_id = Uuid::new_v4();
+        let s1 = make_story(session_id, "S1");
+        let s2 = make_story(session_id, "S2");
+        let s3 = make_story(session_id, "S3");
+        let s4 = make_story(session_id, "S4");
+        let s5 = make_story(session_id, "S5");
+
+        // Linear chain: S1 -> S2 -> S3 -> S4 -> S5
+        let deps = vec![
+            Dependency::new(s1.id, s2.id),
+            Dependency::new(s2.id, s3.id),
+            Dependency::new(s3.id, s4.id),
+            Dependency::new(s4.id, s5.id),
+        ];
+
+        let dag = build_dag(
+            &[s1.clone(), s2.clone(), s3.clone(), s4.clone(), s5.clone()],
+            &deps,
+        )
+        .unwrap();
+
+        assert_eq!(dag.nodes.len(), 5);
+
+        let order = topological_sort(&dag).unwrap();
+        assert_eq!(order.len(), 5);
+
+        let pos1 = order.iter().position(|&id| id == s1.id).unwrap();
+        let pos2 = order.iter().position(|&id| id == s2.id).unwrap();
+        let pos3 = order.iter().position(|&id| id == s3.id).unwrap();
+        let pos4 = order.iter().position(|&id| id == s4.id).unwrap();
+        let pos5 = order.iter().position(|&id| id == s5.id).unwrap();
+
+        assert!(pos1 < pos2);
+        assert!(pos2 < pos3);
+        assert!(pos3 < pos4);
+        assert!(pos4 < pos5);
+    }
+
+    // --- Cross-wave dependency ---
+
+    #[test]
+    fn build_dag_cross_wave_dependency_rejected() {
+        // Stories from different decomposition sessions (waves) cannot be in the same DAG
+        let wave1_session = Uuid::new_v4();
+        let wave2_session = Uuid::new_v4();
+        let s1 = make_story(wave1_session, "S1");
+        let s2 = make_story(wave2_session, "S2");
+
+        // Attempting to build a DAG with stories from different sessions should fail
+        let err = build_dag(&[s1.clone(), s2.clone()], &[]).unwrap_err();
+        assert!(matches!(err, NflowError::ValidationError(_)));
+
+        // Also fails even with an explicit dependency between them
+        let dep = Dependency::new(s1.id, s2.id);
+        let err = build_dag(&[s1, s2], &[dep]).unwrap_err();
+        assert!(matches!(err, NflowError::ValidationError(_)));
+    }
+
     // --- Edge cases ---
 
     #[test]
