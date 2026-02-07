@@ -14,6 +14,9 @@ pub enum NflowError {
     #[error("Invalid state: {0}")]
     InvalidState(String),
 
+    #[error("Invalid transition from {from} to {to}")]
+    InvalidTransition { from: String, to: String },
+
     #[error("Serialization error: {0}")]
     Serialization(String),
 }
