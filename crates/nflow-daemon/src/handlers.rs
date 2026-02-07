@@ -5,7 +5,7 @@ use nflow_core::decomposition::{DecompositionSession, DecompositionSpec, Decompo
 use nflow_core::project::{CreateProjectParams, GitProvider, ProjectService};
 use nflow_core::spec::{Spec, SpecStatus};
 use nflow_core::work_item::{
-    auto_generate_verify_tasks, Dependency, ItemType, WorkItem, WorkItemStatus,
+    auto_generate_verify_tasks, Dependency, ItemType, TaskKind, WorkItem, WorkItemStatus,
 };
 
 use crate::db;
@@ -55,6 +55,7 @@ fn dispatch(req: Request, state: &HandlerState) -> HandlerResult {
         "exec.run" => HandlerResult::Single(handle_exec_run(req, state)),
         "exec.pause" => HandlerResult::Single(handle_exec_pause(req, state)),
         "exec.status" => HandlerResult::Single(handle_exec_status(req, state)),
+        "exec.retry" => HandlerResult::Single(handle_exec_retry(req, state)),
         _ => HandlerResult::Single(Response::error(
             req.id,
             &format!("unknown command: {}", req.command),
@@ -3014,6 +3015,391 @@ fn handle_exec_status(req: Request, state: &HandlerState) -> Response {
             "waves": waves_data,
         }),
     )
+}
+
+/// Handle "exec.retry" command.
+///
+/// Retries a failed task by resetting state and spawning a new Claude agent.
+/// For impl tasks, resets the worktree to the previous task's commit (or base if first).
+/// For verify tasks, no worktree reset is needed.
+///
+/// Params:
+///   - task_id (required): wave-prefixed short ID (e.g., "W1-T1")
+fn handle_exec_retry(req: Request, state: &HandlerState) -> Response {
+    let id = req.id.clone();
+
+    let task_id_str = match req.params.get("task_id").and_then(|v| v.as_str()) {
+        Some(t) => t.to_string(),
+        None => return Response::error(id, "missing required parameter: task_id"),
+    };
+
+    let conn = match db::open_connection(&state.db_path) {
+        Ok(c) => c,
+        Err(e) => return Response::error(id, &format!("database error: {}", e)),
+    };
+
+    // 1. Find the task by wave-prefixed short ID
+    let task = match db::work_items::find_work_item_by_wave_short_id(&conn, &task_id_str) {
+        Ok(Some(t)) => t,
+        Ok(None) => {
+            return Response::error(id, &format!("NOT_FOUND: task '{}' not found", task_id_str))
+        }
+        Err(e) => return Response::error(id, &format!("database error: {}", e)),
+    };
+
+    // 2. Validate the task is in Failed state
+    if task.status != WorkItemStatus::Failed {
+        return Response::error(
+            id,
+            &format!(
+                "INVALID_STATE: task '{}' is in '{}' state, expected 'failed'",
+                task_id_str, task.status
+            ),
+        );
+    }
+
+    // Validate it's actually a task
+    if task.item_type != ItemType::Task {
+        return Response::error(
+            id,
+            &format!("INVALID_PARAMS: '{}' is not a task", task_id_str),
+        );
+    }
+
+    // 3. Find the parent story
+    let story_id = match task.parent_id {
+        Some(sid) => sid,
+        None => {
+            return Response::error(
+                id,
+                &format!("INVALID_STATE: task '{}' has no parent story", task_id_str),
+            )
+        }
+    };
+
+    let story = match db::work_items::get_work_item_by_id(&conn, &story_id) {
+        Ok(Some(s)) => s,
+        Ok(None) => {
+            return Response::error(
+                id,
+                &format!(
+                    "NOT_FOUND: parent story for task '{}' not found",
+                    task_id_str
+                ),
+            )
+        }
+        Err(e) => return Response::error(id, &format!("database error: {}", e)),
+    };
+
+    // 4. For impl tasks: reset worktree to previous task's commit_hash (or base if first)
+    let is_impl = task.kind == Some(TaskKind::Impl);
+    if is_impl {
+        if let Some(ref worktree_path) = story.worktree_path {
+            // Find the previous impl task in this story (lower sort_order, impl kind, done status)
+            let sibling_tasks = match db::work_items::list_work_items_by_parent(&conn, &story_id) {
+                Ok(t) => t,
+                Err(e) => return Response::error(id, &format!("database error: {}", e)),
+            };
+
+            let previous_commit: Option<String> = sibling_tasks
+                .iter()
+                .filter(|t| {
+                    t.item_type == ItemType::Task
+                        && t.kind == Some(TaskKind::Impl)
+                        && t.sort_order < task.sort_order
+                        && t.status == WorkItemStatus::Done
+                })
+                .max_by_key(|t| t.sort_order)
+                .and_then(|t| t.commit_hash.clone());
+
+            // Reset worktree: to previous task's commit or to base commit
+            let reset_target = if let Some(ref commit) = previous_commit {
+                commit.clone()
+            } else {
+                // Get base commit (the commit the worktree was created from)
+                let output = std::process::Command::new("git")
+                    .args(["reflog", "show", "HEAD", "--format=%H"])
+                    .current_dir(worktree_path)
+                    .output();
+
+                match output {
+                    Ok(out) if out.status.success() => {
+                        let stdout = String::from_utf8_lossy(&out.stdout);
+                        match stdout.trim().lines().last() {
+                            Some(hash) => hash.trim().to_string(),
+                            None => {
+                                return Response::error(
+                                    id,
+                                    "failed to determine base commit for worktree reset",
+                                )
+                            }
+                        }
+                    }
+                    _ => {
+                        return Response::error(
+                            id,
+                            "failed to determine base commit for worktree reset",
+                        )
+                    }
+                }
+            };
+
+            // git reset --hard <commit>
+            let reset_result = std::process::Command::new("git")
+                .args(["reset", "--hard", &reset_target])
+                .current_dir(worktree_path)
+                .output();
+
+            if let Err(e) = reset_result {
+                return Response::error(id, &format!("failed to reset worktree: {}", e));
+            }
+            let reset_output = reset_result.unwrap();
+            if !reset_output.status.success() {
+                let stderr = String::from_utf8_lossy(&reset_output.stderr);
+                return Response::error(
+                    id,
+                    &format!("failed to reset worktree: {}", stderr.trim()),
+                );
+            }
+
+            // git clean -fd
+            let _ = std::process::Command::new("git")
+                .args(["clean", "-fd"])
+                .current_dir(worktree_path)
+                .output();
+        }
+    }
+
+    // 5. Count retries
+    let retry_count = match db::agent_runs::count_agent_runs_for_task(&conn, &task.id) {
+        Ok(c) => c,
+        Err(e) => return Response::error(id, &format!("database error: {}", e)),
+    };
+
+    let warning = if retry_count >= 3 {
+        Some(format!(
+            "task has been retried {} times already",
+            retry_count
+        ))
+    } else {
+        None
+    };
+
+    // 6. Set task status to in_progress
+    if let Err(e) =
+        db::work_items::update_work_item_status(&conn, &task.id, WorkItemStatus::InProgress)
+    {
+        return Response::error(id, &format!("database error: {}", e));
+    }
+
+    // 7. Set story status back to in_progress (if it was failed)
+    if story.status == WorkItemStatus::Failed {
+        if let Err(e) =
+            db::work_items::update_work_item_status(&conn, &story_id, WorkItemStatus::InProgress)
+        {
+            return Response::error(id, &format!("database error: {}", e));
+        }
+    }
+
+    // 8. Find project for agent spawning
+    let session = match db::decomposition_sessions::get_decomposition_session(
+        &conn,
+        &task.decomposition_session_id,
+    ) {
+        Ok(Some(s)) => s,
+        Ok(None) => return Response::error(id, "NOT_FOUND: decomposition session not found"),
+        Err(e) => return Response::error(id, &format!("database error: {}", e)),
+    };
+
+    let project = match db::projects::get_project_by_id(&conn, &session.project_id) {
+        Ok(Some(p)) => p,
+        Ok(None) => return Response::error(id, "NOT_FOUND: project not found"),
+        Err(e) => return Response::error(id, &format!("database error: {}", e)),
+    };
+
+    // 9. Spawn Claude agent (sync — handlers run in spawn_blocking)
+    let worktree_path = match &story.worktree_path {
+        Some(p) => PathBuf::from(p),
+        None => {
+            return Response::error(
+                id,
+                &format!(
+                    "INVALID_STATE: story has no worktree, cannot retry task '{}'",
+                    task_id_str,
+                ),
+            )
+        }
+    };
+
+    let nflow_home = match crate::daemon::nflow_home() {
+        Ok(h) => h,
+        Err(e) => return Response::error(id, &format!("failed to get nflow home: {}", e)),
+    };
+
+    let is_verify = task.kind == Some(TaskKind::Verify);
+    let override_dir = nflow_home.join("prompts");
+    let override_path = if override_dir.is_dir() {
+        Some(override_dir)
+    } else {
+        None
+    };
+
+    let template_name = if is_verify {
+        "verify_task"
+    } else {
+        "task_execution"
+    };
+    let template =
+        match nflow_claude::prompt::load_template(template_name, override_path.as_deref()) {
+            Ok(t) => t,
+            Err(e) => {
+                return Response::error(id, &format!("failed to load prompt template: {}", e))
+            }
+        };
+
+    // Build template context
+    let sibling_tasks = match db::work_items::list_work_items_by_parent(&conn, &story_id) {
+        Ok(t) => t,
+        Err(e) => return Response::error(id, &format!("database error: {}", e)),
+    };
+
+    let vars_map = if is_verify {
+        let impl_task = sibling_tasks
+            .iter()
+            .find(|t| {
+                t.item_type == ItemType::Task
+                    && t.kind == Some(TaskKind::Impl)
+                    && t.parent_id == task.parent_id
+                    && t.sort_order == task.sort_order - 1
+            })
+            .unwrap_or(&task);
+        nflow_claude::context::build_verify_context(&task, impl_task, &project.name)
+    } else {
+        let completed: Vec<_> = sibling_tasks
+            .iter()
+            .filter(|t| {
+                t.item_type == ItemType::Task
+                    && t.kind == Some(TaskKind::Impl)
+                    && t.status == WorkItemStatus::Done
+            })
+            .cloned()
+            .collect();
+
+        let previous_error = match db::agent_runs::find_latest_agent_run_for_task(&conn, &task.id) {
+            Ok(Some(run)) => run.error_message.unwrap_or_default(),
+            _ => String::new(),
+        };
+
+        nflow_claude::context::build_task_context(&task, &project.name, &completed, &previous_error)
+    };
+
+    let vars_ref: std::collections::HashMap<&str, &str> = vars_map
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+
+    let rendered_prompt = match nflow_claude::prompt::render_template(&template, &vars_ref) {
+        Ok(p) => p,
+        Err(e) => return Response::error(id, &format!("failed to render prompt: {}", e)),
+    };
+
+    let agent_logs_dir = nflow_home
+        .join("projects")
+        .join(&project.name)
+        .join("agent-logs");
+    if let Err(e) = std::fs::create_dir_all(&agent_logs_dir) {
+        return Response::error(id, &format!("failed to create agent-logs dir: {}", e));
+    }
+
+    let prompt_file_path = agent_logs_dir.join(format!("{}.prompt.md", task.short_id));
+    if let Err(e) = std::fs::write(&prompt_file_path, &rendered_prompt) {
+        return Response::error(id, &format!("failed to write prompt file: {}", e));
+    }
+
+    let task_prompt = format!(
+        "Implement the task as described in the system prompt file. Task: [{}] {}",
+        task.short_id, task.title
+    );
+
+    let mut run_config = if is_verify {
+        nflow_claude::runner::RunConfig::for_verify_task(task_prompt)
+    } else {
+        nflow_claude::runner::RunConfig::for_impl_task(task_prompt)
+    };
+    run_config.working_dir = Some(worktree_path);
+    run_config.system_prompt_file = Some(prompt_file_path);
+
+    let runner = nflow_claude::runner::ClaudeRunner::new();
+    let process = match runner.spawn(&run_config) {
+        Ok(p) => p,
+        Err(e) => {
+            // Revert task to failed
+            let _ =
+                db::work_items::update_work_item_status(&conn, &task.id, WorkItemStatus::Failed);
+            return Response::error(id, &format!("failed to spawn Claude agent: {}", e));
+        }
+    };
+
+    let pid = process.pid;
+    let pid_start_time = crate::recovery::read_process_start_time(pid);
+
+    let log_path = agent_logs_dir.join(format!("{}.log", task.short_id));
+    let log_path_str = log_path.to_string_lossy().to_string();
+
+    let agent_run = db::agent_runs::AgentRun {
+        id: uuid::Uuid::new_v4(),
+        work_item_id: task.id,
+        pid: Some(pid),
+        session_id: None,
+        pid_start_time,
+        status: db::agent_runs::AgentRunStatus::Running,
+        exit_code: None,
+        log_path: Some(log_path_str),
+        error_message: None,
+        started_at: chrono::Utc::now(),
+        finished_at: None,
+    };
+
+    if let Err(e) = db::agent_runs::insert_agent_run(&conn, &agent_run) {
+        return Response::error(id, &format!("database error: {}", e));
+    }
+
+    // Spawn background task to pipe stdout to log file
+    let mut stdout = process.stdout;
+    let _stderr = process.stderr;
+    let _child = process.child;
+
+    tokio::spawn(async move {
+        let log_file = match tokio::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+            .await
+        {
+            Ok(f) => f,
+            Err(_) => return,
+        };
+        let mut writer = tokio::io::BufWriter::new(log_file);
+
+        while let Ok(Some(line)) = stdout.next_line().await {
+            use tokio::io::AsyncWriteExt;
+            let _ = writer.write_all(line.as_bytes()).await;
+            let _ = writer.write_all(b"\n").await;
+            let _ = writer.flush().await;
+        }
+    });
+
+    // 10. Return response
+    let mut response_data = serde_json::json!({
+        "task_id": task_id_str,
+        "retry_count": retry_count + 1,
+    });
+
+    if let Some(ref w) = warning {
+        response_data["warning"] = serde_json::json!(w);
+    }
+
+    Response::ok(id, response_data)
 }
 
 #[cfg(test)]
@@ -6361,6 +6747,164 @@ mod tests {
                     .as_str()
                     .unwrap()
                     .contains("missing required parameter"));
+            }
+            _ => panic!("expected Single response"),
+        }
+        cleanup_db(&db_dir);
+    }
+
+    // --- exec.retry tests ---
+
+    #[test]
+    fn test_exec_retry_missing_task_id() {
+        let (state, db_dir) = make_db_state("exec_retry_missing");
+        let req = Request {
+            id: "400".to_string(),
+            command: "exec.retry".to_string(),
+            params: serde_json::json!({}),
+        };
+        match dispatch(req, &state) {
+            HandlerResult::Single(resp) => {
+                assert_eq!(resp.status, crate::socket::ResponseStatus::Error);
+                assert!(resp.data["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("missing required parameter"));
+            }
+            _ => panic!("expected Single response"),
+        }
+        cleanup_db(&db_dir);
+    }
+
+    #[test]
+    fn test_exec_retry_task_not_found() {
+        let (state, db_dir) = make_db_state("exec_retry_notfound");
+        let req = Request {
+            id: "401".to_string(),
+            command: "exec.retry".to_string(),
+            params: serde_json::json!({ "task_id": "W1-T99" }),
+        };
+        match dispatch(req, &state) {
+            HandlerResult::Single(resp) => {
+                assert_eq!(resp.status, crate::socket::ResponseStatus::Error);
+                assert!(resp.data["message"].as_str().unwrap().contains("NOT_FOUND"));
+            }
+            _ => panic!("expected Single response"),
+        }
+        cleanup_db(&db_dir);
+    }
+
+    #[test]
+    fn test_exec_retry_invalid_format() {
+        let (state, db_dir) = make_db_state("exec_retry_invalid");
+        let req = Request {
+            id: "402".to_string(),
+            command: "exec.retry".to_string(),
+            params: serde_json::json!({ "task_id": "invalid" }),
+        };
+        match dispatch(req, &state) {
+            HandlerResult::Single(resp) => {
+                assert_eq!(resp.status, crate::socket::ResponseStatus::Error);
+                assert!(resp.data["message"].as_str().unwrap().contains("NOT_FOUND"));
+            }
+            _ => panic!("expected Single response"),
+        }
+        cleanup_db(&db_dir);
+    }
+
+    #[test]
+    fn test_exec_retry_task_not_failed() {
+        let (state, db_dir) = make_db_state("exec_retry_notfailed");
+        let project_id = insert_test_project(&state, "retry-proj");
+        let conn = db::open_connection(&state.db_path).unwrap();
+
+        // Create session (wave 1), epic, story, task
+        let session_id = uuid::Uuid::new_v4();
+        conn.execute(
+            "INSERT INTO decomposition_sessions (id, project_id, wave_number, status, created_at, updated_at)
+             VALUES (?1, ?2, 1, 'approved', '2024-01-01T00:00:00Z', '2024-01-01T00:00:00Z')",
+            rusqlite::params![session_id.to_string(), project_id.to_string()],
+        )
+        .unwrap();
+
+        let epic_id = uuid::Uuid::new_v4();
+        conn.execute(
+            "INSERT INTO work_items (id, decomposition_session_id, item_type, title, description, status, short_id, sort_order, created_at, updated_at)
+             VALUES (?1, ?2, 'epic', 'Epic', 'desc', 'in_progress', 'E1', 0, '2024-01-01T00:00:00Z', '2024-01-01T00:00:00Z')",
+            rusqlite::params![epic_id.to_string(), session_id.to_string()],
+        )
+        .unwrap();
+
+        let story_id = uuid::Uuid::new_v4();
+        conn.execute(
+            "INSERT INTO work_items (id, parent_id, decomposition_session_id, item_type, title, description, status, short_id, sort_order, created_at, updated_at)
+             VALUES (?1, ?2, ?3, 'story', 'Story', 'desc', 'in_progress', 'S1', 0, '2024-01-01T00:00:00Z', '2024-01-01T00:00:00Z')",
+            rusqlite::params![story_id.to_string(), epic_id.to_string(), session_id.to_string()],
+        )
+        .unwrap();
+
+        let task_id = uuid::Uuid::new_v4();
+        conn.execute(
+            "INSERT INTO work_items (id, parent_id, decomposition_session_id, item_type, kind, title, description, status, short_id, sort_order, created_at, updated_at)
+             VALUES (?1, ?2, ?3, 'task', 'impl', 'Task 1', 'desc', 'pending', 'T1', 0, '2024-01-01T00:00:00Z', '2024-01-01T00:00:00Z')",
+            rusqlite::params![task_id.to_string(), story_id.to_string(), session_id.to_string()],
+        )
+        .unwrap();
+        drop(conn);
+
+        let req = Request {
+            id: "403".to_string(),
+            command: "exec.retry".to_string(),
+            params: serde_json::json!({ "task_id": "W1-T1" }),
+        };
+        match dispatch(req, &state) {
+            HandlerResult::Single(resp) => {
+                assert_eq!(resp.status, crate::socket::ResponseStatus::Error);
+                assert!(resp.data["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("INVALID_STATE"));
+            }
+            _ => panic!("expected Single response"),
+        }
+        cleanup_db(&db_dir);
+    }
+
+    #[test]
+    fn test_exec_retry_not_a_task() {
+        let (state, db_dir) = make_db_state("exec_retry_notatask");
+        let project_id = insert_test_project(&state, "retry-proj2");
+        let conn = db::open_connection(&state.db_path).unwrap();
+
+        let session_id = uuid::Uuid::new_v4();
+        conn.execute(
+            "INSERT INTO decomposition_sessions (id, project_id, wave_number, status, created_at, updated_at)
+             VALUES (?1, ?2, 1, 'approved', '2024-01-01T00:00:00Z', '2024-01-01T00:00:00Z')",
+            rusqlite::params![session_id.to_string(), project_id.to_string()],
+        )
+        .unwrap();
+
+        let epic_id = uuid::Uuid::new_v4();
+        conn.execute(
+            "INSERT INTO work_items (id, decomposition_session_id, item_type, title, description, status, short_id, sort_order, created_at, updated_at)
+             VALUES (?1, ?2, 'epic', 'Epic', 'desc', 'failed', 'E1', 0, '2024-01-01T00:00:00Z', '2024-01-01T00:00:00Z')",
+            rusqlite::params![epic_id.to_string(), session_id.to_string()],
+        )
+        .unwrap();
+        drop(conn);
+
+        // Trying to retry an epic should fail
+        let req = Request {
+            id: "404".to_string(),
+            command: "exec.retry".to_string(),
+            params: serde_json::json!({ "task_id": "W1-E1" }),
+        };
+        match dispatch(req, &state) {
+            HandlerResult::Single(resp) => {
+                assert_eq!(resp.status, crate::socket::ResponseStatus::Error);
+                // Should fail either on INVALID_STATE (not failed) or INVALID_PARAMS (not a task)
+                let msg = resp.data["message"].as_str().unwrap();
+                assert!(msg.contains("INVALID") || msg.contains("not a task"));
             }
             _ => panic!("expected Single response"),
         }

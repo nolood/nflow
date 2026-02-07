@@ -1,4 +1,6 @@
 ## Codebase Patterns
+- Wave-prefixed short IDs: "W{wave}-{short_id}" format. Use find_work_item_by_wave_short_id() to look up by parsing wave number and joining on decomposition_sessions.
+- Handlers that need to spawn Claude agents must inline the spawning logic (not call start_task_execution) because Connection isn't Send across async boundaries. Use std::process::Command for sync git ops, ClaudeRunner::spawn() for sync process creation, tokio::spawn only for log piping.
 - Story completion lifecycle: rebase → push → MR creation → DB update → worktree cleanup → event broadcast (all in execute_complete_story)
 - On any failure during story completion (rebase/push/MR), story is rolled back to Failed status via fail_story_on_completion_error()
 - Wall-clock timeout: check_agent_timeouts() runs as Phase 0.5 in scheduler_tick (after reaping, before scheduling). Uses nix SIGTERM→sleep(10s)→SIGKILL pattern.
@@ -1571,4 +1573,28 @@ Started: Sat Feb  7 03:49:10 PM MSK 2026
   - Story/epic started_at from created_at, finished_at from updated_at only when in terminal state (Done/Failed/Cancelled)
   - Reuses existing DB queries: count_agent_runs_for_task, find_latest_agent_run_for_task, list_work_items_by_session
   - Summary counts iterate stories and match on WorkItemStatus enum variants — no DB aggregation needed
+---
+
+## 2026-02-07 - US-061
+- What was implemented: exec.retry command handler for retrying failed tasks
+  - find_work_item_by_wave_short_id() DB function: parses "W{wave}-{short_id}" and joins on decomposition_sessions
+  - parse_wave_prefix() helper: extracts (wave_number, short_id) from wave-prefixed IDs
+  - handle_exec_retry handler: validates failed state, resets worktree for impl tasks, updates task/story status, spawns Claude agent
+  - For impl tasks: finds previous task's commit_hash and runs git reset --hard, or uses reflog to find base commit
+  - For verify tasks: no worktree reset needed
+  - Retry counting via count_agent_runs_for_task(), warning at 3+ retries
+  - Previous error context passed to Claude via build_task_context()
+  - Agent spawning inlined in handler (not via start_task_execution) due to Connection Send constraints
+  - Dispatch route: "exec.retry" added
+  - 11 new tests: parse_wave_prefix (valid/invalid), find_work_item_by_wave_short_id (found/not found/wrong wave/invalid), exec.retry handler (missing params, not found, invalid format, not failed, not a task)
+- Files changed:
+  - crates/nflow-daemon/src/db/work_items.rs (find_work_item_by_wave_short_id, parse_wave_prefix + 6 tests)
+  - crates/nflow-daemon/src/handlers.rs (handle_exec_retry, dispatch route, TaskKind import + 5 tests)
+- **Learnings for future iterations:**
+  - Connection is not Send — can't hold it across .await in tokio::spawn. Inline agent spawning in handlers instead of calling async start_task_execution
+  - ClaudeRunner::spawn() is sync — can be called from spawn_blocking handler context
+  - tokio::spawn from spawn_blocking works for fire-and-forget async work (log piping) as long as captured types are Send
+  - Wave-prefixed short IDs stored as bare short_id in DB (e.g., "T1"), wave prefix comes from session's wave_number
+  - Git worktree reset for retry: git reset --hard to previous impl task's commit_hash, or reflog last entry for base commit
+  - read_process_start_time() from recovery.rs is reusable for agent PID tracking
 ---

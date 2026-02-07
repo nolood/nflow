@@ -356,6 +356,44 @@ pub fn has_in_progress_stories_by_session(conn: &Connection, session_id: &Uuid) 
     Ok(count > 0)
 }
 
+/// Find a work item by its wave-prefixed short ID (e.g., "W1-T1").
+/// Parses the wave number from the prefix and looks up the item by short_id
+/// within the matching decomposition session.
+pub fn find_work_item_by_wave_short_id(
+    conn: &Connection,
+    wave_short_id: &str,
+) -> Result<Option<WorkItem>> {
+    // Parse "W{wave}-{short_id}" format
+    let (wave_number, short_id) = match parse_wave_prefix(wave_short_id) {
+        Some(parsed) => parsed,
+        None => return Ok(None),
+    };
+
+    let mut stmt = conn.prepare(
+        "SELECT w.id, w.parent_id, w.decomposition_session_id, w.item_type, w.kind, w.title, w.description, w.acceptance_criteria, w.status, w.short_id, w.sort_order, w.branch_name, w.worktree_path, w.mr_url, w.commit_hash, w.created_at, w.updated_at
+         FROM work_items w
+         JOIN decomposition_sessions ds ON w.decomposition_session_id = ds.id
+         WHERE w.short_id = ?1 AND ds.wave_number = ?2",
+    )?;
+    let mut rows = stmt.query_map(params![short_id, wave_number], row_to_work_item)?;
+    match rows.next() {
+        Some(row) => Ok(Some(row?)),
+        None => Ok(None),
+    }
+}
+
+/// Parse a wave-prefixed short ID like "W1-T1" into (wave_number, short_id).
+fn parse_wave_prefix(wave_short_id: &str) -> Option<(u32, &str)> {
+    let rest = wave_short_id.strip_prefix('W')?;
+    let dash_pos = rest.find('-')?;
+    let wave_number: u32 = rest[..dash_pos].parse().ok()?;
+    let short_id = &rest[dash_pos + 1..];
+    if short_id.is_empty() {
+        return None;
+    }
+    Some((wave_number, short_id))
+}
+
 /// Cancel all in-progress work items for a project.
 /// Returns the number of items cancelled.
 pub fn cancel_in_progress_items_by_project(conn: &Connection, project_id: &Uuid) -> Result<u64> {
@@ -1040,5 +1078,76 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM work_items", [], |row| row.get(0))
             .unwrap();
         assert_eq!(count, 1);
+    }
+
+    // --- parse_wave_prefix ---
+
+    #[test]
+    fn test_parse_wave_prefix_valid() {
+        assert_eq!(parse_wave_prefix("W1-T1"), Some((1, "T1")));
+        assert_eq!(parse_wave_prefix("W2-S3"), Some((2, "S3")));
+        assert_eq!(parse_wave_prefix("W10-T1v"), Some((10, "T1v")));
+        assert_eq!(parse_wave_prefix("W1-E1"), Some((1, "E1")));
+    }
+
+    #[test]
+    fn test_parse_wave_prefix_invalid() {
+        assert_eq!(parse_wave_prefix("T1"), None);
+        assert_eq!(parse_wave_prefix("W-T1"), None);
+        assert_eq!(parse_wave_prefix("W1-"), None);
+        assert_eq!(parse_wave_prefix(""), None);
+        assert_eq!(parse_wave_prefix("X1-T1"), None);
+        assert_eq!(parse_wave_prefix("Wabc-T1"), None);
+    }
+
+    // --- find_work_item_by_wave_short_id ---
+
+    #[test]
+    fn test_find_work_item_by_wave_short_id_found() {
+        let conn = test_conn();
+        let pid = make_project(&conn);
+        let sid = make_session(&conn, pid); // wave 1
+        let epic = make_epic(sid);
+        insert_work_item(&conn, &epic).unwrap();
+
+        let task = make_task(epic.id, sid, "T1", 0);
+        insert_work_item(&conn, &task).unwrap();
+
+        let found = find_work_item_by_wave_short_id(&conn, "W1-T1").unwrap();
+        assert!(found.is_some());
+        assert_eq!(found.unwrap().id, task.id);
+    }
+
+    #[test]
+    fn test_find_work_item_by_wave_short_id_not_found() {
+        let conn = test_conn();
+        let pid = make_project(&conn);
+        let _sid = make_session(&conn, pid);
+
+        let found = find_work_item_by_wave_short_id(&conn, "W1-T99").unwrap();
+        assert!(found.is_none());
+    }
+
+    #[test]
+    fn test_find_work_item_by_wave_short_id_wrong_wave() {
+        let conn = test_conn();
+        let pid = make_project(&conn);
+        let sid = make_session(&conn, pid); // wave 1
+        let epic = make_epic(sid);
+        insert_work_item(&conn, &epic).unwrap();
+
+        let task = make_task(epic.id, sid, "T1", 0);
+        insert_work_item(&conn, &task).unwrap();
+
+        // Wrong wave number
+        let found = find_work_item_by_wave_short_id(&conn, "W2-T1").unwrap();
+        assert!(found.is_none());
+    }
+
+    #[test]
+    fn test_find_work_item_by_wave_short_id_invalid_format() {
+        let conn = test_conn();
+        let found = find_work_item_by_wave_short_id(&conn, "invalid").unwrap();
+        assert!(found.is_none());
     }
 }
