@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use crate::error::Result;
+use crate::error::{GitError, Result};
 use crate::worktree::{run_git_command, validate_git_repo};
 
 /// Creates a new branch in the given worktree via `git checkout -b`.
@@ -88,6 +88,74 @@ pub async fn get_commit_message(worktree_path: &Path) -> Result<String> {
     validate_git_repo(worktree_path).await?;
     let output = run_git_command(worktree_path, &["log", "-1", "--format=%B"]).await?;
     Ok(output.trim().to_string())
+}
+
+/// Fetches the latest changes from origin and rebases the current branch onto `origin/{base_branch}`.
+///
+/// On rebase conflict: aborts the rebase and returns `GitError::RebaseConflict`.
+pub async fn fetch_and_rebase(worktree_path: &Path, base_branch: &str) -> Result<()> {
+    validate_git_repo(worktree_path).await?;
+
+    // Fetch latest from origin
+    run_git_command(worktree_path, &["fetch", "origin", base_branch]).await?;
+
+    // Attempt rebase
+    let remote_ref = format!("origin/{base_branch}");
+    let result = run_git_command(worktree_path, &["rebase", &remote_ref]).await;
+
+    match result {
+        Ok(_) => Ok(()),
+        Err(GitError::CommandFailed(msg)) => {
+            // Abort the rebase to restore clean state
+            let _ = run_git_command(worktree_path, &["rebase", "--abort"]).await;
+            Err(GitError::RebaseConflict { details: msg })
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Pushes a branch to the remote with tracking (`git push -u origin {branch_name}`).
+///
+/// Classifies push failures into distinct error types:
+/// - `AuthError`: authentication/permission failures
+/// - `NetworkError`: network connectivity issues
+/// - `BranchProtection`: branch protection rule violations
+/// - `CommandFailed`: other push failures
+pub async fn push_branch(worktree_path: &Path, branch_name: &str) -> Result<()> {
+    validate_git_repo(worktree_path).await?;
+
+    let result = run_git_command(worktree_path, &["push", "-u", "origin", branch_name]).await;
+
+    match result {
+        Ok(_) => Ok(()),
+        Err(GitError::CommandFailed(msg)) => {
+            let lower = msg.to_lowercase();
+            if lower.contains("authentication")
+                || lower.contains("permission denied")
+                || lower.contains("could not read from remote")
+                || lower.contains("invalid credentials")
+                || lower.contains("authorization")
+            {
+                Err(GitError::AuthError(msg))
+            } else if lower.contains("could not resolve host")
+                || lower.contains("unable to access")
+                || lower.contains("connection refused")
+                || lower.contains("network")
+                || lower.contains("timed out")
+            {
+                Err(GitError::NetworkError(msg))
+            } else if lower.contains("protected branch")
+                || lower.contains("denied to")
+                || lower.contains("pre-receive hook declined")
+                || lower.contains("required status check")
+            {
+                Err(GitError::BranchProtection(msg))
+            } else {
+                Err(GitError::CommandFailed(msg))
+            }
+        }
+        Err(e) => Err(e),
+    }
 }
 
 #[cfg(test)]
@@ -366,5 +434,329 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let result = get_commit_message(dir.path()).await;
         assert!(result.is_err());
+    }
+
+    // --- fetch_and_rebase tests ---
+
+    /// Helper: create a repo with remote (bare origin + clone), same as worktree tests.
+    async fn setup_repo_with_remote() -> (TempDir, PathBuf, PathBuf) {
+        let dir = TempDir::new().unwrap();
+        let bare_path = dir.path().join("origin.git");
+        let clone_path = dir.path().join("repo");
+
+        // Create bare repo
+        std::fs::create_dir_all(&bare_path).unwrap();
+        tokio::process::Command::new("git")
+            .args(["init", "--bare", "--initial-branch=main"])
+            .current_dir(&bare_path)
+            .output()
+            .await
+            .unwrap();
+
+        // Clone it
+        tokio::process::Command::new("git")
+            .args([
+                "clone",
+                bare_path.to_str().unwrap(),
+                clone_path.to_str().unwrap(),
+            ])
+            .output()
+            .await
+            .unwrap();
+
+        // Configure user in clone
+        tokio::process::Command::new("git")
+            .args(["config", "user.email", "test@test.com"])
+            .current_dir(&clone_path)
+            .output()
+            .await
+            .unwrap();
+        tokio::process::Command::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(&clone_path)
+            .output()
+            .await
+            .unwrap();
+
+        // Create initial commit on main and push
+        let readme = clone_path.join("README.md");
+        std::fs::write(&readme, "# test\n").unwrap();
+        tokio::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(&clone_path)
+            .output()
+            .await
+            .unwrap();
+        tokio::process::Command::new("git")
+            .args(["commit", "-m", "initial"])
+            .current_dir(&clone_path)
+            .output()
+            .await
+            .unwrap();
+        tokio::process::Command::new("git")
+            .args(["push", "origin", "main"])
+            .current_dir(&clone_path)
+            .output()
+            .await
+            .unwrap();
+
+        (dir, bare_path, clone_path)
+    }
+
+    #[tokio::test]
+    async fn test_fetch_and_rebase_success_no_changes() {
+        let (_dir, _bare, repo) = setup_repo_with_remote().await;
+
+        // Create a feature branch
+        create_branch(&repo, "feature/rebase-test").await.unwrap();
+
+        // Rebase on main — no divergence, should succeed trivially
+        let result = fetch_and_rebase(&repo, "main").await;
+        assert!(
+            result.is_ok(),
+            "fetch_and_rebase failed: {:?}",
+            result.unwrap_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fetch_and_rebase_success_with_upstream_changes() {
+        let (dir, bare, repo) = setup_repo_with_remote().await;
+
+        // Create a feature branch with a commit
+        create_branch(&repo, "feature/rebase-upstream")
+            .await
+            .unwrap();
+        std::fs::write(repo.join("feature.txt"), "feature work").unwrap();
+        run_git_command(&repo, &["add", "."]).await.unwrap();
+        run_git_command(&repo, &["commit", "-m", "feature commit"])
+            .await
+            .unwrap();
+
+        // Simulate upstream changes: create another clone, push to main
+        let other_clone = dir.path().join("other");
+        tokio::process::Command::new("git")
+            .args([
+                "clone",
+                bare.to_str().unwrap(),
+                other_clone.to_str().unwrap(),
+            ])
+            .output()
+            .await
+            .unwrap();
+        tokio::process::Command::new("git")
+            .args(["config", "user.email", "other@test.com"])
+            .current_dir(&other_clone)
+            .output()
+            .await
+            .unwrap();
+        tokio::process::Command::new("git")
+            .args(["config", "user.name", "Other"])
+            .current_dir(&other_clone)
+            .output()
+            .await
+            .unwrap();
+        std::fs::write(other_clone.join("upstream.txt"), "upstream change").unwrap();
+        run_git_command(&other_clone, &["add", "."]).await.unwrap();
+        run_git_command(&other_clone, &["commit", "-m", "upstream commit"])
+            .await
+            .unwrap();
+        run_git_command(&other_clone, &["push", "origin", "main"])
+            .await
+            .unwrap();
+
+        // Now rebase feature branch onto updated main — should succeed (no conflict)
+        let result = fetch_and_rebase(&repo, "main").await;
+        assert!(
+            result.is_ok(),
+            "fetch_and_rebase with upstream changes failed: {:?}",
+            result.unwrap_err()
+        );
+
+        // Verify upstream file is now visible
+        assert!(
+            repo.join("upstream.txt").exists(),
+            "Upstream file should be present after rebase"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fetch_and_rebase_conflict() {
+        let (dir, bare, repo) = setup_repo_with_remote().await;
+
+        // Create a feature branch that modifies README.md
+        create_branch(&repo, "feature/conflict").await.unwrap();
+        std::fs::write(repo.join("README.md"), "feature changes to readme\n").unwrap();
+        run_git_command(&repo, &["add", "."]).await.unwrap();
+        run_git_command(&repo, &["commit", "-m", "feature: modify readme"])
+            .await
+            .unwrap();
+
+        // Simulate conflicting upstream change on same file
+        let other_clone = dir.path().join("other");
+        tokio::process::Command::new("git")
+            .args([
+                "clone",
+                bare.to_str().unwrap(),
+                other_clone.to_str().unwrap(),
+            ])
+            .output()
+            .await
+            .unwrap();
+        tokio::process::Command::new("git")
+            .args(["config", "user.email", "other@test.com"])
+            .current_dir(&other_clone)
+            .output()
+            .await
+            .unwrap();
+        tokio::process::Command::new("git")
+            .args(["config", "user.name", "Other"])
+            .current_dir(&other_clone)
+            .output()
+            .await
+            .unwrap();
+        std::fs::write(
+            other_clone.join("README.md"),
+            "upstream changes to readme\n",
+        )
+        .unwrap();
+        run_git_command(&other_clone, &["add", "."]).await.unwrap();
+        run_git_command(&other_clone, &["commit", "-m", "upstream: modify readme"])
+            .await
+            .unwrap();
+        run_git_command(&other_clone, &["push", "origin", "main"])
+            .await
+            .unwrap();
+
+        // Rebase should detect conflict and abort
+        let result = fetch_and_rebase(&repo, "main").await;
+        assert!(result.is_err(), "Expected rebase conflict error");
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, GitError::RebaseConflict { .. }),
+            "Expected RebaseConflict, got: {:?}",
+            err
+        );
+
+        // Verify rebase was aborted (no .git/rebase-apply or rebase-merge dir)
+        // The branch should be clean after abort
+        let status = run_git_command(&repo, &["status", "--porcelain"])
+            .await
+            .unwrap();
+        assert!(
+            status.trim().is_empty(),
+            "Working tree should be clean after rebase abort, got: {}",
+            status
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fetch_and_rebase_not_a_repo() {
+        let dir = TempDir::new().unwrap();
+        let fake = dir.path().join("not-a-repo");
+        std::fs::create_dir_all(&fake).unwrap();
+
+        let result = fetch_and_rebase(&fake, "main").await;
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            GitError::NotAGitRepository(_)
+        ));
+    }
+
+    // --- push_branch tests ---
+
+    #[tokio::test]
+    async fn test_push_branch_success() {
+        let (_dir, _bare, repo) = setup_repo_with_remote().await;
+
+        // Create a feature branch with a commit
+        create_branch(&repo, "feature/push-test").await.unwrap();
+        std::fs::write(repo.join("push.txt"), "push content").unwrap();
+        run_git_command(&repo, &["add", "."]).await.unwrap();
+        run_git_command(&repo, &["commit", "-m", "push test commit"])
+            .await
+            .unwrap();
+
+        // Push the branch
+        let result = push_branch(&repo, "feature/push-test").await;
+        assert!(
+            result.is_ok(),
+            "push_branch failed: {:?}",
+            result.unwrap_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_push_branch_sets_upstream() {
+        let (_dir, _bare, repo) = setup_repo_with_remote().await;
+
+        create_branch(&repo, "feature/upstream-test").await.unwrap();
+        std::fs::write(repo.join("upstream.txt"), "content").unwrap();
+        run_git_command(&repo, &["add", "."]).await.unwrap();
+        run_git_command(&repo, &["commit", "-m", "upstream test"])
+            .await
+            .unwrap();
+
+        push_branch(&repo, "feature/upstream-test").await.unwrap();
+
+        // Verify upstream is set
+        let tracking = run_git_command(
+            &repo,
+            &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"],
+        )
+        .await
+        .unwrap();
+        assert_eq!(tracking.trim(), "origin/feature/upstream-test");
+    }
+
+    #[tokio::test]
+    async fn test_push_branch_not_a_repo() {
+        let dir = TempDir::new().unwrap();
+        let fake = dir.path().join("not-a-repo");
+        std::fs::create_dir_all(&fake).unwrap();
+
+        let result = push_branch(&fake, "some-branch").await;
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            GitError::NotAGitRepository(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_push_branch_nonexistent_remote() {
+        let dir = TempDir::new().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+
+        // Init repo without a remote
+        tokio::process::Command::new("git")
+            .args(["init", "--initial-branch=main"])
+            .current_dir(&repo)
+            .output()
+            .await
+            .unwrap();
+        tokio::process::Command::new("git")
+            .args(["config", "user.email", "test@test.com"])
+            .current_dir(&repo)
+            .output()
+            .await
+            .unwrap();
+        tokio::process::Command::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(&repo)
+            .output()
+            .await
+            .unwrap();
+        std::fs::write(repo.join("f.txt"), "x").unwrap();
+        run_git_command(&repo, &["add", "."]).await.unwrap();
+        run_git_command(&repo, &["commit", "-m", "init"])
+            .await
+            .unwrap();
+
+        // Push should fail (no remote named "origin")
+        let result = push_branch(&repo, "main").await;
+        assert!(result.is_err(), "Expected push to fail without remote");
     }
 }
