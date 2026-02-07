@@ -2,9 +2,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use nflow_core::project::{CreateProjectParams, GitProvider, ProjectService};
+use nflow_core::spec::Spec;
 
 use crate::db;
-use crate::socket::{HandlerResult, Request, Response};
+use crate::socket::{HandlerResult, Request, Response, StreamingResponseLine};
 
 /// Helper to convert GitProvider to string for JSON response.
 fn git_provider_str(provider: GitProvider) -> &'static str {
@@ -34,6 +35,7 @@ fn dispatch(req: Request, state: &HandlerState) -> HandlerResult {
         "project.init" => HandlerResult::Single(handle_project_init(req, state)),
         "project.list" => HandlerResult::Single(handle_project_list(req, state)),
         "project.delete" => HandlerResult::Single(handle_project_delete(req, state)),
+        "spec.new" => handle_spec_new(req, state),
         _ => HandlerResult::Single(Response::error(
             req.id,
             &format!("unknown command: {}", req.command),
@@ -284,6 +286,257 @@ fn handle_project_delete(req: Request, state: &HandlerState) -> Response {
             "worktrees_removed": worktree_paths.len(),
         }),
     )
+}
+
+/// Handle "spec.new" command — start a new spec session.
+///
+/// Receives: { project_name, spec_name, with_codebase? }
+/// Returns streaming: initial { spec_id, name, status: "draft" }, then Claude output lines.
+fn handle_spec_new(req: Request, state: &HandlerState) -> HandlerResult {
+    let id = req.id.clone();
+
+    // Parse required params
+    let project_name = match req.params.get("project_name").and_then(|v| v.as_str()) {
+        Some(n) => n.to_string(),
+        None => {
+            return HandlerResult::Single(Response::error(
+                id,
+                "missing required parameter: project_name",
+            ));
+        }
+    };
+
+    let spec_name = match req.params.get("spec_name").and_then(|v| v.as_str()) {
+        Some(n) => n.to_string(),
+        None => {
+            return HandlerResult::Single(Response::error(
+                id,
+                "missing required parameter: spec_name",
+            ));
+        }
+    };
+
+    let with_codebase = req
+        .params
+        .get("with_codebase")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+
+    // Open DB connection
+    let conn = match db::open_connection(&state.db_path) {
+        Ok(c) => c,
+        Err(e) => {
+            return HandlerResult::Single(Response::error(id, &format!("database error: {}", e)));
+        }
+    };
+
+    // Find project by name
+    let project = match db::projects::get_project_by_name(&conn, &project_name) {
+        Ok(Some(p)) => p,
+        Ok(None) => {
+            return HandlerResult::Single(Response::error(
+                id,
+                &format!("NOT_FOUND: project '{}' not found", project_name),
+            ));
+        }
+        Err(e) => {
+            return HandlerResult::Single(Response::error(id, &format!("database error: {}", e)));
+        }
+    };
+
+    // Validate no active spec session for this project
+    match db::specs::has_active_spec_session(&conn, &project.id) {
+        Ok(true) => {
+            return HandlerResult::Single(Response::error(
+                id,
+                "INVALID_STATE: a spec session is already active for this project",
+            ));
+        }
+        Ok(false) => {}
+        Err(e) => {
+            return HandlerResult::Single(Response::error(id, &format!("database error: {}", e)));
+        }
+    }
+
+    // Build the spec file path
+    let nflow_home = match crate::daemon::nflow_home() {
+        Ok(h) => h,
+        Err(e) => {
+            return HandlerResult::Single(Response::error(
+                id,
+                &format!("failed to get nflow home: {}", e),
+            ));
+        }
+    };
+    let spec_file_path = nflow_home
+        .join("projects")
+        .join(&project.name)
+        .join("specs")
+        .join(format!("{}.md", &spec_name));
+
+    // Create spec record with status=draft, session_active=true
+    let mut spec = Spec::new(
+        project.id,
+        spec_name.clone(),
+        spec_file_path.to_string_lossy().to_string(),
+    );
+    spec.start_session().unwrap(); // safe: session_active starts as false in new()
+
+    // Insert spec into DB
+    if let Err(e) = db::specs::insert_spec(&conn, &spec) {
+        return HandlerResult::Single(Response::error(id, &format!("database error: {}", e)));
+    }
+
+    // Load and render the spec_session template
+    let override_dir = nflow_home.join("prompts");
+    let override_path = if override_dir.is_dir() {
+        Some(override_dir)
+    } else {
+        None
+    };
+    let template =
+        match nflow_claude::prompt::load_template("spec_session", override_path.as_deref()) {
+            Ok(t) => t,
+            Err(e) => {
+                return HandlerResult::Single(Response::error(
+                    id,
+                    &format!("failed to load template: {}", e),
+                ));
+            }
+        };
+
+    let context = nflow_claude::context::build_spec_context(&spec, &project);
+    let vars: std::collections::HashMap<&str, &str> = context
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    let prompt = match nflow_claude::prompt::render_template(&template, &vars) {
+        Ok(p) => p,
+        Err(e) => {
+            return HandlerResult::Single(Response::error(
+                id,
+                &format!("failed to render template: {}", e),
+            ));
+        }
+    };
+
+    // Determine working directory
+    let working_dir = if with_codebase {
+        PathBuf::from(&project.path)
+    } else {
+        nflow_home
+            .join("projects")
+            .join(&project.name)
+            .join("specs")
+    };
+
+    // Build RunConfig for spec session
+    let mut run_config = nflow_claude::runner::RunConfig::for_spec(prompt, with_codebase);
+    run_config.working_dir = Some(working_dir);
+    run_config.system_prompt_file = override_path.map(|d| d.join("spec_session.md"));
+
+    // Create streaming channel
+    let (tx, rx) = tokio::sync::mpsc::channel(64);
+    let spec_id = spec.id;
+    let db_path = state.db_path.clone();
+
+    // Send initial response with spec info
+    let initial_id = id.clone();
+    tokio::spawn(async move {
+        // Send initial spec info
+        let _ = tx
+            .send(StreamingResponseLine::data(
+                initial_id.clone(),
+                serde_json::json!({
+                    "spec_id": spec_id.to_string(),
+                    "name": spec_name,
+                    "status": "draft",
+                }),
+            ))
+            .await;
+
+        // Spawn Claude process
+        let runner = nflow_claude::runner::ClaudeRunner::default();
+        let process = match runner.spawn(&run_config) {
+            Ok(p) => p,
+            Err(e) => {
+                let _ = tx
+                    .send(StreamingResponseLine::error(
+                        initial_id,
+                        &format!("failed to spawn Claude: {}", e),
+                    ))
+                    .await;
+                // Mark session as inactive on failure
+                if let Ok(conn) = db::open_connection(&db_path) {
+                    let _ = db::specs::update_spec_session(&conn, &spec_id, false, None);
+                }
+                return;
+            }
+        };
+
+        // Stream Claude output
+        let mut parser = nflow_claude::stream::StreamParser::new(process.stdout);
+        loop {
+            match parser.next_event().await {
+                Ok(Some(event)) => {
+                    let event_json = match &event {
+                        nflow_claude::stream::StreamEvent::TextDelta { text } => {
+                            serde_json::json!({"type": "text", "text": text})
+                        }
+                        nflow_claude::stream::StreamEvent::ToolUse { name, input } => {
+                            serde_json::json!({"type": "tool_use", "name": name, "input": input})
+                        }
+                        nflow_claude::stream::StreamEvent::ToolResult { content } => {
+                            serde_json::json!({"type": "tool_result", "content": content})
+                        }
+                        nflow_claude::stream::StreamEvent::Result { text, session_id } => {
+                            serde_json::json!({"type": "result", "text": text, "session_id": session_id})
+                        }
+                        nflow_claude::stream::StreamEvent::Error { message } => {
+                            serde_json::json!({"type": "error", "message": message})
+                        }
+                        nflow_claude::stream::StreamEvent::ParseError { line, reason } => {
+                            serde_json::json!({"type": "parse_error", "line": line, "reason": reason})
+                        }
+                    };
+
+                    if tx
+                        .send(StreamingResponseLine::data(initial_id.clone(), event_json))
+                        .await
+                        .is_err()
+                    {
+                        break; // Client disconnected
+                    }
+                }
+                Ok(None) => break, // Stream ended
+                Err(e) => {
+                    let _ = tx
+                        .send(StreamingResponseLine::error(
+                            initial_id.clone(),
+                            &format!("stream error: {}", e),
+                        ))
+                        .await;
+                    break;
+                }
+            }
+        }
+
+        // Get session ID from parser
+        let session_id = parser.session_id().map(|s| s.to_string());
+
+        // Send done line
+        let _ = tx
+            .send(StreamingResponseLine::done(
+                initial_id,
+                serde_json::json!({
+                    "spec_id": spec_id.to_string(),
+                    "session_id": session_id,
+                }),
+            ))
+            .await;
+    });
+
+    HandlerResult::Streaming(rx)
 }
 
 /// Check if a path is a git repository using synchronous git command.
@@ -1151,6 +1404,197 @@ mod tests {
                 assert!(resp.data["message"].as_str().unwrap().contains("NOT_FOUND"));
             }
             _ => panic!("expected Single response"),
+        }
+        cleanup_db(&db_dir);
+    }
+
+    // --- spec.new tests ---
+
+    #[test]
+    fn test_handle_spec_new_missing_project_name() {
+        let state = make_test_state();
+        let req = Request {
+            id: "50".to_string(),
+            command: "spec.new".to_string(),
+            params: serde_json::json!({ "spec_name": "my-spec" }),
+        };
+        match handle_spec_new(req, &state) {
+            HandlerResult::Single(resp) => {
+                assert_eq!(resp.status, crate::socket::ResponseStatus::Error);
+                assert!(resp.data["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("missing required parameter: project_name"));
+            }
+            _ => panic!("expected Single response for error"),
+        }
+    }
+
+    #[test]
+    fn test_handle_spec_new_missing_spec_name() {
+        let state = make_test_state();
+        let req = Request {
+            id: "51".to_string(),
+            command: "spec.new".to_string(),
+            params: serde_json::json!({ "project_name": "myproject" }),
+        };
+        match handle_spec_new(req, &state) {
+            HandlerResult::Single(resp) => {
+                assert_eq!(resp.status, crate::socket::ResponseStatus::Error);
+                assert!(resp.data["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("missing required parameter: spec_name"));
+            }
+            _ => panic!("expected Single response for error"),
+        }
+    }
+
+    #[test]
+    fn test_handle_spec_new_project_not_found() {
+        let (state, db_dir) = make_db_state("spec_new_notfound");
+        let req = Request {
+            id: "52".to_string(),
+            command: "spec.new".to_string(),
+            params: serde_json::json!({
+                "project_name": "nonexistent",
+                "spec_name": "my-spec",
+            }),
+        };
+        match handle_spec_new(req, &state) {
+            HandlerResult::Single(resp) => {
+                assert_eq!(resp.status, crate::socket::ResponseStatus::Error);
+                assert!(resp.data["message"].as_str().unwrap().contains("NOT_FOUND"));
+            }
+            _ => panic!("expected Single response for error"),
+        }
+        cleanup_db(&db_dir);
+    }
+
+    #[test]
+    fn test_handle_spec_new_active_session_exists() {
+        let (state, db_dir) = make_db_state("spec_new_active");
+        let project_id = insert_test_project(&state, "active-project");
+
+        // Create an active spec session
+        let conn = db::open_connection(&state.db_path).unwrap();
+        conn.execute(
+            "INSERT INTO specs (id, project_id, name, file_path, status, session_active, created_at, updated_at)
+             VALUES (?1, ?2, 'existing-spec', '/tmp/spec.md', 'draft', 1, '2024-01-01', '2024-01-01')",
+            rusqlite::params![uuid::Uuid::new_v4().to_string(), project_id.to_string()],
+        )
+        .unwrap();
+        drop(conn);
+
+        let req = Request {
+            id: "53".to_string(),
+            command: "spec.new".to_string(),
+            params: serde_json::json!({
+                "project_name": "active-project",
+                "spec_name": "new-spec",
+            }),
+        };
+        match handle_spec_new(req, &state) {
+            HandlerResult::Single(resp) => {
+                assert_eq!(resp.status, crate::socket::ResponseStatus::Error);
+                assert!(resp.data["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("INVALID_STATE"));
+                assert!(resp.data["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("session is already active"));
+            }
+            _ => panic!("expected Single response for error"),
+        }
+        cleanup_db(&db_dir);
+    }
+
+    #[tokio::test]
+    async fn test_handle_spec_new_creates_spec_record() {
+        let (state, db_dir) = make_db_state("spec_new_success");
+        let project_id = insert_test_project(&state, "spec-project");
+
+        let req = Request {
+            id: "54".to_string(),
+            command: "spec.new".to_string(),
+            params: serde_json::json!({
+                "project_name": "spec-project",
+                "spec_name": "my-spec",
+            }),
+        };
+
+        // This returns Streaming because the DB part succeeds.
+        // Claude won't actually be available, but the spec record should be created.
+        match handle_spec_new(req, &state) {
+            HandlerResult::Streaming(_rx) => {
+                // Verify spec was created in DB with session_active=true
+                let conn = db::open_connection(&state.db_path).unwrap();
+                let spec = db::specs::get_spec_by_name(&conn, &project_id, "my-spec")
+                    .unwrap()
+                    .expect("spec should exist");
+                assert_eq!(spec.name, "my-spec");
+                assert_eq!(spec.status, nflow_core::spec::SpecStatus::Draft);
+                assert!(spec.session_active);
+                assert_eq!(spec.project_id, project_id);
+            }
+            HandlerResult::Single(resp) => {
+                panic!(
+                    "expected Streaming response but got Single: {:?}",
+                    resp.data
+                );
+            }
+        }
+        cleanup_db(&db_dir);
+    }
+
+    #[tokio::test]
+    async fn test_handle_spec_new_with_codebase_default_true() {
+        let (state, db_dir) = make_db_state("spec_new_codebase");
+        insert_test_project(&state, "codebase-project");
+
+        // No with_codebase param — should default to true
+        let req = Request {
+            id: "55".to_string(),
+            command: "spec.new".to_string(),
+            params: serde_json::json!({
+                "project_name": "codebase-project",
+                "spec_name": "code-spec",
+            }),
+        };
+        match handle_spec_new(req, &state) {
+            HandlerResult::Streaming(_rx) => {
+                // Success — defaults to with_codebase=true
+            }
+            HandlerResult::Single(resp) => {
+                panic!(
+                    "expected Streaming response but got Single: {:?}",
+                    resp.data
+                );
+            }
+        }
+        cleanup_db(&db_dir);
+    }
+
+    #[test]
+    fn test_dispatch_spec_new() {
+        let (state, db_dir) = make_db_state("dispatch_spec_new");
+        let req = Request {
+            id: "56".to_string(),
+            command: "spec.new".to_string(),
+            params: serde_json::json!({ "project_name": "nope" }),
+        };
+        match dispatch(req, &state) {
+            HandlerResult::Single(resp) => {
+                // Should be error (missing spec_name) but not "unknown command"
+                assert_eq!(resp.status, crate::socket::ResponseStatus::Error);
+                assert!(resp.data["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("missing required parameter: spec_name"));
+            }
+            _ => panic!("expected Single response for missing param"),
         }
         cleanup_db(&db_dir);
     }

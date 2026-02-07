@@ -183,6 +183,15 @@ pub fn count_specs_by_project(conn: &Connection, project_id: &Uuid) -> Result<u3
     Ok(count)
 }
 
+pub fn has_active_spec_session(conn: &Connection, project_id: &Uuid) -> Result<bool> {
+    let active: bool = conn.query_row(
+        "SELECT COUNT(*) > 0 FROM specs WHERE project_id = ?1 AND session_active = 1",
+        params![project_id.to_string()],
+        |row| row.get(0),
+    )?;
+    Ok(active)
+}
+
 pub fn reset_active_sessions(conn: &Connection, project_id: &Uuid) -> Result<u64> {
     let changed = conn.execute(
         "UPDATE specs SET session_active = 0, updated_at = ?1 WHERE project_id = ?2 AND session_active = 1",
@@ -553,6 +562,32 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM specs", [], |row| row.get(0))
             .unwrap();
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn test_has_active_spec_session_none() {
+        let conn = test_conn();
+        let pid = make_project(&conn);
+        assert!(!has_active_spec_session(&conn, &pid).unwrap());
+    }
+
+    #[test]
+    fn test_has_active_spec_session_inactive() {
+        let conn = test_conn();
+        let pid = make_project(&conn);
+        let spec = make_spec(pid, "inactive-spec");
+        insert_spec(&conn, &spec).unwrap();
+        assert!(!has_active_spec_session(&conn, &pid).unwrap());
+    }
+
+    #[test]
+    fn test_has_active_spec_session_active() {
+        let conn = test_conn();
+        let pid = make_project(&conn);
+        let mut spec = make_spec(pid, "active-spec");
+        spec.session_active = true;
+        insert_spec(&conn, &spec).unwrap();
+        assert!(has_active_spec_session(&conn, &pid).unwrap());
     }
 
     #[test]
