@@ -1,7 +1,7 @@
 {
   "project": "nflow",
   "branchName": "ralph/nflow-orchestrator",
-  "description": "nflow — CLI/TUI orchestrator for Claude Code agents. Manages spec writing, DAG decomposition, and parallel agent execution across git worktrees. Six-crate Rust workspace.",
+  "description": "nflow \u2014 CLI/TUI orchestrator for Claude Code agents. Manages spec writing, DAG decomposition, and parallel agent execution across git worktrees. Six-crate Rust workspace.",
   "userStories": [
     {
       "id": "US-001",
@@ -30,7 +30,7 @@
         "ProjectService::create() detects git provider from remote URL string (github.com -> github, gitlab.com -> gitlab) with manual override",
         "ProjectService::create() detects base branch from provided HEAD ref or defaults to 'main'",
         "ProjectService::delete() returns error if project has running agents (given a running-count checker)",
-        "All functions are pure — accept trait/closure for external checks, no IO",
+        "All functions are pure \u2014 accept trait/closure for external checks, no IO",
         "Typecheck passes"
       ],
       "priority": 2,
@@ -58,15 +58,15 @@
     },
     {
       "id": "US-004",
-      "title": "Work item model — epics and stories",
+      "title": "Work item model \u2014 epics and stories",
       "description": "As a developer, I want epic and story models so that work can be organized hierarchically with story-level dependencies.",
       "acceptanceCriteria": [
         "WorkItem struct with fields: id (UUID), parent_id (Option<UUID>), decomposition_session_id, item_type (epic|story|task), kind (Option: impl|verify), title, description, acceptance_criteria, status, short_id, sort_order, branch_name (Option), worktree_path (Option), mr_url (Option), commit_hash (Option), created_at, updated_at",
-        "Epic status: pending|in_progress|done|failed|cancelled — materialized from child stories, stored in DB and recalculated on every child story status change",
+        "Epic status: pending|in_progress|done|failed|cancelled \u2014 materialized from child stories, stored in DB and recalculated on every child story status change",
         "Story state machine: pending -> ready -> in_progress -> done|failed|cancelled",
         "Story transitions: ready requires all blockers done, in_progress requires ready|failed(retry), cancelled from pending|ready|in_progress",
         "propagate_epic_status() rules: pending when all stories pending; in_progress when any story in_progress or ready; done when all stories done (or mix of done+cancelled); failed when any story failed and none in_progress; cancelled when all stories cancelled",
-        "Dependency model: Dependency { blocker_id: UUID, blocked_id: UUID } — story-level only",
+        "Dependency model: Dependency { blocker_id: UUID, blocked_id: UUID } \u2014 story-level only",
         "Pure logic, no IO",
         "Typecheck passes"
       ],
@@ -76,7 +76,7 @@
     },
     {
       "id": "US-005",
-      "title": "Work item model — tasks (impl and verify)",
+      "title": "Work item model \u2014 tasks (impl and verify)",
       "description": "As a developer, I want task models with impl/verify pairing so that each implementation step has automatic verification.",
       "acceptanceCriteria": [
         "Task state machine: pending -> in_progress -> done|failed|cancelled",
@@ -99,7 +99,7 @@
       "title": "Short ID system",
       "description": "As a developer, I want wave-prefixed short IDs so that users can reference work items concisely in CLI commands.",
       "acceptanceCriteria": [
-        "Generate short IDs: E1, E2 (epics), S1, S2 (stories), T1, T2 (tasks) — scoped per decomposition session",
+        "Generate short IDs: E1, E2 (epics), S1, S2 (stories), T1, T2 (tasks) \u2014 scoped per decomposition session",
         "Wave-prefixed display: W1-E1, W1-S1, W1-T1, W1-T1v",
         "Verify tasks: short_id = '{impl_short_id}v' (e.g., T1 -> T1v)",
         "resolve_short_id(wave_prefix, short_id) -> Result<UUID> resolves display IDs to internal UUIDs",
@@ -122,7 +122,7 @@
         "Circular dependency detection returns Error::CyclicDependency { cycle: Vec<UUID> }",
         "Validate all depends_on references exist within the same decomposition session",
         "Validate no cross-wave dependencies (all deps within same session)",
-        "find_ready_stories(dag, statuses) -> Vec<UUID> returns stories with all blockers in done|cancelled state (cancelled stories do not block dependents — treated same as done for unblocking purposes)",
+        "find_ready_stories(dag, statuses) -> Vec<UUID> returns stories with all blockers in done|cancelled state (cancelled stories do not block dependents \u2014 treated same as done for unblocking purposes)",
         "find_blocked_stories(dag, statuses) -> Vec<UUID> returns stories with at least one incomplete blocker",
         "Pure logic, no IO",
         "Typecheck passes"
@@ -178,7 +178,7 @@
       "acceptanceCriteria": [
         "Config struct with all keys: max_parallel (u32), git_provider (String), base_branch (String), cleanup_worktrees (bool), max_turns_per_task (u32), auto_execute (bool), max_time_per_task (u64 secs), log_level (String), branch_template (String), worktree_dir (String)",
         "Defaults: max_parallel=3, git_provider='github', base_branch='main', cleanup_worktrees=false, max_turns_per_task=50, auto_execute=false, max_time_per_task=1800, log_level='info'",
-        "merge(base: Config, overlay: PartialConfig) -> Config — overlay fields override base when present",
+        "merge(base: Config, overlay: PartialConfig) -> Config \u2014 overlay fields override base when present",
         "Merging order: defaults -> global toml -> per-project toml -> env vars",
         "Env var mapping: NFLOW_HOME, NFLOW_SOCKET, NFLOW_LOG_LEVEL, NFLOW_MAX_PARALLEL",
         "Validation: max_parallel > 0, max_time_per_task > 0, git_provider in ['github', 'gitlab']",
@@ -212,7 +212,7 @@
     },
     {
       "id": "US-012",
-      "title": "Database CRUD — projects",
+      "title": "Database CRUD \u2014 projects",
       "description": "As a developer, I want database CRUD for projects so that project records are persisted and queryable.",
       "acceptanceCriteria": [
         "insert_project(project: &Project) -> Result<()>",
@@ -220,7 +220,7 @@
         "get_project_by_id(id: &Uuid) -> Result<Option<Project>>",
         "list_projects() -> Result<Vec<Project>>",
         "update_project(project: &Project) -> Result<()>",
-        "delete_project(id: &Uuid) -> Result<()> — cascades to specs, work_items, agent_runs",
+        "delete_project(id: &Uuid) -> Result<()> \u2014 cascades to specs, work_items, agent_runs",
         "project_name_exists(name: &str) -> Result<bool>",
         "All queries use parameterized statements (no SQL injection)",
         "Typecheck passes"
@@ -231,7 +231,7 @@
     },
     {
       "id": "US-013",
-      "title": "Database CRUD — specs",
+      "title": "Database CRUD \u2014 specs",
       "description": "As a developer, I want database CRUD for specs so that spec records and their sessions are persisted.",
       "acceptanceCriteria": [
         "insert_spec(spec: &Spec) -> Result<()>",
@@ -251,7 +251,7 @@
     },
     {
       "id": "US-014",
-      "title": "Database CRUD — work items and dependencies",
+      "title": "Database CRUD \u2014 work items and dependencies",
       "description": "As a developer, I want database CRUD for work items and dependencies so that the full DAG is persisted.",
       "acceptanceCriteria": [
         "insert_work_item(item) and insert_dependency(dep) functions",
@@ -270,7 +270,7 @@
     },
     {
       "id": "US-015",
-      "title": "Database CRUD — agent runs and decomposition sessions",
+      "title": "Database CRUD \u2014 agent runs and decomposition sessions",
       "description": "As a developer, I want database CRUD for agent runs and decomposition sessions so that execution history and wave state are tracked.",
       "acceptanceCriteria": [
         "insert_agent_run with fields: id, work_item_id, pid, session_id, pid_start_time, status, exit_code, log_path, error_message, started_at, finished_at",
@@ -305,7 +305,7 @@
     },
     {
       "id": "US-017",
-      "title": "Claude process runner — core spawning",
+      "title": "Claude process runner \u2014 core spawning",
       "description": "As a developer, I want to spawn Claude CLI processes with correct arguments so that agents run with proper configuration.",
       "acceptanceCriteria": [
         "ClaudeRunner::spawn(config: &RunConfig) -> Result<ClaudeProcess> spawns claude binary",
@@ -322,13 +322,13 @@
     },
     {
       "id": "US-018",
-      "title": "Claude process runner — invocation modes",
+      "title": "Claude process runner \u2014 invocation modes",
       "description": "As a developer, I want preset invocation modes for spec/decompose/impl/verify so that each Claude interaction uses the correct tools and limits.",
       "acceptanceCriteria": [
-        "RunConfig::for_spec(with_codebase) — with_codebase: allowedTools: Read,Glob,Grep,Write,AskUserQuestion; without: allowedTools: Write,AskUserQuestion; no max_turns",
-        "RunConfig::for_decompose(with_codebase) — with_codebase: allowedTools: Read,Glob,Grep, working_dir=project_path; without: no allowedTools, working_dir=specs_dir; no max_turns",
-        "RunConfig::for_impl_task() — allowedTools: Read,Write,Edit,Bash,Glob,Grep, max_turns: 50",
-        "RunConfig::for_verify_task() — allowedTools: Read,Bash,Glob,Grep (NO Write/Edit), max_turns: 30",
+        "RunConfig::for_spec(with_codebase) \u2014 with_codebase: allowedTools: Read,Glob,Grep,Write,AskUserQuestion; without: allowedTools: Write,AskUserQuestion; no max_turns",
+        "RunConfig::for_decompose(with_codebase) \u2014 with_codebase: allowedTools: Read,Glob,Grep, working_dir=project_path; without: no allowedTools, working_dir=specs_dir; no max_turns",
+        "RunConfig::for_impl_task() \u2014 allowedTools: Read,Write,Edit,Bash,Glob,Grep, max_turns: 50",
+        "RunConfig::for_verify_task() \u2014 allowedTools: Read,Bash,Glob,Grep (NO Write/Edit), max_turns: 30",
         "--with-codebase changes working_dir to project root (otherwise specs dir)",
         "All modes include --output-format stream-json --verbose --include-partial-messages",
         "Typecheck passes"
@@ -357,7 +357,7 @@
     },
     {
       "id": "US-020",
-      "title": "Stream-JSON — success criteria evaluation",
+      "title": "Stream-JSON \u2014 success criteria evaluation",
       "description": "As a developer, I want to evaluate task success from stream output so that impl and verify tasks are correctly marked as done or failed.",
       "acceptanceCriteria": [
         "evaluate_impl_result(exit_code, head_before, head_after, commit_message) -> TaskResult",
@@ -496,7 +496,7 @@
         "fetch_and_rebase(worktree_path, base_branch) runs git fetch origin && git rebase origin/{base}",
         "On rebase conflict: abort rebase (git rebase --abort), return Error::RebaseConflict { details }",
         "push_branch(worktree_path, branch_name) runs git push -u origin {branch_name}",
-        "Handle push failures: auth error, network error, branch protection — each with distinct error",
+        "Handle push failures: auth error, network error, branch protection \u2014 each with distinct error",
         "Typecheck passes"
       ],
       "priority": 28,
@@ -520,7 +520,7 @@
     },
     {
       "id": "US-030",
-      "title": "MR/PR creation — GitHub",
+      "title": "MR/PR creation \u2014 GitHub",
       "description": "As a developer, I want PR creation via gh so that completed stories automatically get pull requests on GitHub.",
       "acceptanceCriteria": [
         "create_github_pr(worktree_path, title, body, base_branch) -> Result<String> returns PR URL",
@@ -536,7 +536,7 @@
     },
     {
       "id": "US-031",
-      "title": "MR/PR creation — GitLab",
+      "title": "MR/PR creation \u2014 GitLab",
       "description": "As a developer, I want MR creation via glab so that completed stories automatically get merge requests on GitLab.",
       "acceptanceCriteria": [
         "create_gitlab_mr(worktree_path, title, body, base_branch) -> Result<String> returns MR URL",
@@ -558,7 +558,7 @@
         "has_new_commit(worktree_path, previous_head) -> Result<bool> compares current HEAD to previous",
         "validate_commit_message(worktree_path, expected_prefix) -> Result<bool> checks latest commit contains [{prefix}]",
         "expected_prefix is the wave-prefixed task short ID (e.g., W1-T1)",
-        "Returns false (not error) when validation fails — caller decides how to handle",
+        "Returns false (not error) when validation fails \u2014 caller decides how to handle",
         "Typecheck passes"
       ],
       "priority": 32,
@@ -632,7 +632,7 @@
     },
     {
       "id": "US-037",
-      "title": "Crash recovery — stale agent detection",
+      "title": "Crash recovery \u2014 stale agent detection",
       "description": "As a developer, I want crash recovery so that stale agents are detected and cleaned up on daemon restart.",
       "acceptanceCriteria": [
         "On startup, query agent_runs WHERE status = 'running'",
@@ -650,7 +650,7 @@
     },
     {
       "id": "US-038",
-      "title": "Crash recovery — session and state reset",
+      "title": "Crash recovery \u2014 session and state reset",
       "description": "As a developer, I want session and state cleanup on crash recovery so that no stuck state remains after a crash.",
       "acceptanceCriteria": [
         "Reset all specs with session_active = 1 to session_active = 0",
@@ -700,7 +700,7 @@
         "Typecheck passes"
       ],
       "priority": 40,
-      "passes": false,
+      "passes": true,
       "notes": ""
     },
     {
@@ -736,7 +736,7 @@
     },
     {
       "id": "US-043",
-      "title": "Command handler — project init",
+      "title": "Command handler \u2014 project init",
       "description": "As a developer, I want project init handling so that nflow init creates and persists a new project.",
       "acceptanceCriteria": [
         "Receives: { name, path, base_branch?, git_provider? }",
@@ -754,7 +754,7 @@
     },
     {
       "id": "US-044",
-      "title": "Command handler — project list and delete",
+      "title": "Command handler \u2014 project list and delete",
       "description": "As a developer, I want project list and delete handling so that projects can be managed.",
       "acceptanceCriteria": [
         "project.list returns all projects with: name, path, base_branch, git_provider, execution_enabled, spec_count, story_count",
@@ -770,7 +770,7 @@
     },
     {
       "id": "US-045",
-      "title": "Command handler — spec new (start session)",
+      "title": "Command handler \u2014 spec new (start session)",
       "description": "As a developer, I want spec creation handling so that nflow spec new starts a Claude dialogue session.",
       "acceptanceCriteria": [
         "Receives: { project_name, spec_name, with_codebase? }",
@@ -788,7 +788,7 @@
     },
     {
       "id": "US-046",
-      "title": "Command handler — spec Q&A flow",
+      "title": "Command handler \u2014 spec Q&A flow",
       "description": "As a developer, I want spec Q&A handling so that the multi-turn Claude dialogue works via resume chains.",
       "acceptanceCriteria": [
         "Detects AskUserQuestion tool call in Claude stream output",
@@ -806,7 +806,7 @@
     },
     {
       "id": "US-047",
-      "title": "Command handler — spec CRUD (list/view/approve/reopen/delete)",
+      "title": "Command handler \u2014 spec CRUD (list/view/approve/reopen/delete)",
       "description": "As a developer, I want spec CRUD handling so that all spec lifecycle commands work.",
       "acceptanceCriteria": [
         "spec.list returns specs with: name, status, session_active, created_at",
@@ -824,7 +824,7 @@
     },
     {
       "id": "US-048",
-      "title": "Command handler — plan generate",
+      "title": "Command handler \u2014 plan generate",
       "description": "As a developer, I want plan generation handling so that nflow plan generate invokes Claude decomposition.",
       "acceptanceCriteria": [
         "Receives: { project_name, spec_names?, with_codebase? }",
@@ -844,7 +844,7 @@
     },
     {
       "id": "US-049",
-      "title": "Command handler — plan show",
+      "title": "Command handler \u2014 plan show",
       "description": "As a developer, I want plan display so that the current wave's structure is visible.",
       "acceptanceCriteria": [
         "plan.show returns hierarchical tree: wave -> epics -> stories -> tasks",
@@ -861,7 +861,7 @@
     },
     {
       "id": "US-050",
-      "title": "Command handler — plan feedback",
+      "title": "Command handler \u2014 plan feedback",
       "description": "As a developer, I want plan feedback handling so that the decomposition can be refined through Claude dialogue.",
       "acceptanceCriteria": [
         "Receives: { message, wave_number? }",
@@ -879,7 +879,7 @@
     },
     {
       "id": "US-051",
-      "title": "Command handler — plan approve and discard",
+      "title": "Command handler \u2014 plan approve and discard",
       "description": "As a developer, I want plan approval and discard so that waves are locked for execution or removed.",
       "acceptanceCriteria": [
         "plan.approve validates wave is in draft state, transitions to approved",
@@ -896,7 +896,7 @@
     },
     {
       "id": "US-052",
-      "title": "Scheduler loop — main integration",
+      "title": "Scheduler loop \u2014 main integration",
       "description": "As a developer, I want the scheduler running on the main event loop so that it ticks every 2 seconds without race conditions.",
       "acceptanceCriteria": [
         "Scheduler runs as tokio::time::interval(Duration::from_secs(2)) on the main task",
@@ -913,7 +913,7 @@
     },
     {
       "id": "US-053",
-      "title": "Scheduler — reap finished processes",
+      "title": "Scheduler \u2014 reap finished processes",
       "description": "As a developer, I want process reaping so that finished agents are detected and their results processed.",
       "acceptanceCriteria": [
         "On each tick: check all running agent_runs PIDs via waitpid(WNOHANG) or tokio process handle",
@@ -931,7 +931,7 @@
     },
     {
       "id": "US-054",
-      "title": "Scheduler — start story execution",
+      "title": "Scheduler \u2014 start story execution",
       "description": "As a developer, I want story start logic so that ready stories get a worktree and begin their first task.",
       "acceptanceCriteria": [
         "When scheduler selects a ready story: set status to in_progress",
@@ -948,7 +948,7 @@
     },
     {
       "id": "US-055",
-      "title": "Scheduler — start task execution",
+      "title": "Scheduler \u2014 start task execution",
       "description": "As a developer, I want task start logic so that Claude agents are spawned for each task.",
       "acceptanceCriteria": [
         "Set task status to in_progress",
@@ -967,7 +967,7 @@
     },
     {
       "id": "US-056",
-      "title": "Scheduler — task completion and story progression",
+      "title": "Scheduler \u2014 task completion and story progression",
       "description": "As a developer, I want task completion logic so that stories progress through their task sequence correctly.",
       "acceptanceCriteria": [
         "On impl task success: mark done, store commit_hash, start paired verify task",
@@ -984,7 +984,7 @@
     },
     {
       "id": "US-057",
-      "title": "Scheduler — story completion (rebase, push, MR)",
+      "title": "Scheduler \u2014 story completion (rebase, push, MR)",
       "description": "As a developer, I want story completion so that finished stories are rebased, pushed, and get MRs created.",
       "acceptanceCriteria": [
         "When all tasks done: run fetch_and_rebase() from nflow-git",
@@ -1003,7 +1003,7 @@
     },
     {
       "id": "US-058",
-      "title": "Scheduler — wall-clock timeout",
+      "title": "Scheduler \u2014 wall-clock timeout",
       "description": "As a developer, I want wall-clock timeout so that hung agents are killed after a configurable time.",
       "acceptanceCriteria": [
         "Track task start time in agent_runs.started_at",
@@ -1020,13 +1020,13 @@
     },
     {
       "id": "US-059",
-      "title": "Command handler — exec run and pause",
+      "title": "Command handler \u2014 exec run and pause",
       "description": "As a developer, I want run/pause commands so that execution can be enabled and disabled.",
       "acceptanceCriteria": [
         "exec.run sets execution_enabled = true for current project",
         "--parallel N temporarily overrides max_parallel for this run (stored in memory)",
         "--story {id} limits execution to a specific story",
-        "exec.pause sets execution_enabled = false — running agents continue, no new ones started",
+        "exec.pause sets execution_enabled = false \u2014 running agents continue, no new ones started",
         "Returns current execution state: enabled/disabled, running_count, pending_count",
         "Typecheck passes"
       ],
@@ -1036,7 +1036,7 @@
     },
     {
       "id": "US-060",
-      "title": "Command handler — exec status",
+      "title": "Command handler \u2014 exec status",
       "description": "As a developer, I want status display so that I can see the current state of all work items.",
       "acceptanceCriteria": [
         "Returns hierarchical status: waves -> epics -> stories -> tasks",
@@ -1053,7 +1053,7 @@
     },
     {
       "id": "US-061",
-      "title": "Command handler — exec retry",
+      "title": "Command handler \u2014 exec retry",
       "description": "As a developer, I want retry handling so that failed tasks can be re-executed.",
       "acceptanceCriteria": [
         "Receives: { task_id } (wave-prefixed short ID)",
@@ -1072,7 +1072,7 @@
     },
     {
       "id": "US-062",
-      "title": "Command handler — exec skip",
+      "title": "Command handler \u2014 exec skip",
       "description": "As a developer, I want skip handling so that failed tasks can be bypassed.",
       "acceptanceCriteria": [
         "Receives: { task_id }",
@@ -1090,7 +1090,7 @@
     },
     {
       "id": "US-063",
-      "title": "Command handler — exec continue",
+      "title": "Command handler \u2014 exec continue",
       "description": "As a developer, I want continue handling so that failed stories can resume from the next task.",
       "acceptanceCriteria": [
         "Receives: { story_id, force? }",
@@ -1108,7 +1108,7 @@
     },
     {
       "id": "US-064",
-      "title": "Command handler — exec stop and cancel",
+      "title": "Command handler \u2014 exec stop and cancel",
       "description": "As a developer, I want stop/cancel so that running and pending stories can be halted.",
       "acceptanceCriteria": [
         "exec.stop {story_id}: single story sends SIGTERM to agent, sets story to cancelled",
@@ -1125,7 +1125,7 @@
     },
     {
       "id": "US-065",
-      "title": "Command handler — log viewing",
+      "title": "Command handler \u2014 log viewing",
       "description": "As a developer, I want log viewing so that agent output can be inspected.",
       "acceptanceCriteria": [
         "exec.log receives: { task_id, follow? }",
@@ -1141,7 +1141,7 @@
     },
     {
       "id": "US-066",
-      "title": "Command handler — worktree and cleanup",
+      "title": "Command handler \u2014 worktree and cleanup",
       "description": "As a developer, I want worktree and cleanup commands so that disk space can be managed.",
       "acceptanceCriteria": [
         "worktree.list returns all active worktrees: path, branch, story_id, story_status",
@@ -1157,7 +1157,7 @@
     },
     {
       "id": "US-067",
-      "title": "Command handler — config get and set",
+      "title": "Command handler \u2014 config get and set",
       "description": "As a developer, I want config commands so that configuration can be viewed and modified at runtime.",
       "acceptanceCriteria": [
         "config.show returns effective config: merged defaults + global + per-project + env",
@@ -1304,7 +1304,7 @@
     },
     {
       "id": "US-076",
-      "title": "TUI — specs list view",
+      "title": "TUI \u2014 specs list view",
       "description": "As a developer, I want a specs list so that I can see and manage all specifications.",
       "acceptanceCriteria": [
         "Lists all specs with columns: name, status, updated",
@@ -1319,7 +1319,7 @@
     },
     {
       "id": "US-077",
-      "title": "TUI — spec dialogue sub-view",
+      "title": "TUI \u2014 spec dialogue sub-view",
       "description": "As a developer, I want a dialogue interface so that I can have Claude conversations for spec creation in the TUI.",
       "acceptanceCriteria": [
         "Shown when a spec session is active (after n or r)",
@@ -1336,7 +1336,7 @@
     },
     {
       "id": "US-078",
-      "title": "TUI — spec content pager",
+      "title": "TUI \u2014 spec content pager",
       "description": "As a developer, I want a pager view so that I can read full spec content in the TUI.",
       "acceptanceCriteria": [
         "Full-screen markdown content display (plain text)",
@@ -1352,7 +1352,7 @@
     },
     {
       "id": "US-079",
-      "title": "TUI — plan tree view",
+      "title": "TUI \u2014 plan tree view",
       "description": "As a developer, I want a tree visualization so that I can see the full decomposition structure.",
       "acceptanceCriteria": [
         "Collapsible tree: Wave -> Epic -> Story -> Task",
@@ -1369,7 +1369,7 @@
     },
     {
       "id": "US-080",
-      "title": "TUI — plan actions",
+      "title": "TUI \u2014 plan actions",
       "description": "As a developer, I want plan action keybindings so that I can generate, refine, and approve plans from the TUI.",
       "acceptanceCriteria": [
         "g opens generate dialog (select specs, --with-codebase checkbox)",
@@ -1385,7 +1385,7 @@
     },
     {
       "id": "US-081",
-      "title": "TUI — execute split view",
+      "title": "TUI \u2014 execute split view",
       "description": "As a developer, I want a split execution view so that I can see the work tree and agent output simultaneously.",
       "acceptanceCriteria": [
         "Vertical split: task tree (left 40%) + agent output (right 60%)",
@@ -1402,7 +1402,7 @@
     },
     {
       "id": "US-082",
-      "title": "TUI — execute real-time updates",
+      "title": "TUI \u2014 execute real-time updates",
       "description": "As a developer, I want real-time status updates so that the execution view reflects current state.",
       "acceptanceCriteria": [
         "Subscribe to daemon events on view entry",
@@ -1418,7 +1418,7 @@
     },
     {
       "id": "US-083",
-      "title": "TUI — execute actions",
+      "title": "TUI \u2014 execute actions",
       "description": "As a developer, I want execution control actions so that I can manage running work from the TUI.",
       "acceptanceCriteria": [
         "r starts execution (equivalent to nflow run)",
@@ -1435,7 +1435,7 @@
     },
     {
       "id": "US-084",
-      "title": "TUI — logs view",
+      "title": "TUI \u2014 logs view",
       "description": "As a developer, I want a full-screen log viewer so that I can inspect agent output in detail.",
       "acceptanceCriteria": [
         "Full-screen scrollable text display of selected task's log",
@@ -1452,7 +1452,7 @@
     },
     {
       "id": "US-085",
-      "title": "TUI — help overlay",
+      "title": "TUI \u2014 help overlay",
       "description": "As a developer, I want a help overlay so that I can discover keybindings for the current view.",
       "acceptanceCriteria": [
         "? toggles floating help panel",
@@ -1467,7 +1467,7 @@
     },
     {
       "id": "US-086",
-      "title": "TUI — project switcher",
+      "title": "TUI \u2014 project switcher",
       "description": "As a developer, I want a project switcher so that I can change projects without restarting the TUI.",
       "acceptanceCriteria": [
         "p opens project selector popup",
@@ -1483,7 +1483,7 @@
     },
     {
       "id": "US-087",
-      "title": "TUI — filter and search",
+      "title": "TUI \u2014 filter and search",
       "description": "As a developer, I want filtering so that I can find specific items in large plans/execution views.",
       "acceptanceCriteria": [
         "/ opens search input at bottom of screen",
@@ -1499,7 +1499,7 @@
     },
     {
       "id": "US-088",
-      "title": "Platform abstraction — PID detection",
+      "title": "Platform abstraction \u2014 PID detection",
       "description": "As a developer, I want platform-abstracted PID detection so that crash recovery works on both Linux and macOS.",
       "acceptanceCriteria": [
         "get_pid_start_time(pid) -> Result<u64> returns process start time",
@@ -1516,7 +1516,7 @@
     },
     {
       "id": "US-089",
-      "title": "Platform abstraction — signal handling",
+      "title": "Platform abstraction \u2014 signal handling",
       "description": "As a developer, I want cross-platform signal handling so that process management works on both Linux and macOS.",
       "acceptanceCriteria": [
         "send_signal(pid, signal) wraps nix::sys::signal::kill",
@@ -1531,7 +1531,7 @@
     },
     {
       "id": "US-090",
-      "title": "Unit tests — DAG and topological sort",
+      "title": "Unit tests \u2014 DAG and topological sort",
       "description": "As a developer, I want DAG tests so that dependency resolution is proven correct.",
       "acceptanceCriteria": [
         "Test: build DAG from 5 stories with linear dependencies -> correct topological sort order",
@@ -1548,7 +1548,7 @@
     },
     {
       "id": "US-091",
-      "title": "Unit tests — scheduler algorithm",
+      "title": "Unit tests \u2014 scheduler algorithm",
       "description": "As a developer, I want scheduler tests so that story selection and parallel limits are verified.",
       "acceptanceCriteria": [
         "Test: 5 ready stories, max_parallel=3 -> returns 3 start actions",
@@ -1567,7 +1567,7 @@
     },
     {
       "id": "US-092",
-      "title": "Unit tests — work item state machines",
+      "title": "Unit tests \u2014 work item state machines",
       "description": "As a developer, I want state machine tests so that all valid and invalid transitions are covered.",
       "acceptanceCriteria": [
         "Test all valid story transitions: pending->ready->in_progress->done, in_progress->failed, failed->in_progress, cancelled from pending/ready/in_progress",
@@ -1583,7 +1583,7 @@
     },
     {
       "id": "US-093",
-      "title": "Unit tests — spec state machine",
+      "title": "Unit tests \u2014 spec state machine",
       "description": "As a developer, I want spec state machine tests so that lifecycle transitions are verified.",
       "acceptanceCriteria": [
         "Test valid: draft->approved, approved->draft(reopen), approved->decomposed, decomposed->approved(via plan discard), draft->deleted, approved->deleted",
@@ -1598,7 +1598,7 @@
     },
     {
       "id": "US-094",
-      "title": "Unit tests — short ID system",
+      "title": "Unit tests \u2014 short ID system",
       "description": "As a developer, I want short ID tests so that generation and resolution work correctly.",
       "acceptanceCriteria": [
         "Test: generate short IDs for 3 epics, 5 stories, 10 tasks -> E1-E3, S1-S5, T1-T10",
@@ -1615,7 +1615,7 @@
     },
     {
       "id": "US-095",
-      "title": "Unit tests — config merging",
+      "title": "Unit tests \u2014 config merging",
       "description": "As a developer, I want config merge tests so that layered configuration works correctly.",
       "acceptanceCriteria": [
         "Test: defaults only -> all default values",
@@ -1631,7 +1631,7 @@
     },
     {
       "id": "US-096",
-      "title": "Unit tests — stream-JSON parser",
+      "title": "Unit tests \u2014 stream-JSON parser",
       "description": "As a developer, I want parser tests so that all stream-json message types are handled correctly.",
       "acceptanceCriteria": [
         "Test: parse text delta, tool_use, tool_result, result events",
@@ -1648,7 +1648,7 @@
     },
     {
       "id": "US-097",
-      "title": "Unit tests — prompt template rendering",
+      "title": "Unit tests \u2014 prompt template rendering",
       "description": "As a developer, I want template tests so that variable substitution works correctly.",
       "acceptanceCriteria": [
         "Test: render with all variables present -> correct output",
@@ -1664,7 +1664,7 @@
     },
     {
       "id": "US-098",
-      "title": "Integration tests — daemon lifecycle",
+      "title": "Integration tests \u2014 daemon lifecycle",
       "description": "As a developer, I want daemon lifecycle tests so that start/stop/crash recovery are verified end-to-end.",
       "acceptanceCriteria": [
         "Test fixture: temporary NFLOW_HOME directory, isolated daemon instance",
@@ -1682,7 +1682,7 @@
     },
     {
       "id": "US-099",
-      "title": "Integration tests — NDJSON protocol",
+      "title": "Integration tests \u2014 NDJSON protocol",
       "description": "As a developer, I want protocol tests so that client-server communication is verified.",
       "acceptanceCriteria": [
         "Test: valid request -> valid response with matching UUID",
@@ -1699,7 +1699,7 @@
     },
     {
       "id": "US-100",
-      "title": "Integration tests — project and spec commands",
+      "title": "Integration tests \u2014 project and spec commands",
       "description": "As a developer, I want command integration tests so that project and spec CRUD work through the socket.",
       "acceptanceCriteria": [
         "Test: project.init -> created in DB, directories exist",
@@ -1715,7 +1715,7 @@
     },
     {
       "id": "US-101",
-      "title": "Integration tests — plan commands",
+      "title": "Integration tests \u2014 plan commands",
       "description": "As a developer, I want plan integration tests so that decomposition and approval work through the socket.",
       "acceptanceCriteria": [
         "Test: plan.generate with mock Claude -> wave created, work items in DB",
@@ -1731,7 +1731,7 @@
     },
     {
       "id": "US-102",
-      "title": "Integration tests — execution commands",
+      "title": "Integration tests \u2014 execution commands",
       "description": "As a developer, I want execution integration tests so that run/stop/retry/skip work through the socket.",
       "acceptanceCriteria": [
         "Test: exec.run, exec.pause, exec.status",
@@ -1748,7 +1748,7 @@
     },
     {
       "id": "US-103",
-      "title": "E2E test — mock Claude binary",
+      "title": "E2E test \u2014 mock Claude binary",
       "description": "As a developer, I want a mock Claude binary so that E2E tests run without real API calls.",
       "acceptanceCriteria": [
         "Mock binary reads -p prompt and returns canned stream-json responses",
@@ -1766,7 +1766,7 @@
     },
     {
       "id": "US-104",
-      "title": "E2E test — full happy path",
+      "title": "E2E test \u2014 full happy path",
       "description": "As a developer, I want a full happy-path E2E test so that the entire workflow is verified end-to-end.",
       "acceptanceCriteria": [
         "Setup: temporary git repo, temporary NFLOW_HOME, mock Claude in PATH",
@@ -1784,7 +1784,7 @@
     },
     {
       "id": "US-105",
-      "title": "E2E test — failure and recovery scenarios",
+      "title": "E2E test \u2014 failure and recovery scenarios",
       "description": "As a developer, I want failure E2E tests so that error recovery paths are verified.",
       "acceptanceCriteria": [
         "Test: impl task fails -> task and story marked failed",
@@ -1802,7 +1802,7 @@
     },
     {
       "id": "US-106",
-      "title": "E2E test — parallel execution",
+      "title": "E2E test \u2014 parallel execution",
       "description": "As a developer, I want parallel execution E2E tests so that concurrent story execution is verified.",
       "acceptanceCriteria": [
         "Setup: plan with 3 independent stories (no dependencies)",

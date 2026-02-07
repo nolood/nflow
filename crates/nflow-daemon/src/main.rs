@@ -3,6 +3,7 @@ mod db;
 pub mod error;
 mod recovery;
 mod shutdown;
+pub mod socket;
 
 use std::env;
 

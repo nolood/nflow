@@ -86,6 +86,11 @@
 - Signal handlers must be extern "C" fn(c_int) — use global AtomicBool statics for shutdown signaling
 - libc crate needed for c_int type in signal handler signatures
 - std::io::Error::other() preferred over std::io::Error::new(ErrorKind::Other, ...) in Rust 1.92+
+- Socket server uses tokio::sync::oneshot for shutdown signaling, tokio::select! for accept loop + shutdown
+- NDJSON protocol: one JSON object per line, newline-terminated; Request {id, command, params}, Response {id, status, data}
+- Command handlers run via spawn_blocking to serialize with scheduler (no async in handlers)
+- Socket file permissions set to 0600 via std::os::unix::fs::PermissionsExt after binding
+- bind_socket removes stale socket file before binding — always clean up existing socket on start
 
 # Ralph Progress Log
 Started: Sat Feb  7 03:49:10 PM MSK 2026
@@ -1009,4 +1014,37 @@ Started: Sat Feb  7 03:49:10 PM MSK 2026
   - `trap '' TERM; sleep 300` creates a SIGTERM-resistant process for testing SIGKILL escalation
   - `Command::new("true")` is the fastest way to spawn a short-lived process in tests
   - Consolidated duplicate match arms (`"foreground" | _`) reduces code duplication in main.rs
+---
+
+## 2026-02-07 - US-040
+- What was implemented: Unix socket server in nflow-daemon
+  - Created `crates/nflow-daemon/src/socket.rs` with full Unix domain socket server
+  - `Request` struct: {id, command, params} — NDJSON protocol message from client
+  - `Response` struct: {id, status, data} — NDJSON protocol response to client
+  - `ResponseStatus` enum: Ok, Error — serialized as lowercase strings
+  - `Response::ok()` and `Response::error()` convenience constructors
+  - `CommandHandler` type alias: `Box<dyn Fn(Request) -> Response + Send + Sync>`
+  - `bind_socket(path)` — removes stale socket, binds UnixListener, sets 0600 permissions
+  - `start_server(config)` — spawns tokio accept loop, returns SocketServerHandle
+  - `accept_loop()` — tokio::select! between accepting connections and shutdown signal
+  - `handle_client()` — reads NDJSON lines, parses Request, dispatches via spawn_blocking, writes Response
+  - `SocketServerHandle` — holds oneshot::Sender for shutdown signaling, Drop impl triggers shutdown
+  - `SocketServerConfig` — socket_path + handler
+  - Empty lines are silently ignored; invalid JSON returns error response with empty ID
+  - Client disconnect detected via EOF on read or BrokenPipe on write
+  - Concurrent client connections via per-client tokio tasks
+  - Fixed pre-existing clippy redundant_field_names in shutdown.rs
+  - 15 new tests (182 nflow-daemon, 667 workspace total)
+- Files changed:
+  - crates/nflow-daemon/src/socket.rs (new — full Unix socket server with tests)
+  - crates/nflow-daemon/src/main.rs (added socket module)
+  - crates/nflow-daemon/src/shutdown.rs (fixed pre-existing clippy redundant_field_names)
+- **Learnings for future iterations:**
+  - tokio::sync::oneshot is ideal for one-shot shutdown signaling in async accept loops
+  - tokio::select! on listener.accept() + shutdown_rx cleanly handles concurrent accept and shutdown
+  - spawn_blocking moves handler execution off the async runtime — suitable for synchronous command handlers
+  - std::os::unix::fs::PermissionsExt::from_mode(0o600) sets owner-only permissions on socket file
+  - UnixStream::into_split() provides owned read/write halves — needed for concurrent read/write on same connection
+  - BufReader::lines() handles NDJSON line splitting automatically (splits on \n)
+  - cargo fmt reformats `map_err(|e| Error::other(...))` to method chain on the preceding expression
 ---

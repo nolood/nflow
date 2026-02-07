@@ -222,7 +222,7 @@ pub fn graceful_shutdown(
         agents_finished_naturally: finished_naturally,
         agents_sigtermed: sigtermed,
         agents_sigkilled: sigkilled,
-        socket_removed: socket_removed,
+        socket_removed,
         pid_file_removed: pid_removed,
     }
 }
