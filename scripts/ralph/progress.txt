@@ -950,4 +950,34 @@ Started: Sat Feb  7 03:49:10 PM MSK 2026
   - PID 4_000_000_000 is a safe "nonexistent PID" for tests (beyond Linux's max PID)
   - #[cfg(target_os = "linux")] gates platform-specific tests — they run only on the right OS
   - Conservative approach: if we can't read start time but process is alive, assume it's the right process
+- recover_session_state() is the main entry point for full crash recovery (US-038) — combines all steps
+- RecoveryReport struct returns all recovery metrics for caller inspection
+- reset_all_active_spec_sessions() operates across ALL projects (no project_id filter) — different from per-project reset_active_sessions()
+- find_orphaned_in_progress_items uses NOT EXISTS subquery to find tasks with no running agent_run
+- find_completed_in_progress_stories uses nested EXISTS/NOT EXISTS to find stories where all child tasks are done/cancelled
+- remove_stale_socket() and cleanup_stale_pid_file() are filesystem operations — take Path arguments, return bool
+- cleanup_stale_pid_file checks if recorded PID matches current process AND if recorded PID is still alive before removing
+- tracing::info! macro uses structured fields (count = value) for machine-parseable logging
+---
+
+## 2026-02-07 - US-038
+- What was implemented: Crash recovery — session and state reset in nflow-daemon
+  - reset_all_active_spec_sessions(conn) — resets all specs with session_active=1 to 0 across all projects
+  - find_orphaned_in_progress_items(conn) — finds tasks in in_progress with no running agent_run
+  - fail_orphaned_in_progress_items(conn) — marks orphaned in-progress tasks as failed
+  - find_completed_in_progress_stories(conn) — finds stories in in_progress where all child tasks are done/cancelled
+  - remove_stale_socket(path) — removes stale socket file if it exists
+  - cleanup_stale_pid_file(path) — removes PID file if recorded PID doesn't match current process or is dead
+  - RecoveryReport struct with specs_reset, tasks_failed, stories_needing_completion, agents_adopted, socket_removed, pid_file_removed
+  - recover_session_state(conn, socket_path, pid_file) — full recovery pipeline with INFO-level logging
+  - 19 new tests (36 recovery total, 634 workspace total)
+- Files changed:
+  - crates/nflow-daemon/src/recovery.rs (added session/state reset functions, file cleanup, RecoveryReport, integration pipeline + tests)
+- **Learnings for future iterations:**
+  - Use NOT EXISTS subquery to find orphaned items (tasks with no running agent_run)
+  - Nested EXISTS + NOT EXISTS SQL pattern for "all children done" check
+  - tracing::info! uses field = value syntax for structured logging
+  - cleanup_stale_pid_file reads file content atomically and checks both PID match and process liveness
+  - RecoveryReport uses named struct init instead of Default + field assignment (clippy field_reassign_with_default)
+  - replace_all in Edit tool is dangerous — it replaces ALL occurrences including import paths (uuid::Uuid → Uuid)
 ---
