@@ -1047,4 +1047,43 @@ Started: Sat Feb  7 03:49:10 PM MSK 2026
   - UnixStream::into_split() provides owned read/write halves — needed for concurrent read/write on same connection
   - BufReader::lines() handles NDJSON line splitting automatically (splits on \n)
   - cargo fmt reformats `map_err(|e| Error::other(...))` to method chain on the preceding expression
+- CommandHandler now returns HandlerResult enum (Single or Streaming) — update all handler constructors
+- SocketServerConfig has `event_bus: Option<SharedEventBus>` — pass None when no event system needed
+- tokio::sync::broadcast for event fan-out to multiple subscribers; tokio::sync::mpsc for streaming response lines
+- Arc<tokio::sync::Mutex<OwnedWriteHalf>> needed when both request loop and event forwarder task need to write
+- Event forwarder spawned as background tokio task per subscribed client — detects disconnect via write failure
+- StreamingResponseLine has `done: bool` field (#[serde(default)]) — defaults to false on deserialization
+---
+
+## 2026-02-07 - US-041
+- What was implemented: Streaming responses and event broadcast in nflow-daemon
+  - Created `crates/nflow-daemon/src/events.rs` — full event system module
+  - Event enum with 3 variants: StatusChange, AgentOutput, StoryCompleted (tagged serde union)
+  - ClientId struct (UUID wrapper) for subscription tracking
+  - EventBus: subscribe(client_id), unsubscribe(client_id), broadcast(event), is_subscribed(), subscription_count(), sender()
+  - SharedEventBus (Arc<EventBus>) for cross-task sharing
+  - StreamingResponseLine struct: {id, status, data, done} — `done: bool` with #[serde(default)]
+  - StreamingResponseLine::data(), done(), error() constructors
+  - HandlerResult enum: Single(Response) or Streaming(mpsc::Receiver<StreamingResponseLine>)
+  - CommandHandler type updated: returns HandlerResult instead of Response
+  - handle_client refactored: Arc<Mutex<OwnedWriteHalf>> for shared writer between request loop and event forwarder
+  - "subscribe" command: registers client for events, spawns background task to forward broadcast events
+  - Client disconnect cleanup: unsubscribe on EOF, event forwarder detects BrokenPipe and self-cleans
+  - Double-subscribe returns already_subscribed=true (idempotent)
+  - subscribe without event bus returns error
+  - SocketServerConfig gains event_bus: Option<SharedEventBus>
+  - write_line() helper for consistent NDJSON line writing with disconnect detection
+  - 29 new tests (209 nflow-daemon, 694 workspace total)
+- Files changed:
+  - crates/nflow-daemon/src/events.rs (new — Event enum, EventBus, ClientId, SharedEventBus)
+  - crates/nflow-daemon/src/socket.rs (StreamingResponseLine, HandlerResult, streaming dispatch, subscribe command, event forwarding, updated tests)
+  - crates/nflow-daemon/src/main.rs (added events module)
+- **Learnings for future iterations:**
+  - tokio::sync::broadcast is ideal for fan-out (one sender → many receivers) event delivery
+  - tokio::sync::mpsc is better for streaming responses (one producer → one consumer)
+  - Arc<tokio::sync::Mutex<OwnedWriteHalf>> needed when multiple async tasks write to same socket
+  - broadcast::RecvError::Lagged(n) means receiver fell behind — log and continue, don't disconnect
+  - serde(default) on `done: bool` makes it optional in JSON (defaults to false when missing)
+  - Event uses #[serde(tag = "type", rename_all = "snake_case")] for discriminated union serialization
+  - cargo fmt collapses handle_subscribe with 5 short params to single line
 ---
