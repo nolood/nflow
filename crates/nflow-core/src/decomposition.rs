@@ -87,11 +87,11 @@ impl DecompositionSession {
 
     /// Discard the session.
     ///
-    /// Valid transition: InProgress -> Discarded
+    /// Valid transition: InProgress -> Discarded, Approved -> Discarded
     /// The caller is responsible for deleting associated work items and
     /// freeing specs back to approved status (use `discard_session()`).
     pub fn discard(&mut self) -> Result<()> {
-        if self.status != DecompositionStatus::InProgress {
+        if self.status == DecompositionStatus::Discarded {
             return Err(NflowError::InvalidTransition {
                 from: self.status.to_string(),
                 to: "discarded".into(),
@@ -243,12 +243,12 @@ mod tests {
     }
 
     #[test]
-    fn discard_from_approved_fails() {
+    fn discard_from_approved_succeeds() {
         let project_id = Uuid::new_v4();
         let mut session = DecompositionSession::new(project_id, no_in_progress, 0).unwrap();
         session.approve().unwrap();
-        let err = session.discard().unwrap_err();
-        assert!(matches!(err, NflowError::InvalidTransition { .. }));
+        assert!(session.discard().is_ok());
+        assert_eq!(session.status, DecompositionStatus::Discarded);
     }
 
     #[test]
@@ -365,13 +365,14 @@ mod tests {
     }
 
     #[test]
-    fn discard_session_fails_if_already_approved() {
+    fn discard_session_succeeds_from_approved() {
         let project_id = Uuid::new_v4();
         let mut session = DecompositionSession::new(project_id, no_in_progress, 0).unwrap();
         session.approve().unwrap();
 
-        let err = discard_session(&mut session, &[], &mut []).unwrap_err();
-        assert!(matches!(err, NflowError::InvalidTransition { .. }));
+        let deleted_ids = discard_session(&mut session, &[], &mut []).unwrap();
+        assert!(deleted_ids.is_empty());
+        assert_eq!(session.status, DecompositionStatus::Discarded);
     }
 
     // --- Display impl ---

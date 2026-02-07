@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use nflow_core::decomposition::{DecompositionSession, DecompositionSpec};
+use nflow_core::decomposition::{DecompositionSession, DecompositionSpec, DecompositionStatus};
 use nflow_core::project::{CreateProjectParams, GitProvider, ProjectService};
 use nflow_core::spec::{Spec, SpecStatus};
 use nflow_core::work_item::{
@@ -50,6 +50,8 @@ fn dispatch(req: Request, state: &HandlerState) -> HandlerResult {
         "plan.generate" => handle_plan_generate(req, state),
         "plan.show" => HandlerResult::Single(handle_plan_show(req, state)),
         "plan.feedback" => handle_plan_feedback(req, state),
+        "plan.approve" => HandlerResult::Single(handle_plan_approve(req, state)),
+        "plan.discard" => HandlerResult::Single(handle_plan_discard(req, state)),
         _ => HandlerResult::Single(Response::error(
             req.id,
             &format!("unknown command: {}", req.command),
@@ -2445,6 +2447,234 @@ fn handle_plan_feedback(req: Request, state: &HandlerState) -> HandlerResult {
     });
 
     HandlerResult::Streaming(rx)
+}
+
+/// Handle "plan.approve" command.
+///
+/// Transitions a draft wave (in_progress) to approved, making its stories schedulable.
+/// If auto_execute param is true, sets execution_enabled = true on the project.
+///
+/// Params: project_name (required), wave_number (optional — defaults to latest draft),
+///         auto_execute (optional bool — if true, enables execution on project)
+fn handle_plan_approve(req: Request, state: &HandlerState) -> Response {
+    let id = req.id.clone();
+
+    // Parse required params
+    let project_name = match req.params.get("project_name").and_then(|v| v.as_str()) {
+        Some(n) => n.to_string(),
+        None => return Response::error(id, "missing required parameter: project_name"),
+    };
+
+    let wave_number: Option<u32> = req
+        .params
+        .get("wave_number")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as u32);
+
+    let auto_execute = req
+        .params
+        .get("auto_execute")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    // Open DB connection
+    let conn = match db::open_connection(&state.db_path) {
+        Ok(c) => c,
+        Err(e) => return Response::error(id, &format!("database error: {}", e)),
+    };
+
+    // Find project
+    let mut project = match db::projects::get_project_by_name(&conn, &project_name) {
+        Ok(Some(p)) => p,
+        Ok(None) => {
+            return Response::error(
+                id,
+                &format!("NOT_FOUND: project '{}' not found", project_name),
+            )
+        }
+        Err(e) => return Response::error(id, &format!("database error: {}", e)),
+    };
+
+    // Find session (by wave_number or latest draft)
+    let mut session = if let Some(wave) = wave_number {
+        match db::decomposition_sessions::get_session_by_wave(&conn, &project.id, wave) {
+            Ok(Some(s)) => s,
+            Ok(None) => {
+                return Response::error(id, &format!("NOT_FOUND: wave W{} not found", wave))
+            }
+            Err(e) => return Response::error(id, &format!("database error: {}", e)),
+        }
+    } else {
+        match db::decomposition_sessions::find_draft_session(&conn, &project.id) {
+            Ok(Some(s)) => s,
+            Ok(None) => {
+                return Response::error(id, "NOT_FOUND: no draft wave found for this project")
+            }
+            Err(e) => return Response::error(id, &format!("database error: {}", e)),
+        }
+    };
+
+    // Validate session is in draft (in_progress) state
+    if session.status != DecompositionStatus::InProgress {
+        return Response::error(
+            id,
+            &format!(
+                "INVALID_STATE: wave W{} is {} (must be in_progress for approval)",
+                session.wave_number, session.status
+            ),
+        );
+    }
+
+    // Approve the session
+    if let Err(e) = session.approve() {
+        return Response::error(id, &format!("INVALID_STATE: {}", e));
+    }
+
+    // Persist session status change
+    if let Err(e) =
+        db::decomposition_sessions::update_session_status(&conn, &session.id, session.status)
+    {
+        return Response::error(id, &format!("database error: {}", e));
+    }
+
+    // If auto_execute is true, enable execution on the project
+    if auto_execute {
+        project.execution_enabled = true;
+        project.updated_at = chrono::Utc::now();
+        if let Err(e) = db::projects::update_project(&conn, &project) {
+            return Response::error(id, &format!("database error: {}", e));
+        }
+    }
+
+    Response::ok(
+        id,
+        serde_json::json!({
+            "wave_number": session.wave_number,
+            "status": session.status.to_string(),
+            "execution_enabled": project.execution_enabled,
+        }),
+    )
+}
+
+/// Handle "plan.discard" command.
+///
+/// Discards a wave (draft or approved), deleting all work items and reverting
+/// associated specs from decomposed back to approved.
+/// Fails if the wave has stories with in_progress status.
+///
+/// Params: project_name (required), wave_number (optional — defaults to latest draft)
+fn handle_plan_discard(req: Request, state: &HandlerState) -> Response {
+    let id = req.id.clone();
+
+    // Parse required params
+    let project_name = match req.params.get("project_name").and_then(|v| v.as_str()) {
+        Some(n) => n.to_string(),
+        None => return Response::error(id, "missing required parameter: project_name"),
+    };
+
+    let wave_number: Option<u32> = req
+        .params
+        .get("wave_number")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as u32);
+
+    // Open DB connection
+    let conn = match db::open_connection(&state.db_path) {
+        Ok(c) => c,
+        Err(e) => return Response::error(id, &format!("database error: {}", e)),
+    };
+
+    // Find project
+    let project = match db::projects::get_project_by_name(&conn, &project_name) {
+        Ok(Some(p)) => p,
+        Ok(None) => {
+            return Response::error(
+                id,
+                &format!("NOT_FOUND: project '{}' not found", project_name),
+            )
+        }
+        Err(e) => return Response::error(id, &format!("database error: {}", e)),
+    };
+
+    // Find session (by wave_number or latest non-discarded)
+    let session = if let Some(wave) = wave_number {
+        match db::decomposition_sessions::get_session_by_wave(&conn, &project.id, wave) {
+            Ok(Some(s)) => s,
+            Ok(None) => {
+                return Response::error(id, &format!("NOT_FOUND: wave W{} not found", wave))
+            }
+            Err(e) => return Response::error(id, &format!("database error: {}", e)),
+        }
+    } else {
+        match db::decomposition_sessions::find_draft_session(&conn, &project.id) {
+            Ok(Some(s)) => s,
+            Ok(None) => {
+                return Response::error(id, "NOT_FOUND: no draft wave found for this project")
+            }
+            Err(e) => return Response::error(id, &format!("database error: {}", e)),
+        }
+    };
+
+    // Validate session is not already discarded
+    if session.status == DecompositionStatus::Discarded {
+        return Response::error(
+            id,
+            &format!(
+                "INVALID_STATE: wave W{} is already discarded",
+                session.wave_number
+            ),
+        );
+    }
+
+    // Check for in_progress stories — must stop them first
+    match db::work_items::has_in_progress_stories_by_session(&conn, &session.id) {
+        Ok(true) => {
+            return Response::error(
+                id,
+                &format!(
+                    "INVALID_STATE: wave W{} has stories in progress (stop them first)",
+                    session.wave_number
+                ),
+            );
+        }
+        Ok(false) => {}
+        Err(e) => return Response::error(id, &format!("database error: {}", e)),
+    }
+
+    // Get spec IDs linked to this session
+    let spec_ids = match db::decomposition_sessions::list_spec_ids_by_session(&conn, &session.id) {
+        Ok(ids) => ids,
+        Err(e) => return Response::error(id, &format!("database error: {}", e)),
+    };
+
+    // Delete all work items for this session
+    if let Err(e) = db::work_items::delete_work_items_by_session(&conn, &session.id) {
+        return Response::error(id, &format!("database error: {}", e));
+    }
+
+    // Revert specs from decomposed back to approved
+    for spec_id in &spec_ids {
+        if let Err(e) = db::specs::update_spec_status(&conn, spec_id, SpecStatus::Approved) {
+            return Response::error(id, &format!("database error: {}", e));
+        }
+    }
+
+    // Update session status to discarded
+    if let Err(e) = db::decomposition_sessions::update_session_status(
+        &conn,
+        &session.id,
+        DecompositionStatus::Discarded,
+    ) {
+        return Response::error(id, &format!("database error: {}", e));
+    }
+
+    Response::ok(
+        id,
+        serde_json::json!({
+            "wave_number": session.wave_number,
+            "status": "discarded",
+        }),
+    )
 }
 
 #[cfg(test)]

@@ -118,6 +118,9 @@
 - Decomposition session pre-check: validate no in_progress session exists before creating new one, then pass |_| false to constructor
 - Use update_session_claude_id() for updating claude_session_id (not re-insert which fails on uniqueness)
 - Feedback handlers: find existing draft session, delete work items, revert spec status to approved, resume Claude with --resume, re-parse and persist
+- DecompositionSession::discard() allows both InProgress→Discarded and Approved→Discarded (plan.discard targets any non-discarded wave)
+- plan.discard must check has_in_progress_stories_by_session before proceeding — in_progress stories must be stopped first
+- plan.approve accepts auto_execute param: when true, sets project.execution_enabled = true via update_project
 
 # Ralph Progress Log
 Started: Sat Feb  7 03:49:10 PM MSK 2026
@@ -1342,4 +1345,23 @@ Started: Sat Feb  7 03:49:10 PM MSK 2026
   - stream_claude_decompose is reusable for both generate and feedback — just needs different RunConfig
   - insert_decomposition_session was being used for updates (silently failing) — use dedicated update functions
   - get_session_by_wave enables targeting specific waves; find_draft_session finds latest draft
+---
+
+## 2026-02-07 - US-051
+- What was implemented: Command handlers for plan.approve and plan.discard
+  - handle_plan_approve: validates wave is in draft (in_progress) state, transitions to approved via session.approve(), persists with update_session_status(), optionally sets execution_enabled=true on project when auto_execute param is true
+  - handle_plan_discard: validates wave is not already discarded, checks for in_progress stories (fails if any exist), deletes all work items, reverts linked specs from decomposed→approved, transitions session to discarded
+  - Both handlers accept project_name (required) and wave_number (optional, defaults to latest draft)
+  - Updated DecompositionSession::discard() in nflow-core to accept both InProgress→Discarded and Approved→Discarded transitions (AC requires targeting any wave)
+  - Added has_in_progress_stories_by_session() DB function for the in_progress guard
+  - Updated 2 existing tests in decomposition.rs that expected discard-from-approved to fail
+- Files changed:
+  - crates/nflow-core/src/decomposition.rs (discard() now allows Approved→Discarded, updated 2 tests)
+  - crates/nflow-daemon/src/db/work_items.rs (added has_in_progress_stories_by_session function)
+  - crates/nflow-daemon/src/handlers.rs (added handle_plan_approve + handle_plan_discard functions, dispatch routes, DecompositionStatus import)
+- **Learnings for future iterations:**
+  - DecompositionSession::discard() originally only allowed InProgress→Discarded; AC for plan.discard requires both InProgress and Approved waves to be discardable
+  - The discard handler operates directly on DB (delete work items, update specs, update session status) rather than using nflow-core's discard_session() helper, since the handler already has DB access and the helper works on in-memory structs
+  - auto_execute is a Config field but isn't wired up to handlers yet — accept it as a param to plan.approve for now
+  - Pre-existing flaky test: daemon::tests::test_foreground_mode_writes_pid_file_and_sets_shutdown fails when run with full workspace due to filesystem race conditions
 ---

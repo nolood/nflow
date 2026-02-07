@@ -332,6 +332,17 @@ pub fn list_worktree_paths_by_project(conn: &Connection, project_id: &Uuid) -> R
     Ok(paths)
 }
 
+/// Check if a session has any stories with in_progress status.
+pub fn has_in_progress_stories_by_session(conn: &Connection, session_id: &Uuid) -> Result<bool> {
+    let count: u32 = conn.query_row(
+        "SELECT COUNT(*) FROM work_items
+         WHERE decomposition_session_id = ?1 AND item_type = 'story' AND status = 'in_progress'",
+        params![session_id.to_string()],
+        |row| row.get(0),
+    )?;
+    Ok(count > 0)
+}
+
 /// Cancel all in-progress work items for a project.
 /// Returns the number of items cancelled.
 pub fn cancel_in_progress_items_by_project(conn: &Connection, project_id: &Uuid) -> Result<u64> {
