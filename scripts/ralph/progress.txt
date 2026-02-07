@@ -28,6 +28,10 @@
 - find_ready_stories/find_blocked_stories treat Cancelled same as Done for unblocking
 - detect_cycle() uses DFS with White/Gray/Black coloring; topological_sort() uses Kahn's algorithm
 - Sort Uuid collections for deterministic test output (HashSet iteration is non-deterministic)
+- Scheduler is a pure function: schedule(&SchedulerState) -> Vec<SchedulerAction> — no mutations, no IO
+- SessionStatus enum (InProgress, Approved, Discarded) gates story schedulability — only Approved sessions produce actions
+- SchedulerAction enum: MarkStoryReady, StartStory, UpdateEpicStatus — daemon executes these
+- Scheduler groups stories by session to build per-session DAGs, then uses find_ready_stories() from dag module
 
 # Ralph Progress Log
 Started: Sat Feb  7 03:49:10 PM MSK 2026
@@ -175,4 +179,25 @@ Started: Sat Feb  7 03:49:10 PM MSK 2026
   - cargo fmt collapses short multi-arg build_dag calls to single lines — don't fight it
   - DFS cycle detection with coloring is cleaner than tracking visited sets
   - Kahn's algorithm handles cycle detection as a side effect (remaining nodes = cycle members)
+---
+
+## 2026-02-07 - US-008
+- What was implemented: Pure scheduling algorithm in nflow-core
+  - SessionStatus enum (InProgress, Approved, Discarded) to gate story schedulability
+  - SchedulerState struct with work_items, dependencies, running_count, max_parallel, execution_enabled, session_statuses
+  - SchedulerAction enum with MarkStoryReady, StartStory, UpdateEpicStatus variants
+  - schedule() function — 3-phase pure algorithm:
+    1. Propagate epic statuses from child stories via propagate_epic_status()
+    2. Find pending stories with all blockers resolved in approved sessions, emit MarkStoryReady
+    3. Select Ready stories to start, respecting max_parallel and running_count
+  - Prioritization by decomposition_session_id then sort_order (wave_number sorting deferred to US-009)
+  - 23 new tests (201 total) covering all acceptance criteria
+- Files changed:
+  - crates/nflow-core/src/scheduler.rs (full scheduler module with algorithm and tests)
+- **Learnings for future iterations:**
+  - Scheduler reuses dag module's build_dag() and find_ready_stories() — no need to reimplement DAG logic
+  - Group stories by session before building DAGs — each session gets its own DAG
+  - Only filter for status == Pending when marking stories ready (avoid re-marking Ready/InProgress/Done)
+  - Only filter for status == Ready when selecting stories to start (failed stories need manual retry)
+  - cargo fmt collapses single-field struct initialization — don't fight it
 ---
