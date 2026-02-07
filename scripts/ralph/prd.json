@@ -819,7 +819,7 @@
         "Typecheck passes"
       ],
       "priority": 47,
-      "passes": false,
+      "passes": true,
       "notes": ""
     },
     {

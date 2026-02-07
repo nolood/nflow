@@ -108,6 +108,8 @@
 - Extract shared async streaming logic when multiple handlers stream Claude output (e.g., stream_claude_spec_session)
 - RunConfig.resume_session = Some(id) enables --resume for Claude session chaining
 - Session completion: spec file existence check (Path::new(spec_file_path).exists()) determines if Q&A is done
+- Soft-delete: update status to 'deleted', filter out in handler (not DB); use force=true for approved specs
+- spec.resume is a streaming handler: validates draft + not active + has session_id, then streams like spec.new
 
 # Ralph Progress Log
 Started: Sat Feb  7 03:49:10 PM MSK 2026
@@ -1234,4 +1236,26 @@ Started: Sat Feb  7 03:49:10 PM MSK 2026
   - Session completion heuristic: spec file existence (Path::new(spec_file_path).exists())
   - get_spec_by_id doesn't need project_id scope — spec UUIDs are globally unique
   - Pre-existing flaky test still fails intermittently: test_foreground_mode_writes_pid_file_and_sets_shutdown
+---
+
+## 2026-02-07 - US-047
+- What was implemented: Command handler — spec CRUD (list/view/approve/reopen/delete/resume)
+  - handle_spec_list: returns specs with name, status, session_active, created_at; filters out deleted specs (soft-delete hidden from listings)
+  - handle_spec_view: reads spec markdown content from disk, returns name, status, content
+  - handle_spec_approve: transitions draft → approved via state machine; if spec has active session, stops it first (sets session_active=false in DB)
+  - handle_spec_reopen: transitions approved → draft; rejects if decomposed or draft
+  - handle_spec_delete: soft-delete (sets status='deleted', record stays in DB, file preserved); if draft with active session stops session first; if approved requires force=true; if decomposed fails (must discard wave first)
+  - handle_spec_resume: finds latest draft spec or by name, validates session not active, validates has previous claude_session_id, marks session active, starts Claude with --resume; returns streaming
+  - All 6 new commands wired into dispatch() routing
+  - 35 new tests (76 handler tests, 783 workspace total): covering all handlers, error cases, state transitions, session management, dispatch routing
+- Files changed:
+  - crates/nflow-daemon/src/handlers.rs (6 new handler functions, dispatch routing, 35 new tests, test helper functions)
+- **Learnings for future iterations:**
+  - Soft-delete pattern: update status to 'deleted' in DB, filter in handler (not DB layer) since list_specs_by_project returns all
+  - spec.approve stops active session before transitioning — uses update_spec_session to set session_active=false
+  - spec.delete requires force=true for approved specs — prevents accidental deletion of reviewed work
+  - spec.resume is a streaming handler (like spec.new/spec.answer) — sends initial info then streams Claude output
+  - spec.resume validates: draft status, session not active, has previous claude_session_id — all three must hold
+  - cargo fmt breaks long Response::error calls with format! to multi-line — follow its lead
+  - Test helpers insert_test_spec and insert_test_spec_with_session reduce boilerplate in DB setup
 ---
