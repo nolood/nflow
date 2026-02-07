@@ -1,6 +1,7 @@
 pub mod cli;
 pub mod daemon_client;
 pub mod error;
+pub mod format;
 pub mod socket_client;
 pub mod streaming;
 
@@ -18,10 +19,12 @@ use socket_client::{ResponseStatus, SocketClient};
 async fn main() -> ExitCode {
     let cli = Cli::parse();
 
+    format::init(cli.no_color);
+
     match run(cli).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("error: {}", e);
+            eprintln!("{}", format::format_error(&e.to_string()));
             ExitCode::FAILURE
         }
     }
@@ -111,7 +114,7 @@ async fn run(cli: Cli) -> error::Result<()> {
                 "follow": false,
             });
             let resp = client.send_command("exec.log", params).await?;
-            handle_response(resp, cli.json)
+            handle_response(resp, cli.json, "exec.log")
         }
 
         // --- All other commands: send to daemon and print response ---
@@ -120,13 +123,17 @@ async fn run(cli: Cli) -> error::Result<()> {
             ensure_daemon()?;
             let mut client = SocketClient::connect().await?;
             let resp = client.send_command(&command, params).await?;
-            handle_response(resp, cli.json)
+            handle_response(resp, cli.json, &command)
         }
     }
 }
 
 /// Handle a single response from the daemon.
-fn handle_response(resp: socket_client::Response, json_mode: bool) -> error::Result<()> {
+fn handle_response(
+    resp: socket_client::Response,
+    json_mode: bool,
+    command: &str,
+) -> error::Result<()> {
     match resp.status {
         ResponseStatus::Ok => {
             if json_mode {
@@ -135,7 +142,7 @@ fn handle_response(resp: socket_client::Response, json_mode: bool) -> error::Res
                     serde_json::to_string_pretty(&resp.data).unwrap_or_default()
                 );
             } else {
-                print_response_data(&resp.data);
+                format::print_response(&resp.data, command);
             }
             Ok(())
         }
@@ -146,25 +153,6 @@ fn handle_response(resp: socket_client::Response, json_mode: bool) -> error::Res
                 .and_then(|v| v.as_str())
                 .unwrap_or("unknown error from daemon");
             Err(CliError::Socket(msg.to_string()))
-        }
-    }
-}
-
-/// Print response data in human-readable format.
-fn print_response_data(data: &serde_json::Value) {
-    match data {
-        serde_json::Value::Null => {}
-        serde_json::Value::String(s) => println!("{}", s),
-        serde_json::Value::Array(arr) => {
-            for item in arr {
-                println!("{}", serde_json::to_string_pretty(item).unwrap_or_default());
-            }
-        }
-        other => {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(other).unwrap_or_default()
-            );
         }
     }
 }
@@ -551,7 +539,19 @@ mod tests {
             status: ResponseStatus::Ok,
             data: serde_json::json!({"key": "value"}),
         };
-        let result = handle_response(resp, true);
+        let result = handle_response(resp, true, "test");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_handle_response_ok_human() {
+        format::init(true); // no color for tests
+        let resp = socket_client::Response {
+            id: "test".to_string(),
+            status: ResponseStatus::Ok,
+            data: serde_json::json!({"key": "value"}),
+        };
+        let result = handle_response(resp, false, "test");
         assert!(result.is_ok());
     }
 
@@ -562,25 +562,10 @@ mod tests {
             status: ResponseStatus::Error,
             data: serde_json::json!({"message": "NOT_FOUND: spec does not exist"}),
         };
-        let result = handle_response(resp, false);
+        let result = handle_response(resp, false, "spec.view");
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("NOT_FOUND"));
-    }
-
-    #[test]
-    fn test_print_response_data_null() {
-        print_response_data(&serde_json::Value::Null);
-    }
-
-    #[test]
-    fn test_print_response_data_string() {
-        print_response_data(&serde_json::json!("hello"));
-    }
-
-    #[test]
-    fn test_print_response_data_array() {
-        print_response_data(&serde_json::json!([{"a": 1}, {"b": 2}]));
     }
 
     #[test]

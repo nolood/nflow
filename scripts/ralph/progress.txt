@@ -1,4 +1,6 @@
 ## Codebase Patterns
+- format::init(no_color) sets global NO_COLOR AtomicBool; also checks NO_COLOR env var and libc::isatty() for pipe detection
+- format::print_response(data, command) dispatches by JSON shape (epics→tree, adjacency→DAG, waves→status); format::format_error() classifies by prefix (NOT_FOUND/ALREADY_EXISTS/INVALID_STATE/INVALID_PARAMS) and adds hint suggestions
 - SocketClient::connect_to(path) for tests; SocketClient::connect() uses socket_path() (supports NFLOW_SOCKET env override) for production
 - Protocol types duplicated in CLI (not shared with daemon crate) — keeps CLI independent of daemon internals
 - Tests using Unix sockets must use unique socket paths per test, NOT env var overrides (parallel test execution races on shared env vars)
@@ -1820,4 +1822,30 @@ Started: Sat Feb  7 03:49:10 PM MSK 2026
   - Use tokio::select! with AtomicBool polling for cancellation during stdin reads (no direct way to interrupt blocking stdin in async)
   - build_command() unreachable arms for streaming commands that are handled before the match — ensures compiler catches unhandled commands
   - Pre-existing test_acquire_lock_contention is flaky in parallel execution (race on daemon.lock file) — run with --test-threads=1 to pass reliably
+---
+
+## 2026-02-08 - US-072
+- What was implemented:
+  - New `format.rs` module with full colored output formatting for CLI responses
+  - Status icons and colors: green (done ✔), yellow bold (running ▶), yellow (ready ○), gray (pending ·), red bold (failed ✘), dim (cancelled ―)
+  - Tree rendering for plan.show: indented ASCII tree (├── └──) with status icons, progress counts, dependency arrows
+  - DAG rendering for plan.show --dag: adjacency list with arrow notation
+  - exec.status rendering: wave summaries with colored counts
+  - Error classification from daemon prefix patterns (NOT_FOUND, ALREADY_EXISTS, INVALID_STATE, INVALID_PARAMS) with hint suggestions
+  - --json mode: raw JSON output (unchanged from prior behavior)
+  - --no-color mode: strips ANSI codes; also auto-detects NO_COLOR env var and pipe (non-tty) output
+  - `libc` dependency added for isatty() terminal detection
+  - Streaming log/spec events now use format module (format_log_event, format_stream_event)
+  - handle_response() now takes command name for context-aware formatting
+  - 27 new tests in format.rs, streaming tests updated to use format module
+- Files changed:
+  - crates/nflow-cli/Cargo.toml (added libc dependency)
+  - crates/nflow-cli/src/format.rs (new — all formatting logic)
+  - crates/nflow-cli/src/main.rs (wired format module, updated handle_response signature, format::init at startup, format_error for errors)
+  - crates/nflow-cli/src/streaming.rs (replaced local print functions with format module calls, updated tests)
+- **Learnings for future iterations:**
+  - Use libc::isatty() for pipe detection instead of an external crate — keeps dependencies minimal
+  - Static AtomicBool for global color flag avoids threading issues and is zero-cost when color is enabled
+  - JSON shape detection (epics+wave_number→tree, adjacency→DAG, waves→status) lets format module dispatch correctly without knowing the command name
+  - Error prefix patterns from daemon (NOT_FOUND:, ALREADY_EXISTS:, etc.) are stable API for client-side classification
 ---

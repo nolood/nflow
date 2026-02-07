@@ -39,7 +39,7 @@ pub async fn handle_log_follow(
             return Err(CliError::Socket(msg.to_string()));
         }
 
-        print_log_event(&line.data);
+        crate::format::format_log_event(&line.data);
 
         if line.done {
             break;
@@ -118,7 +118,7 @@ pub async fn handle_spec_dialogue(
                         // Store question for prompting after stream ends
                         pending_question = Some(line.data.clone());
                     } else {
-                        print_stream_event(&line.data);
+                        crate::format::format_stream_event(&line.data);
                     }
                 }
             }
@@ -182,91 +182,6 @@ pub async fn handle_spec_dialogue(
     Ok(())
 }
 
-/// Print a log event to stdout.
-fn print_log_event(data: &serde_json::Value) {
-    let event_type = data.get("type").and_then(|v| v.as_str()).unwrap_or("");
-    match event_type {
-        "text" => {
-            if let Some(text) = data.get("text").and_then(|v| v.as_str()) {
-                print!("{}", text);
-            }
-        }
-        "tool_use" => {
-            let name = data
-                .get("name")
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown");
-            println!("[tool: {}]", name);
-        }
-        "tool_result" => {
-            if let Some(content) = data.get("content").and_then(|v| v.as_str()) {
-                let truncated = if content.len() > 200 {
-                    format!("{}...", &content[..200])
-                } else {
-                    content.to_string()
-                };
-                println!("[result: {}]", truncated);
-            }
-        }
-        "result" => {
-            if let Some(text) = data.get("text").and_then(|v| v.as_str()) {
-                println!("\n--- Result ---\n{}", text);
-            }
-        }
-        "error" => {
-            if let Some(msg) = data.get("message").and_then(|v| v.as_str()) {
-                eprintln!("error: {}", msg);
-            }
-        }
-        _ => {
-            // Unknown event type — print raw JSON for debugging
-            println!("{}", data);
-        }
-    }
-}
-
-/// Print a streaming spec event to stdout.
-fn print_stream_event(data: &serde_json::Value) {
-    let event_type = data.get("type").and_then(|v| v.as_str()).unwrap_or("");
-    match event_type {
-        "text" => {
-            if let Some(text) = data.get("text").and_then(|v| v.as_str()) {
-                print!("{}", text);
-            }
-        }
-        "tool_use" => {
-            let name = data
-                .get("name")
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown");
-            println!("[tool: {}]", name);
-        }
-        "tool_result" => {
-            if let Some(content) = data.get("content").and_then(|v| v.as_str()) {
-                let truncated = if content.len() > 200 {
-                    format!("{}...", &content[..200])
-                } else {
-                    content.to_string()
-                };
-                println!("[result: {}]", truncated);
-            }
-        }
-        "result" => {
-            if let Some(text) = data.get("text").and_then(|v| v.as_str()) {
-                println!("\n{}", text);
-            }
-        }
-        "error" => {
-            if let Some(msg) = data.get("message").and_then(|v| v.as_str()) {
-                eprintln!("error: {}", msg);
-            }
-        }
-        _ => {
-            // Unknown — skip silently for spec dialogue
-        }
-    }
-}
-
 /// Read a line of input from the user via stdin.
 ///
 /// Returns `None` on EOF (Ctrl+D) or if cancelled (Ctrl+C).
@@ -306,74 +221,85 @@ async fn wait_for_cancel(cancelled: Arc<AtomicBool>) {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::format;
 
     #[test]
-    fn test_print_log_event_text() {
+    fn test_format_log_event_text() {
+        format::init(true);
         let data = serde_json::json!({"type": "text", "text": "hello world"});
-        print_log_event(&data);
+        format::format_log_event(&data);
     }
 
     #[test]
-    fn test_print_log_event_tool_use() {
+    fn test_format_log_event_tool_use() {
+        format::init(true);
         let data = serde_json::json!({"type": "tool_use", "name": "Read"});
-        print_log_event(&data);
+        format::format_log_event(&data);
     }
 
     #[test]
-    fn test_print_log_event_error() {
+    fn test_format_log_event_error() {
+        format::init(true);
         let data = serde_json::json!({"type": "error", "message": "something failed"});
-        print_log_event(&data);
+        format::format_log_event(&data);
     }
 
     #[test]
-    fn test_print_log_event_unknown() {
+    fn test_format_log_event_unknown() {
+        format::init(true);
         let data = serde_json::json!({"type": "custom", "value": 42});
-        print_log_event(&data);
+        format::format_log_event(&data);
     }
 
     #[test]
-    fn test_print_stream_event_text() {
+    fn test_format_stream_event_text() {
+        format::init(true);
         let data = serde_json::json!({"type": "text", "text": "spec output"});
-        print_stream_event(&data);
+        format::format_stream_event(&data);
     }
 
     #[test]
-    fn test_print_stream_event_result() {
+    fn test_format_stream_event_result() {
+        format::init(true);
         let data = serde_json::json!({"type": "result", "text": "final answer"});
-        print_stream_event(&data);
+        format::format_stream_event(&data);
     }
 
     #[test]
-    fn test_print_log_event_tool_result_truncation() {
+    fn test_format_log_event_tool_result_truncation() {
+        format::init(true);
         let long_content = "x".repeat(300);
         let data = serde_json::json!({"type": "tool_result", "content": long_content});
-        print_log_event(&data);
+        format::format_log_event(&data);
     }
 
     #[test]
-    fn test_print_log_event_tool_result_short() {
+    fn test_format_log_event_tool_result_short() {
+        format::init(true);
         let data = serde_json::json!({"type": "tool_result", "content": "short result"});
-        print_log_event(&data);
+        format::format_log_event(&data);
     }
 
     #[test]
-    fn test_print_stream_event_unknown_skipped() {
+    fn test_format_stream_event_unknown_skipped() {
+        format::init(true);
         // Unknown events should be silently skipped in spec dialogue
         let data = serde_json::json!({"type": "custom_internal", "value": 42});
-        print_stream_event(&data);
+        format::format_stream_event(&data);
         // No panic, no output
     }
 
     #[test]
-    fn test_print_stream_event_tool_result() {
+    fn test_format_stream_event_tool_result() {
+        format::init(true);
         let data = serde_json::json!({"type": "tool_result", "content": "some tool output"});
-        print_stream_event(&data);
+        format::format_stream_event(&data);
     }
 
     #[test]
-    fn test_print_stream_event_error() {
+    fn test_format_stream_event_error() {
+        format::init(true);
         let data = serde_json::json!({"type": "error", "message": "oops"});
-        print_stream_event(&data);
+        format::format_stream_event(&data);
     }
 }
