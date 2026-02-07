@@ -1,0 +1,11 @@
+[package]
+name = "nflow-git"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Git operations — worktree management, branch creation, MR/PR creation via gh/glab"
+
+[dependencies]
+nflow-core = { workspace = true }
+thiserror = "2"
+tokio = { version = "1", features = ["process"] }

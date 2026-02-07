@@ -1,0 +1,17 @@
+[package]
+name = "nflow-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Thin CLI client — sends commands to daemon via Unix socket"
+
+[[bin]]
+name = "nflow"
+path = "src/main.rs"
+
+[dependencies]
+nflow-core = { workspace = true }
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

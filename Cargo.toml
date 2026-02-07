@@ -1,0 +1,21 @@
+[workspace]
+members = [
+    "crates/nflow-core",
+    "crates/nflow-claude",
+    "crates/nflow-git",
+    "crates/nflow-daemon",
+    "crates/nflow-cli",
+    "crates/nflow-tui",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+license = "MIT"
+
+[workspace.dependencies]
+nflow-core = { path = "crates/nflow-core" }
+nflow-claude = { path = "crates/nflow-claude" }
+nflow-git = { path = "crates/nflow-git" }
