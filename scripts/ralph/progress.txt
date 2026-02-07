@@ -5,6 +5,8 @@
 - exec.continue handler pattern: story-level (not task-level), handles both Failed and Cancelled stories differently. Failed→skip failed task + resume. Cancelled with worktree→InProgress + restore cancelled tasks to Pending. Cancelled without worktree→Ready/Pending based on blockers.
 - spawn_agent_for_task() is a reusable helper for spawning Claude agents — extracted from common pattern in exec.skip/exec.continue/exec.retry
 - list_dependents_of_story() finds stories blocked by a given story (WHERE blocker_id = X), complementary to list_blockers_for_story() (WHERE blocked_id = X)
+- exec.stop vs exec.cancel: stop sends SIGTERM to running agents (InProgress stories), cancel sets Pending/Ready stories to Cancelled (no process termination)
+- terminate_agent_process_sigterm() sends SIGTERM only (no wait), vs scheduler_loop::terminate_agent_process() which does SIGTERM→wait 10s→SIGKILL
 - Story completion lifecycle: rebase → push → MR creation → DB update → worktree cleanup → event broadcast (all in execute_complete_story)
 - On any failure during story completion (rebase/push/MR), story is rolled back to Failed status via fail_story_on_completion_error()
 - Wall-clock timeout: check_agent_timeouts() runs as Phase 0.5 in scheduler_tick (after reaping, before scheduling). Uses nix SIGTERM→sleep(10s)→SIGKILL pattern.
@@ -1640,4 +1642,29 @@ Started: Sat Feb  7 03:49:10 PM MSK 2026
   - Cancelled stories need task restoration: cancelled tasks should be reset to Pending before finding next pending task
   - exec.continue operates on story_id (wave-prefixed like "W1-S1") not task_id — different from exec.retry/exec.skip
   - spawn_agent_for_task() is a good refactoring target — exec.retry and exec.skip could also use it to reduce duplication
+---
+
+## 2026-02-07 - US-064
+- What was implemented:
+  - exec.stop handler: stops running stories by sending SIGTERM to agent processes
+    - Single story mode: story_id param, validates InProgress/Ready state
+    - Wave mode: --wave N + project_name, stops all running stories in that wave
+    - Project mode: project_name, stops all running agents in that project
+    - All mode: --all flag, stops all running agents across all projects
+  - exec.cancel handler: cancels pending/ready stories without process termination
+    - Validates story is Pending or Ready (not InProgress — use exec.stop for that)
+    - Warns if cancelled story has dependents that will be blocked
+    - Returns blocked_dependents list in response
+  - Helper functions: terminate_agent_process_sigterm(), stop_story_agents(), cancel_pending_tasks_in_story()
+  - New DB functions: find_running_agent_runs_for_story(), find_running_agent_runs_by_session(), list_stories_by_session()
+- Files changed:
+  - crates/nflow-daemon/src/handlers.rs (handle_exec_stop, handle_exec_cancel, helpers, dispatch routes)
+  - crates/nflow-daemon/src/db/agent_runs.rs (find_running_agent_runs_for_story, find_running_agent_runs_by_session)
+  - crates/nflow-daemon/src/db/work_items.rs (list_stories_by_session)
+- **Learnings for future iterations:**
+  - exec.stop sends SIGTERM only (no wait/SIGKILL) — unlike scheduler_loop::terminate_agent_process which does SIGTERM→wait→SIGKILL
+  - exec.stop vs exec.cancel: stop is for running stories (terminates processes), cancel is for pending/ready stories (no processes to terminate)
+  - When stopping a story: mark agent runs as Cancelled, mark tasks as Failed, mark story as Cancelled, cancel remaining pending tasks
+  - Use std::collections::HashSet to deduplicate parent story IDs when stopping multiple agents
+  - get_session_by_wave() already exists in decomposition_sessions — useful for wave-level operations
 ---
