@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use nflow_core::config::{self as core_config, Config, PartialConfig};
 use nflow_core::decomposition::{DecompositionSession, DecompositionSpec, DecompositionStatus};
 use nflow_core::project::{CreateProjectParams, GitProvider, ProjectService};
 use nflow_core::spec::{Spec, SpecStatus};
@@ -64,6 +65,8 @@ fn dispatch(req: Request, state: &HandlerState) -> HandlerResult {
         "worktree.list" => HandlerResult::Single(handle_worktree_list(req, state)),
         "worktree.clean" => HandlerResult::Single(handle_worktree_clean(req, state)),
         "cleanup.logs" => HandlerResult::Single(handle_cleanup_logs(req, state)),
+        "config.show" => HandlerResult::Single(handle_config_show(req, state)),
+        "config.set" => HandlerResult::Single(handle_config_set(req, state)),
         _ => HandlerResult::Single(Response::error(
             req.id,
             &format!("unknown command: {}", req.command),
@@ -5306,6 +5309,431 @@ fn handle_cleanup_logs(req: Request, state: &HandlerState) -> Response {
     )
 }
 
+/// Known config keys with their expected types.
+const KNOWN_CONFIG_KEYS: &[(&str, &str)] = &[
+    ("max_parallel", "integer"),
+    ("git_provider", "string"),
+    ("base_branch", "string"),
+    ("cleanup_worktrees", "boolean"),
+    ("max_turns_per_task", "integer"),
+    ("auto_execute", "boolean"),
+    ("max_time_per_task", "integer"),
+    ("log_level", "string"),
+    ("branch_template", "string"),
+    ("worktree_dir", "string"),
+];
+
+/// Returns the global config file path (~/.nflow/config.toml).
+fn global_config_path() -> std::io::Result<PathBuf> {
+    let home = std::env::var("HOME").map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "HOME environment variable not set",
+        )
+    })?;
+    Ok(PathBuf::from(home).join(".nflow").join("config.toml"))
+}
+
+/// Returns the per-project config file path (~/.nflow/projects/{name}/config.toml).
+fn project_config_path(project_name: &str) -> std::io::Result<PathBuf> {
+    let home = std::env::var("HOME").map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "HOME environment variable not set",
+        )
+    })?;
+    Ok(PathBuf::from(home)
+        .join(".nflow")
+        .join("projects")
+        .join(project_name)
+        .join("config.toml"))
+}
+
+/// Read a PartialConfig from a TOML file. Returns default (all-None) if file doesn't exist.
+fn read_partial_config(path: &Path) -> PartialConfig {
+    match std::fs::read_to_string(path) {
+        Ok(content) => toml::from_str(&content).unwrap_or_default(),
+        Err(_) => PartialConfig::default(),
+    }
+}
+
+/// Write a PartialConfig to a TOML file, creating parent directories as needed.
+fn write_partial_config(path: &Path, partial: &PartialConfig) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let content =
+        toml::to_string_pretty(partial).map_err(|e| std::io::Error::other(e.to_string()))?;
+    std::fs::write(path, content)
+}
+
+/// Determine which layer a config value comes from by checking each layer.
+fn determine_layer(
+    key: &str,
+    global: &PartialConfig,
+    project: &PartialConfig,
+    env: &PartialConfig,
+) -> &'static str {
+    // Check env first (highest priority), then project, then global, then default
+    if has_value(key, env) {
+        "env"
+    } else if has_value(key, project) {
+        "project"
+    } else if has_value(key, global) {
+        "global"
+    } else {
+        "default"
+    }
+}
+
+/// Check if a PartialConfig has a non-None value for the given key.
+fn has_value(key: &str, partial: &PartialConfig) -> bool {
+    match key {
+        "max_parallel" => partial.max_parallel.is_some(),
+        "git_provider" => partial.git_provider.is_some(),
+        "base_branch" => partial.base_branch.is_some(),
+        "cleanup_worktrees" => partial.cleanup_worktrees.is_some(),
+        "max_turns_per_task" => partial.max_turns_per_task.is_some(),
+        "auto_execute" => partial.auto_execute.is_some(),
+        "max_time_per_task" => partial.max_time_per_task.is_some(),
+        "log_level" => partial.log_level.is_some(),
+        "branch_template" => partial.branch_template.is_some(),
+        "worktree_dir" => partial.worktree_dir.is_some(),
+        _ => false,
+    }
+}
+
+/// Get a config value as a serde_json::Value from a resolved Config.
+fn config_value(key: &str, config: &Config) -> serde_json::Value {
+    match key {
+        "max_parallel" => serde_json::json!(config.max_parallel),
+        "git_provider" => serde_json::json!(config.git_provider),
+        "base_branch" => serde_json::json!(config.base_branch),
+        "cleanup_worktrees" => serde_json::json!(config.cleanup_worktrees),
+        "max_turns_per_task" => serde_json::json!(config.max_turns_per_task),
+        "auto_execute" => serde_json::json!(config.auto_execute),
+        "max_time_per_task" => serde_json::json!(config.max_time_per_task),
+        "log_level" => serde_json::json!(config.log_level),
+        "branch_template" => serde_json::json!(config.branch_template),
+        "worktree_dir" => serde_json::json!(config.worktree_dir),
+        _ => serde_json::Value::Null,
+    }
+}
+
+/// Apply a key=value pair to a PartialConfig.
+fn set_partial_config_value(
+    partial: &mut PartialConfig,
+    key: &str,
+    value: &serde_json::Value,
+) -> Result<(), String> {
+    match key {
+        "max_parallel" => {
+            let v = value.as_u64().ok_or("max_parallel must be an integer")? as u32;
+            partial.max_parallel = Some(v);
+        }
+        "git_provider" => {
+            let v = value
+                .as_str()
+                .ok_or("git_provider must be a string")?
+                .to_string();
+            partial.git_provider = Some(v);
+        }
+        "base_branch" => {
+            let v = value
+                .as_str()
+                .ok_or("base_branch must be a string")?
+                .to_string();
+            partial.base_branch = Some(v);
+        }
+        "cleanup_worktrees" => {
+            let v = value
+                .as_bool()
+                .ok_or("cleanup_worktrees must be a boolean")?;
+            partial.cleanup_worktrees = Some(v);
+        }
+        "max_turns_per_task" => {
+            let v = value
+                .as_u64()
+                .ok_or("max_turns_per_task must be an integer")? as u32;
+            partial.max_turns_per_task = Some(v);
+        }
+        "auto_execute" => {
+            let v = value.as_bool().ok_or("auto_execute must be a boolean")?;
+            partial.auto_execute = Some(v);
+        }
+        "max_time_per_task" => {
+            let v = value
+                .as_u64()
+                .ok_or("max_time_per_task must be an integer")?;
+            partial.max_time_per_task = Some(v);
+        }
+        "log_level" => {
+            let v = value
+                .as_str()
+                .ok_or("log_level must be a string")?
+                .to_string();
+            partial.log_level = Some(v);
+        }
+        "branch_template" => {
+            let v = value
+                .as_str()
+                .ok_or("branch_template must be a string")?
+                .to_string();
+            partial.branch_template = Some(v);
+        }
+        "worktree_dir" => {
+            let v = value
+                .as_str()
+                .ok_or("worktree_dir must be a string")?
+                .to_string();
+            partial.worktree_dir = Some(v);
+        }
+        _ => return Err(format!("unknown config key: {}", key)),
+    }
+    Ok(())
+}
+
+/// Handle "config.show" command.
+///
+/// Returns the effective config merged from all layers, indicating which layer each value comes from.
+///
+/// Params: project_name? (optional — if provided, includes per-project layer)
+fn handle_config_show(req: Request, state: &HandlerState) -> Response {
+    let id = req.id.clone();
+
+    let project_name: Option<String> = req
+        .params
+        .get("project_name")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    // If project_name is provided, validate the project exists
+    if let Some(ref name) = project_name {
+        let conn = match db::open_connection(&state.db_path) {
+            Ok(c) => c,
+            Err(e) => return Response::error(id, &format!("database error: {}", e)),
+        };
+        match db::projects::get_project_by_name(&conn, name) {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                return Response::error(id, &format!("NOT_FOUND: project '{}' not found", name))
+            }
+            Err(e) => return Response::error(id, &format!("database error: {}", e)),
+        }
+    }
+
+    // Load global config
+    let global_path = match global_config_path() {
+        Ok(p) => p,
+        Err(e) => return Response::error(id, &format!("config error: {}", e)),
+    };
+    let global = read_partial_config(&global_path);
+
+    // Load per-project config
+    let project = if let Some(ref name) = project_name {
+        match project_config_path(name) {
+            Ok(p) => read_partial_config(&p),
+            Err(e) => return Response::error(id, &format!("config error: {}", e)),
+        }
+    } else {
+        PartialConfig::default()
+    };
+
+    // Load env vars
+    let env_vars: Vec<(String, String)> = std::env::vars()
+        .filter(|(k, _)| k.starts_with("NFLOW_"))
+        .collect();
+    let env_refs: Vec<(&str, &str)> = env_vars
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    let env = core_config::partial_config_from_env(&env_refs);
+
+    // Resolve effective config
+    let effective = core_config::resolve(global.clone(), project.clone(), env.clone());
+
+    // Build response with per-key layer info
+    let mut entries = serde_json::Map::new();
+    for &(key, expected_type) in KNOWN_CONFIG_KEYS {
+        let layer = determine_layer(key, &global, &project, &env);
+        let value = config_value(key, &effective);
+        entries.insert(
+            key.to_string(),
+            serde_json::json!({
+                "value": value,
+                "layer": layer,
+                "type": expected_type,
+            }),
+        );
+    }
+
+    Response::ok(
+        id,
+        serde_json::json!({
+            "config": entries,
+            "project": project_name,
+        }),
+    )
+}
+
+/// Handle "config.set" command.
+///
+/// Receives: { key, value, project_name? }
+/// Without project_name: writes to global ~/.nflow/config.toml
+/// With project_name: writes to per-project config.toml
+///
+/// Validates key is known and value type matches expected.
+/// Returns updated effective value.
+fn handle_config_set(req: Request, state: &HandlerState) -> Response {
+    let id = req.id.clone();
+
+    let key = match req.params.get("key").and_then(|v| v.as_str()) {
+        Some(k) => k.to_string(),
+        None => return Response::error(id, "missing required parameter: key"),
+    };
+
+    let value = match req.params.get("value") {
+        Some(v) => v.clone(),
+        None => return Response::error(id, "missing required parameter: value"),
+    };
+
+    let project_name: Option<String> = req
+        .params
+        .get("project_name")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    // Validate key is known
+    let expected_type = match KNOWN_CONFIG_KEYS.iter().find(|&&(k, _)| k == key) {
+        Some(&(_, t)) => t,
+        None => {
+            return Response::error(
+                id,
+                &format!(
+                    "INVALID_PARAMS: unknown config key '{}'. Known keys: {}",
+                    key,
+                    KNOWN_CONFIG_KEYS
+                        .iter()
+                        .map(|&(k, _)| k)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            )
+        }
+    };
+
+    // Validate value type matches expected
+    let type_ok = match expected_type {
+        "integer" => value.is_u64() || value.is_i64(),
+        "string" => value.is_string(),
+        "boolean" => value.is_boolean(),
+        _ => false,
+    };
+    if !type_ok {
+        return Response::error(
+            id,
+            &format!(
+                "INVALID_PARAMS: config key '{}' expects {} but got {}",
+                key,
+                expected_type,
+                match &value {
+                    v if v.is_string() => "string",
+                    v if v.is_boolean() => "boolean",
+                    v if v.is_number() => "number",
+                    v if v.is_null() => "null",
+                    _ => "unknown",
+                }
+            ),
+        );
+    }
+
+    // If project_name is provided, validate the project exists
+    if let Some(ref name) = project_name {
+        let conn = match db::open_connection(&state.db_path) {
+            Ok(c) => c,
+            Err(e) => return Response::error(id, &format!("database error: {}", e)),
+        };
+        match db::projects::get_project_by_name(&conn, name) {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                return Response::error(id, &format!("NOT_FOUND: project '{}' not found", name))
+            }
+            Err(e) => return Response::error(id, &format!("database error: {}", e)),
+        }
+    }
+
+    // Determine target config file
+    let config_path = if let Some(ref name) = project_name {
+        match project_config_path(name) {
+            Ok(p) => p,
+            Err(e) => return Response::error(id, &format!("config error: {}", e)),
+        }
+    } else {
+        match global_config_path() {
+            Ok(p) => p,
+            Err(e) => return Response::error(id, &format!("config error: {}", e)),
+        }
+    };
+
+    // Read existing config, update the key, write back
+    let mut partial = read_partial_config(&config_path);
+    if let Err(e) = set_partial_config_value(&mut partial, &key, &value) {
+        return Response::error(id, &format!("INVALID_PARAMS: {}", e));
+    }
+    if let Err(e) = write_partial_config(&config_path, &partial) {
+        return Response::error(id, &format!("config write error: {}", e));
+    }
+
+    // Validate the new effective config
+    let global_path = match global_config_path() {
+        Ok(p) => p,
+        Err(e) => return Response::error(id, &format!("config error: {}", e)),
+    };
+    let global = read_partial_config(&global_path);
+    let project_partial = if let Some(ref name) = project_name {
+        match project_config_path(name) {
+            Ok(p) => read_partial_config(&p),
+            Err(_) => PartialConfig::default(),
+        }
+    } else {
+        PartialConfig::default()
+    };
+    let env_vars: Vec<(String, String)> = std::env::vars()
+        .filter(|(k, _)| k.starts_with("NFLOW_"))
+        .collect();
+    let env_refs: Vec<(&str, &str)> = env_vars
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    let env = core_config::partial_config_from_env(&env_refs);
+    let effective = core_config::resolve(global, project_partial, env);
+
+    // Validate the resolved config
+    if let Err(e) = core_config::validate(&effective) {
+        return Response::error(
+            id,
+            &format!("INVALID_PARAMS: value would create invalid config: {}", e),
+        );
+    }
+
+    let effective_value = config_value(&key, &effective);
+    let layer = if project_name.is_some() {
+        "project"
+    } else {
+        "global"
+    };
+
+    Response::ok(
+        id,
+        serde_json::json!({
+            "key": key,
+            "value": effective_value,
+            "layer": layer,
+            "project": project_name,
+        }),
+    )
+}
+
 /// Parse a duration string like "7d", "24h", "30m" into seconds.
 fn parse_duration_secs(s: &str) -> Option<u64> {
     let s = s.trim();
@@ -9478,6 +9906,314 @@ mod tests {
         let req = Request {
             id: "632".to_string(),
             command: "cleanup.logs".to_string(),
+            params: serde_json::json!({}),
+        };
+        match dispatch(req, &state) {
+            HandlerResult::Single(resp) => {
+                assert_eq!(resp.status, crate::socket::ResponseStatus::Error);
+                assert!(resp.data["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("missing required parameter"));
+            }
+            _ => panic!("expected Single response"),
+        }
+        cleanup_db(&db_dir);
+    }
+
+    // --- config.show tests ---
+
+    /// Consolidated test for config.show and config.set with filesystem operations.
+    /// All HOME-modifying config tests must run sequentially in one function.
+    #[test]
+    fn test_config_show_and_set_with_filesystem() {
+        let (state, db_dir) = make_db_state("config_show_set_fs");
+        let temp_home =
+            std::env::temp_dir().join(format!("nflow_test_home_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(temp_home.join(".nflow")).unwrap();
+        std::env::set_var("HOME", &temp_home);
+
+        // 1. config.show returns defaults with no config files
+        let req = Request {
+            id: "700".to_string(),
+            command: "config.show".to_string(),
+            params: serde_json::json!({}),
+        };
+        let resp = handle_config_show(req, &state);
+        assert_eq!(resp.status, crate::socket::ResponseStatus::Ok);
+        let config = &resp.data["config"];
+        assert_eq!(config["max_parallel"]["value"], 3);
+        assert_eq!(config["max_parallel"]["type"], "integer");
+        assert_eq!(config["git_provider"]["value"], "github");
+        assert_eq!(config["base_branch"]["value"], "main");
+        assert_eq!(config["cleanup_worktrees"]["value"], false);
+        assert_eq!(config["max_turns_per_task"]["value"], 50);
+        assert_eq!(config["auto_execute"]["value"], false);
+        assert_eq!(config["max_time_per_task"]["value"], 1800);
+        assert_eq!(config["log_level"]["value"], "info");
+        // Without any config files, all layers should be "default"
+        assert_eq!(config["max_parallel"]["layer"], "default");
+        assert_eq!(config["git_provider"]["layer"], "default");
+        assert!(resp.data["project"].is_null());
+
+        // 2. config.set integer and verify show reflects it as "global" layer
+        let req = Request {
+            id: "717".to_string(),
+            command: "config.set".to_string(),
+            params: serde_json::json!({"key": "max_parallel", "value": 8}),
+        };
+        let resp = handle_config_set(req, &state);
+        assert_eq!(
+            resp.status,
+            crate::socket::ResponseStatus::Ok,
+            "set int failed: {:?}",
+            resp.data
+        );
+        assert_eq!(resp.data["key"], "max_parallel");
+        assert_eq!(resp.data["value"], 8);
+        assert_eq!(resp.data["layer"], "global");
+        assert!(resp.data["project"].is_null());
+
+        // Verify config file was written
+        let config_path = temp_home.join(".nflow").join("config.toml");
+        assert!(config_path.exists());
+        let content = std::fs::read_to_string(&config_path).unwrap();
+        assert!(content.contains("max_parallel"));
+
+        // Verify show now reflects the global layer
+        let req = Request {
+            id: "700b".to_string(),
+            command: "config.show".to_string(),
+            params: serde_json::json!({}),
+        };
+        let resp = handle_config_show(req, &state);
+        assert_eq!(resp.status, crate::socket::ResponseStatus::Ok);
+        assert_eq!(resp.data["config"]["max_parallel"]["value"], 8);
+        assert_eq!(resp.data["config"]["max_parallel"]["layer"], "global");
+
+        // 3. config.set boolean value
+        let req = Request {
+            id: "718".to_string(),
+            command: "config.set".to_string(),
+            params: serde_json::json!({"key": "cleanup_worktrees", "value": true}),
+        };
+        let resp = handle_config_set(req, &state);
+        assert_eq!(
+            resp.status,
+            crate::socket::ResponseStatus::Ok,
+            "set bool failed: {:?}",
+            resp.data
+        );
+        assert_eq!(resp.data["key"], "cleanup_worktrees");
+        assert_eq!(resp.data["value"], true);
+
+        // 4. config.set string value
+        let req = Request {
+            id: "719".to_string(),
+            command: "config.set".to_string(),
+            params: serde_json::json!({"key": "log_level", "value": "debug"}),
+        };
+        let resp = handle_config_set(req, &state);
+        assert_eq!(
+            resp.status,
+            crate::socket::ResponseStatus::Ok,
+            "set string failed: {:?}",
+            resp.data
+        );
+        assert_eq!(resp.data["key"], "log_level");
+        assert_eq!(resp.data["value"], "debug");
+
+        // 5. Invalid git_provider rejected by validation
+        let req = Request {
+            id: "720".to_string(),
+            command: "config.set".to_string(),
+            params: serde_json::json!({"key": "git_provider", "value": "bitbucket"}),
+        };
+        let resp = handle_config_set(req, &state);
+        assert_eq!(resp.status, crate::socket::ResponseStatus::Error);
+        assert!(resp.data["message"]
+            .as_str()
+            .unwrap()
+            .contains("invalid config"));
+
+        // Cleanup
+        let _ = std::fs::remove_dir_all(&temp_home);
+        cleanup_db(&db_dir);
+    }
+
+    #[test]
+    fn test_config_show_with_project_not_found() {
+        let (state, db_dir) = make_db_state("config_show_notfound");
+        let req = Request {
+            id: "701".to_string(),
+            command: "config.show".to_string(),
+            params: serde_json::json!({"project_name": "nonexistent"}),
+        };
+        let resp = handle_config_show(req, &state);
+        assert_eq!(resp.status, crate::socket::ResponseStatus::Error);
+        assert!(resp.data["message"].as_str().unwrap().contains("NOT_FOUND"));
+        cleanup_db(&db_dir);
+    }
+
+    #[test]
+    fn test_config_show_with_project() {
+        let (state, db_dir) = make_db_state("config_show_project");
+        insert_test_project(&state, "config-proj");
+        let req = Request {
+            id: "702".to_string(),
+            command: "config.show".to_string(),
+            params: serde_json::json!({"project_name": "config-proj"}),
+        };
+        let resp = handle_config_show(req, &state);
+        assert_eq!(resp.status, crate::socket::ResponseStatus::Ok);
+        assert_eq!(resp.data["project"], "config-proj");
+        cleanup_db(&db_dir);
+    }
+
+    // --- config.set tests ---
+
+    #[test]
+    fn test_config_set_missing_key() {
+        let (state, db_dir) = make_db_state("config_set_nokey");
+        let req = Request {
+            id: "710".to_string(),
+            command: "config.set".to_string(),
+            params: serde_json::json!({"value": 5}),
+        };
+        let resp = handle_config_set(req, &state);
+        assert_eq!(resp.status, crate::socket::ResponseStatus::Error);
+        assert!(resp.data["message"]
+            .as_str()
+            .unwrap()
+            .contains("missing required parameter: key"));
+        cleanup_db(&db_dir);
+    }
+
+    #[test]
+    fn test_config_set_missing_value() {
+        let (state, db_dir) = make_db_state("config_set_noval");
+        let req = Request {
+            id: "711".to_string(),
+            command: "config.set".to_string(),
+            params: serde_json::json!({"key": "max_parallel"}),
+        };
+        let resp = handle_config_set(req, &state);
+        assert_eq!(resp.status, crate::socket::ResponseStatus::Error);
+        assert!(resp.data["message"]
+            .as_str()
+            .unwrap()
+            .contains("missing required parameter: value"));
+        cleanup_db(&db_dir);
+    }
+
+    #[test]
+    fn test_config_set_unknown_key() {
+        let (state, db_dir) = make_db_state("config_set_unknown");
+        let req = Request {
+            id: "712".to_string(),
+            command: "config.set".to_string(),
+            params: serde_json::json!({"key": "unknown_key", "value": "foo"}),
+        };
+        let resp = handle_config_set(req, &state);
+        assert_eq!(resp.status, crate::socket::ResponseStatus::Error);
+        assert!(resp.data["message"]
+            .as_str()
+            .unwrap()
+            .contains("unknown config key"));
+        cleanup_db(&db_dir);
+    }
+
+    #[test]
+    fn test_config_set_wrong_type_string_for_integer() {
+        let (state, db_dir) = make_db_state("config_set_wrongtype");
+        let req = Request {
+            id: "713".to_string(),
+            command: "config.set".to_string(),
+            params: serde_json::json!({"key": "max_parallel", "value": "not_a_number"}),
+        };
+        let resp = handle_config_set(req, &state);
+        assert_eq!(resp.status, crate::socket::ResponseStatus::Error);
+        assert!(resp.data["message"]
+            .as_str()
+            .unwrap()
+            .contains("expects integer"));
+        cleanup_db(&db_dir);
+    }
+
+    #[test]
+    fn test_config_set_wrong_type_integer_for_boolean() {
+        let (state, db_dir) = make_db_state("config_set_wrongtype2");
+        let req = Request {
+            id: "714".to_string(),
+            command: "config.set".to_string(),
+            params: serde_json::json!({"key": "cleanup_worktrees", "value": 1}),
+        };
+        let resp = handle_config_set(req, &state);
+        assert_eq!(resp.status, crate::socket::ResponseStatus::Error);
+        assert!(resp.data["message"]
+            .as_str()
+            .unwrap()
+            .contains("expects boolean"));
+        cleanup_db(&db_dir);
+    }
+
+    #[test]
+    fn test_config_set_validation_rejects_zero_max_parallel() {
+        let (state, db_dir) = make_db_state("config_set_validate");
+        let req = Request {
+            id: "715".to_string(),
+            command: "config.set".to_string(),
+            params: serde_json::json!({"key": "max_parallel", "value": 0}),
+        };
+        let resp = handle_config_set(req, &state);
+        assert_eq!(resp.status, crate::socket::ResponseStatus::Error);
+        assert!(resp.data["message"]
+            .as_str()
+            .unwrap()
+            .contains("invalid config"));
+        cleanup_db(&db_dir);
+    }
+
+    #[test]
+    fn test_config_set_project_not_found() {
+        let (state, db_dir) = make_db_state("config_set_projnotfound");
+        let req = Request {
+            id: "716".to_string(),
+            command: "config.set".to_string(),
+            params: serde_json::json!({"key": "max_parallel", "value": 5, "project_name": "nonexistent"}),
+        };
+        let resp = handle_config_set(req, &state);
+        assert_eq!(resp.status, crate::socket::ResponseStatus::Error);
+        assert!(resp.data["message"].as_str().unwrap().contains("NOT_FOUND"));
+        cleanup_db(&db_dir);
+    }
+
+    // --- config dispatch route tests ---
+
+    #[test]
+    fn test_config_show_dispatch_route() {
+        let (state, db_dir) = make_db_state("dispatch_config_show");
+        let req = Request {
+            id: "730".to_string(),
+            command: "config.show".to_string(),
+            params: serde_json::json!({}),
+        };
+        match dispatch(req, &state) {
+            HandlerResult::Single(resp) => {
+                assert_eq!(resp.status, crate::socket::ResponseStatus::Ok);
+                assert!(resp.data["config"].is_object());
+            }
+            _ => panic!("expected Single response"),
+        }
+        cleanup_db(&db_dir);
+    }
+
+    #[test]
+    fn test_config_set_dispatch_route() {
+        let (state, db_dir) = make_db_state("dispatch_config_set");
+        let req = Request {
+            id: "731".to_string(),
+            command: "config.set".to_string(),
             params: serde_json::json!({}),
         };
         match dispatch(req, &state) {
