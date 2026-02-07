@@ -445,4 +445,33 @@ Started: Sat Feb  7 03:49:10 PM MSK 2026
   - Map error variants to semantically correct types: "already exists" → AlreadyExists, "can't do X while Y" → InvalidState, "ambiguous input" → InvalidParams
   - DaemonError uses #[from] for NflowError, rusqlite::Error, std::io::Error — automatic conversion with ?
   - CliError uses String for Db since CLI doesn't directly use rusqlite (communicates via socket)
+- nflow-claude needs tokio features: process, io-util, fs, macros, rt-multi-thread (macros+rt for #[tokio::test])
+- ClaudeError is nflow-claude's error type (BinaryNotFound, SpawnFailed, ProcessExited, Io) — in crate::error
+- Use `echo` as a test stand-in for claude binary — validates arg passing via piped stdout
+- tokio::process::Command + Stdio::piped for stdout/stderr + Stdio::null for stdin
+- Lines<BufReader<ChildStdout>> for line-by-line async streaming from spawned process
+---
+
+## 2026-02-07 - US-017
+- What was implemented: Claude process runner — core spawning in nflow-claude
+  - ClaudeError enum in error.rs: BinaryNotFound, SpawnFailed, ProcessExited, Io
+  - RunConfig struct with all 9 fields: prompt, system_prompt_file, allowed_tools, max_turns, resume_session, working_dir, output_format, verbose, include_partial_messages
+  - OutputFormat enum (StreamJson) with as_arg() method
+  - ClaudeProcess struct with child process handle, PID, stdout (Lines<BufReader>), stderr (Lines<BufReader>)
+  - ClaudeRunner struct with claude_binary field, Default impl, new(), with_binary()
+  - ClaudeRunner::spawn() builds tokio::process::Command with all RunConfig options, pipes stdout/stderr, null stdin
+  - Handles binary not found (ErrorKind::NotFound → BinaryNotFound) vs other spawn errors (SpawnFailed)
+  - Cross-platform: uses std::process::Stdio and tokio::process, no platform-specific code
+  - 8 new tests (354 total) covering binary not found, process spawning, all options, minimal options, format args, defaults, clone
+- Files changed:
+  - crates/nflow-claude/Cargo.toml (added macros, rt-multi-thread tokio features)
+  - crates/nflow-claude/src/error.rs (new — ClaudeError enum)
+  - crates/nflow-claude/src/runner.rs (full runner implementation with tests)
+  - crates/nflow-claude/src/lib.rs (added error module)
+- **Learnings for future iterations:**
+  - tokio::test requires macros + rt-multi-thread features — not included by default
+  - Use `echo` binary as stand-in for claude in tests — it prints all args to stdout for assertion
+  - ClaudeProcess derives Debug — tokio's Child, Lines, BufReader all implement Debug
+  - Distinguish NotFound (binary missing) from other IO errors in spawn error handling
+  - cargo fmt breaks chained .arg().arg() calls across lines when the first arg is long
 ---
