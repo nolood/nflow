@@ -47,6 +47,13 @@
 - Foreign keys need `PRAGMA foreign_keys = ON` on every connection open
 - WAL mode set via `PRAGMA journal_mode = WAL` on connection open
 - In-memory SQLite uses "memory" journal mode even when WAL is requested — tests should accept both
+- DB module is a directory (`db/mod.rs` + submodules): convert single-file `db.rs` → `db/mod.rs` when adding CRUD submodules
+- When db.rs becomes db/mod.rs, update `include_str!` paths (add one more `../` level)
+- Use `test_conn()` in `db/mod.rs` as shared test helper: creates in-memory conn + runs migrations
+- GitProvider↔string conversion in db layer: "github"/"gitlab" strings, default to Github for unknown
+- Use rusqlite `params![]` macro for parameterized queries, `row.get("column_name")` for named column access
+- Timestamps stored/retrieved as RFC 3339 strings via `.to_rfc3339()` / `.parse::<DateTime<Utc>>()`
+- nflow-daemon needs uuid and chrono in its own Cargo.toml (not just via nflow-core re-export)
 
 # Ralph Progress Log
 Started: Sat Feb  7 03:49:10 PM MSK 2026
@@ -283,4 +290,29 @@ Started: Sat Feb  7 03:49:10 PM MSK 2026
   - SQLite stores booleans as INTEGER (0/1), UUIDs as TEXT, timestamps as TEXT
   - Foreign keys require PRAGMA foreign_keys = ON on each connection open
   - cargo fmt collapses short format! calls to single lines — don't fight it
+---
+
+## 2026-02-07 - US-012
+- What was implemented: Database CRUD for projects in nflow-daemon
+  - Converted db.rs to db/ module directory (db/mod.rs + db/projects.rs) for better organization
+  - insert_project(conn, project) — inserts Project struct into SQLite with parameterized queries
+  - get_project_by_name(conn, name) and get_project_by_id(conn, id) — single-row lookups returning Option<Project>
+  - list_projects(conn) — returns all projects ordered by name
+  - update_project(conn, project) — updates all mutable fields by ID
+  - delete_project(conn, id) — deletes by ID, cascades to specs/work_items/agent_runs via FK constraints
+  - project_name_exists(conn, name) — boolean existence check
+  - Helper functions: row_to_project(), git_provider_to_str/from_str(), parse_datetime()
+  - Shared test_conn() helper in db/mod.rs for creating migrated in-memory connections
+  - 13 new tests (269 total) covering all CRUD operations, cascading deletes, SQL injection resistance
+- Files changed:
+  - crates/nflow-daemon/Cargo.toml (added uuid, chrono dependencies)
+  - crates/nflow-daemon/src/db.rs → crates/nflow-daemon/src/db/mod.rs (converted to module directory, added test_conn helper, fixed include_str path)
+  - crates/nflow-daemon/src/db/projects.rs (new — full project CRUD with tests)
+- **Learnings for future iterations:**
+  - Converting db.rs to db/mod.rs requires updating include_str! paths (extra ../ level)
+  - rusqlite row.get("column_name") uses named column access — clearer than positional indexes
+  - GitProvider enum doesn't have Display impl — handle string conversion in DB layer
+  - Timestamps use RFC 3339 format for storage/retrieval (to_rfc3339 / parse::<DateTime<Utc>>)
+  - params! macro handles type conversion automatically (bool → INTEGER, etc.)
+  - cargo fmt collapses single-line parse chains and expands short delete_project calls — follow its lead
 ---

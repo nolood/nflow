@@ -16,7 +16,9 @@ pub enum DbError {
 pub type Result<T> = std::result::Result<T, DbError>;
 
 /// Embedded migration files, ordered by version number.
-const MIGRATIONS: &[(u32, &str)] = &[(1, include_str!("../migrations/001_init.sql"))];
+pub mod projects;
+
+const MIGRATIONS: &[(u32, &str)] = &[(1, include_str!("../../migrations/001_init.sql"))];
 
 /// Open a SQLite connection with WAL mode and foreign keys enabled.
 pub fn open_connection(db_path: &Path) -> Result<Connection> {
@@ -80,6 +82,16 @@ pub fn run_migrations(conn: &Connection, db_path: &Path) -> Result<u32> {
 
     let new_version = pending.last().map(|(v, _)| *v).unwrap_or(current);
     Ok(new_version)
+}
+
+#[cfg(test)]
+pub(crate) fn test_conn() -> Connection {
+    let conn = Connection::open_in_memory().unwrap();
+    conn.pragma_update(None, "journal_mode", "WAL").unwrap();
+    conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+    let dummy_path = std::path::Path::new("/nonexistent/nflow.db");
+    run_migrations(&conn, dummy_path).unwrap();
+    conn
 }
 
 #[cfg(test)]
