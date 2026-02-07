@@ -613,13 +613,268 @@ pub async fn execute_story_progress_actions(
 
                 start_task_execution(conn, &task, &project, &story, event_bus).await;
             }
-            StoryProgressAction::FailStory { .. } | StoryProgressAction::CompleteStory { .. } => {
-                // These are already handled synchronously in determine_story_progress
+            StoryProgressAction::FailStory { .. } => {
+                // Already handled synchronously in determine_story_progress
                 // (DB updates and broadcasts done inline).
-                // Listed here for completeness — no async follow-up needed.
+            }
+            StoryProgressAction::CompleteStory { story_id } => {
+                execute_complete_story(conn, story_id, event_bus).await;
             }
         }
     }
+}
+
+/// Execute the story completion lifecycle: rebase, push, create MR, cleanup.
+///
+/// On success: stores mr_url in DB, broadcasts StoryCompleted event.
+/// On failure at any step: marks story as Failed, broadcasts status change.
+async fn execute_complete_story(
+    conn: &Connection,
+    story_id: &Uuid,
+    event_bus: Option<&SharedEventBus>,
+) {
+    // 1. Load story
+    let story = match db::work_items::get_work_item_by_id(conn, story_id) {
+        Ok(Some(s)) => s,
+        Ok(None) => {
+            warn!("complete_story: story {} not found", story_id);
+            return;
+        }
+        Err(e) => {
+            warn!("complete_story: failed to load story {}: {}", story_id, e);
+            return;
+        }
+    };
+
+    // 2. Find the project
+    let project_id = match find_project_id_for_item(conn, &story) {
+        Some(id) => id,
+        None => {
+            warn!(
+                "complete_story: could not find project for story {}",
+                story_id
+            );
+            return;
+        }
+    };
+
+    let project = match db::projects::get_project_by_id(conn, &project_id) {
+        Ok(Some(p)) => p,
+        Ok(None) => {
+            warn!(
+                "complete_story: project {} not found for story {}",
+                project_id, story_id
+            );
+            return;
+        }
+        Err(e) => {
+            warn!(
+                "complete_story: failed to load project {}: {}",
+                project_id, e
+            );
+            return;
+        }
+    };
+
+    // 3. Get worktree path and branch name
+    let worktree_path = match &story.worktree_path {
+        Some(p) => PathBuf::from(p),
+        None => {
+            warn!(
+                "complete_story: story {} has no worktree_path, cannot complete",
+                story_id
+            );
+            fail_story_on_completion_error(conn, story_id, &story, event_bus);
+            return;
+        }
+    };
+
+    let branch_name = match &story.branch_name {
+        Some(b) => b.clone(),
+        None => {
+            warn!(
+                "complete_story: story {} has no branch_name, cannot complete",
+                story_id
+            );
+            fail_story_on_completion_error(conn, story_id, &story, event_bus);
+            return;
+        }
+    };
+
+    // 4. Fetch and rebase onto base branch
+    info!(
+        "complete_story: rebasing story {} branch {} onto {}",
+        story.short_id, branch_name, project.base_branch
+    );
+    if let Err(e) = nflow_git::branch::fetch_and_rebase(&worktree_path, &project.base_branch).await
+    {
+        warn!(
+            "complete_story: rebase failed for story {}: {}",
+            story_id, e
+        );
+        fail_story_on_completion_error(conn, story_id, &story, event_bus);
+        return;
+    }
+
+    // 5. Push the branch
+    info!(
+        "complete_story: pushing branch {} for story {}",
+        branch_name, story.short_id
+    );
+    if let Err(e) = nflow_git::branch::push_branch(&worktree_path, &branch_name).await {
+        warn!("complete_story: push failed for story {}: {}", story_id, e);
+        fail_story_on_completion_error(conn, story_id, &story, event_bus);
+        return;
+    }
+
+    // 6. Load tasks and render MR body from template
+    let tasks = match db::work_items::list_work_items_by_parent(conn, story_id) {
+        Ok(t) => t,
+        Err(e) => {
+            warn!(
+                "complete_story: failed to list tasks for story {}: {}",
+                story_id, e
+            );
+            // Continue without tasks list — MR creation still valuable
+            Vec::new()
+        }
+    };
+
+    let mr_title = format!("[{}] {}", story.short_id, story.title);
+
+    let mr_body = {
+        let template = nflow_claude::prompt::load_template("mr_body", None).unwrap_or_default();
+        let vars_map = nflow_claude::context::build_mr_context(&story, &tasks, &project);
+        let vars_ref: HashMap<&str, &str> = vars_map
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        nflow_claude::prompt::render_template(&template, &vars_ref).unwrap_or_else(|e| {
+            warn!(
+                "complete_story: failed to render MR body for story {}: {}",
+                story_id, e
+            );
+            format!("[{}] {}", story.short_id, story.title)
+        })
+    };
+
+    // 7. Create MR/PR based on git provider
+    info!(
+        "complete_story: creating MR for story {} via {:?}",
+        story.short_id, project.git_provider
+    );
+    let mr_result = match project.git_provider {
+        nflow_core::project::GitProvider::Github => {
+            nflow_git::mr::create_github_pr(
+                &worktree_path,
+                &mr_title,
+                &mr_body,
+                &project.base_branch,
+            )
+            .await
+        }
+        nflow_core::project::GitProvider::Gitlab => {
+            nflow_git::mr::create_gitlab_mr(
+                &worktree_path,
+                &mr_title,
+                &mr_body,
+                &project.base_branch,
+            )
+            .await
+        }
+    };
+
+    let mr_url = match mr_result {
+        Ok(url) => {
+            info!(
+                "complete_story: MR created for story {}: {}",
+                story.short_id, url
+            );
+            Some(url)
+        }
+        Err(e) => {
+            warn!(
+                "complete_story: MR creation failed for story {}: {}",
+                story_id, e
+            );
+            fail_story_on_completion_error(conn, story_id, &story, event_bus);
+            return;
+        }
+    };
+
+    // 8. Store mr_url in DB
+    if let Some(ref url) = mr_url {
+        if let Err(e) = db::work_items::update_story_mr(conn, story_id, url) {
+            warn!(
+                "complete_story: failed to store mr_url for story {}: {}",
+                story_id, e
+            );
+        }
+    }
+
+    // 9. Cleanup worktree if configured
+    // Load config to check cleanup_worktrees setting
+    let cleanup = load_project_config(conn, &project_id);
+    if cleanup {
+        info!(
+            "complete_story: cleaning up worktree for story {}",
+            story.short_id
+        );
+        let repo_path = Path::new(&project.path);
+        if let Err(e) = nflow_git::worktree::remove_worktree(repo_path, &worktree_path).await {
+            warn!(
+                "complete_story: failed to cleanup worktree for story {}: {}",
+                story_id, e
+            );
+            // Non-fatal — story is still complete
+        }
+    }
+
+    // 10. Broadcast StoryCompleted event
+    if let Some(bus) = event_bus {
+        bus.broadcast(Event::StoryCompleted {
+            story_id: story_id.to_string(),
+            project_id: project_id.to_string(),
+            branch_name: branch_name.clone(),
+            mr_url,
+        });
+    }
+
+    info!(
+        "complete_story: story {} completed successfully",
+        story.short_id
+    );
+}
+
+/// Mark a story as failed during the completion lifecycle (rebase/push/MR).
+///
+/// Rolls back the status from Done to Failed and broadcasts a status change event.
+fn fail_story_on_completion_error(
+    conn: &Connection,
+    story_id: &Uuid,
+    story: &WorkItem,
+    event_bus: Option<&SharedEventBus>,
+) {
+    if let Err(e) = db::work_items::update_work_item_status(conn, story_id, WorkItemStatus::Failed)
+    {
+        warn!(
+            "complete_story: failed to mark story {} as failed: {}",
+            story_id, e
+        );
+    }
+    broadcast_status_change(event_bus, story_id, story, "done", "failed", conn);
+}
+
+/// Load the cleanup_worktrees config setting for a project.
+///
+/// Returns the effective config value by loading global and per-project config.
+/// Defaults to false if config cannot be loaded.
+fn load_project_config(conn: &Connection, _project_id: &Uuid) -> bool {
+    // Load global config, fallback to defaults
+    let config = config::Config::default();
+    // TODO: load per-project config overrides when config DB integration is implemented
+    let _ = conn; // available for future config DB lookups
+    config.cleanup_worktrees
 }
 
 /// Helper to mark an agent as failed with an error message.

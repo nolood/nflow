@@ -1,4 +1,7 @@
 ## Codebase Patterns
+- Story completion lifecycle: rebase → push → MR creation → DB update → worktree cleanup → event broadcast (all in execute_complete_story)
+- On any failure during story completion (rebase/push/MR), story is rolled back to Failed status via fail_story_on_completion_error()
+- build_mr_context() from nflow-claude returns HashMap<String, String>; convert to HashMap<&str, &str> via .iter().map() for render_template()
 - Scheduler loop runs on main tokio task with tokio::time::interval(2s) — serialized, no concurrent DB writes
 - scheduler_tick() takes &Connection, builds SchedulerState per project from DB, calls nflow-core schedule()
 - recovery.rs uses db::Result (DbError), not error::Result (DaemonError) — DB-centric modules should use the db error type
@@ -1490,4 +1493,17 @@ Started: Sat Feb  7 03:49:10 PM MSK 2026
   - Story completion triggers immediately when all tasks are Done|Cancelled — no separate "check story completion" phase needed
   - Task failure always fails the story — there's no partial story recovery (retry is handled at the story level via US-061)
   - When updating function return types, all call sites (including tests) must be updated — use destructuring with `_` prefix for unused fields
+---
+
+## 2026-02-07 - US-057
+- What was implemented: Story completion lifecycle in execute_story_progress_actions. When CompleteStory action fires (all tasks done), the daemon now: (1) fetches and rebases onto base branch, (2) pushes the branch, (3) renders MR body from mr_body.md template using build_mr_context(), (4) creates MR/PR via gh/glab based on project git_provider, (5) stores mr_url in DB, (6) optionally cleans up worktree if cleanup_worktrees=true, (7) broadcasts StoryCompleted event. On failure at any step, story is rolled back to Failed status.
+- Files changed:
+  - crates/nflow-daemon/src/scheduler_loop.rs (~150 lines — execute_complete_story, fail_story_on_completion_error, load_project_config, updated execute_story_progress_actions match arm)
+- **Learnings for future iterations:**
+  - All git operations (fetch_and_rebase, push_branch) already existed in nflow-git/src/branch.rs — no new git functions needed
+  - MR creation functions (create_github_pr, create_gitlab_mr) already existed in nflow-git/src/mr.rs
+  - build_mr_context() in nflow-claude/src/context.rs already builds the template vars — just needed to load template and render
+  - Story completion is an async operation (git commands) that runs after the sync determine_story_progress sets status=Done
+  - If story completion fails, we roll back status from Done→Failed (not from InProgress→Failed) — important distinction
+  - Config loading for cleanup_worktrees currently uses defaults; per-project config DB lookup is a TODO for config integration US
 ---
