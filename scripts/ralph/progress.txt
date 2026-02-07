@@ -471,6 +471,7 @@ Started: Sat Feb  7 03:49:10 PM MSK 2026
 - `git worktree list --porcelain` outputs: "worktree /path\nHEAD abc\nbranch refs/heads/main\n\n" per entry
 - `git worktree remove --force` for worktrees with possible uncommitted changes; graceful fallback to prune for stale entries
 - Use CLI (`git rev-parse --is-inside-work-tree`) for repo validation — git2 requires OpenSSL which may not be available
+- Use `which` command to check CLI tool availability; CliNotFound error variant for missing tools (gh, glab)
 - Reuse validate_git_repo() and run_git_command() from worktree.rs via pub(crate) — all nflow-git modules share these helpers
 - run_git_command() is an async helper: runs git CLI, returns stdout on success, GitError::CommandFailed on failure
 - Use `--initial-branch=main` when creating bare repos in tests to ensure consistent branch naming
@@ -756,4 +757,26 @@ Started: Sat Feb  7 03:49:10 PM MSK 2026
   - `git reflog show HEAD --format=%H` lists reflog entries newest-first; the last entry is the initial commit when a worktree was created
   - `git clean -fd` removes untracked files (-f) and directories (-d) — needed after `git reset --hard` to fully clean state
   - cargo fmt collapses `run_git_command(worktree_path, &["reflog", "show", "HEAD", "--format=%H"])` to single line
+---
+
+## 2026-02-07 - US-030
+- What was implemented: MR/PR creation — GitHub in nflow-git
+  - check_cli_available(tool) async helper: uses `which` to verify CLI tool is in PATH, returns CliNotFound error with helpful message
+  - check_gh_auth(worktree_path) async helper: runs `gh auth status` to verify authentication, returns AuthError with details
+  - create_github_pr(worktree_path, title, body, base_branch) -> Result<String>: creates PR via `gh pr create`, returns PR URL
+  - Validates git repo, gh availability, and gh auth before attempting PR creation
+  - Parses PR URL from gh stdout output
+  - Classifies gh pr create errors: auth errors (authentication/not logged in/auth login) vs generic command failures
+  - Added CliNotFound variant to GitError enum for missing CLI tools
+  - 8 new tests (74 nflow-git total) covering CLI availability, nonexistent tools, git availability, not-a-repo, gh-not-installed, auth check, error messages
+- Files changed:
+  - crates/nflow-git/src/error.rs (added CliNotFound variant)
+  - crates/nflow-git/src/mr.rs (full GitHub PR creation implementation with tests)
+- **Learnings for future iterations:**
+  - Use `which` command for CLI tool detection — cross-platform (Linux + macOS), returns exit 0 if found
+  - `gh auth status` returns non-zero when not authenticated — check before attempting `gh pr create`
+  - `gh pr create` prints the PR URL to stdout on success — parse via stdout.trim()
+  - Tests that depend on `gh` being installed use conditional skip: `if check_cli_available("gh").await.is_ok() { return; }`
+  - CliNotFound is a separate error variant from CommandFailed — distinguishes "tool missing" from "tool failed"
+  - check_cli_available and check_gh_auth are private helpers — only create_github_pr is public API
 ---

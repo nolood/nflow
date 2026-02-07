@@ -23,6 +23,9 @@ pub enum GitError {
     #[error("Push failed: branch protection: {0}")]
     BranchProtection(String),
 
+    #[error("CLI tool not found: {0}")]
+    CliNotFound(String),
+
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 }
