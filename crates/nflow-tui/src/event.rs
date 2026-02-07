@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 
-use crate::app::{App, DialogueSessionState, Overlay, SpecPagerState, View};
+use crate::app::{App, ConfirmAction, DialogueSessionState, Overlay, SpecPagerState, View};
 
 /// Poll for a crossterm event with the given timeout.
 ///
@@ -39,6 +39,19 @@ pub enum ViewAction {
     DialogueExit,
     /// User exited pager back to specs list.
     PagerExit,
+    /// Request to generate a plan (with selected specs and with_codebase flag).
+    PlanGenerate {
+        spec_names: Vec<String>,
+        with_codebase: bool,
+    },
+    /// Request to send plan feedback text.
+    PlanFeedback(String),
+    /// Request to approve the current draft wave.
+    PlanApprove,
+    /// Request to discard the current draft wave.
+    PlanDiscard,
+    /// User closed a plan sub-view (generate dialog, feedback input, detail popup, confirm popup).
+    PlanSubViewExit,
 }
 
 /// Handle a key event, returning true if the app should continue, false to quit.
@@ -59,6 +72,12 @@ pub fn handle_key_event(app: &mut App, key: KeyEvent) -> (bool, ViewAction) {
     // If in dialogue mode, handle dialogue keys exclusively
     if app.in_dialogue() {
         let action = handle_dialogue_key(app, key);
+        return (true, action);
+    }
+
+    // If in plan sub-view (generate, feedback, detail, confirm), handle exclusively
+    if app.in_plan_sub_view() {
+        let action = handle_plan_sub_view_key(app, key);
         return (true, action);
     }
 
@@ -272,14 +291,173 @@ fn handle_plan_key(app: &mut App, key: KeyEvent) -> ViewAction {
             app.plan_tree.select_next();
             ViewAction::None
         }
-        // Toggle collapse
-        KeyCode::Enter | KeyCode::Char(' ') => {
+        // Toggle collapse (Space only; Enter now opens detail)
+        KeyCode::Char(' ') => {
             app.plan_tree.toggle_collapse();
+            ViewAction::None
+        }
+        // Enter: show detail popup for the selected item
+        KeyCode::Enter => {
+            app.open_plan_detail();
             ViewAction::None
         }
         // Toggle verify task visibility
         KeyCode::Char('h') => {
             app.plan_tree.toggle_verify_visibility();
+            ViewAction::None
+        }
+        // g: open generate dialog
+        KeyCode::Char('g') => {
+            app.open_generate_dialog();
+            ViewAction::None
+        }
+        // f: open feedback input
+        KeyCode::Char('f') => {
+            app.open_feedback_input();
+            ViewAction::None
+        }
+        // a: approve current draft wave (with confirmation)
+        KeyCode::Char('a') => {
+            app.open_confirm(ConfirmAction::ApprovePlan);
+            ViewAction::None
+        }
+        // d: discard current draft wave (with confirmation)
+        KeyCode::Char('d') => {
+            app.open_confirm(ConfirmAction::DiscardPlan);
+            ViewAction::None
+        }
+        _ => ViewAction::None,
+    }
+}
+
+/// Handle key events in plan sub-views (generate dialog, feedback input, detail, confirm).
+fn handle_plan_sub_view_key(app: &mut App, key: KeyEvent) -> ViewAction {
+    // Escape exits any plan sub-view
+    if key.code == KeyCode::Esc {
+        return ViewAction::PlanSubViewExit;
+    }
+
+    // Confirmation popup
+    if app.plan_confirm.is_some() {
+        return handle_confirm_key(app, key);
+    }
+
+    // Generate dialog
+    if app.plan_generate.is_some() {
+        return handle_generate_key(app, key);
+    }
+
+    // Feedback input
+    if app.plan_feedback.is_some() {
+        return handle_feedback_key(app, key);
+    }
+
+    // Detail popup — any key dismisses (Esc handled above)
+    if app.plan_detail.is_some() {
+        app.plan_detail = None;
+        return ViewAction::None;
+    }
+
+    ViewAction::None
+}
+
+/// Handle key events in the plan generate dialog.
+fn handle_generate_key(app: &mut App, key: KeyEvent) -> ViewAction {
+    let gen = match &mut app.plan_generate {
+        Some(g) => g,
+        None => return ViewAction::None,
+    };
+
+    match key.code {
+        // Navigate spec list
+        KeyCode::Up | KeyCode::Char('k') => {
+            gen.select_prev();
+            ViewAction::None
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            gen.select_next();
+            ViewAction::None
+        }
+        // Toggle selection of current spec
+        KeyCode::Char(' ') => {
+            gen.toggle_selection();
+            ViewAction::None
+        }
+        // Toggle --with-codebase checkbox
+        KeyCode::Char('c') => {
+            gen.with_codebase = !gen.with_codebase;
+            ViewAction::None
+        }
+        // Confirm / submit
+        KeyCode::Enter => {
+            let spec_names: Vec<String> = gen
+                .specs
+                .iter()
+                .filter(|s| s.selected)
+                .map(|s| s.name.clone())
+                .collect();
+            let with_codebase = gen.with_codebase;
+            app.plan_generate = None;
+            if spec_names.is_empty() {
+                app.status_message = "No specs selected".to_string();
+                ViewAction::None
+            } else {
+                ViewAction::PlanGenerate {
+                    spec_names,
+                    with_codebase,
+                }
+            }
+        }
+        _ => ViewAction::None,
+    }
+}
+
+/// Handle key events in the plan feedback input.
+fn handle_feedback_key(app: &mut App, key: KeyEvent) -> ViewAction {
+    let fb = match &mut app.plan_feedback {
+        Some(f) => f,
+        None => return ViewAction::None,
+    };
+
+    match key.code {
+        KeyCode::Enter => {
+            let text = fb.input.clone();
+            app.plan_feedback = None;
+            if text.is_empty() {
+                ViewAction::None
+            } else {
+                ViewAction::PlanFeedback(text)
+            }
+        }
+        KeyCode::Backspace => {
+            fb.input.pop();
+            ViewAction::None
+        }
+        KeyCode::Char(c) => {
+            fb.input.push(c);
+            ViewAction::None
+        }
+        _ => ViewAction::None,
+    }
+}
+
+/// Handle key events in the confirmation popup.
+fn handle_confirm_key(app: &mut App, key: KeyEvent) -> ViewAction {
+    let confirm = match &app.plan_confirm {
+        Some(c) => c.clone(),
+        None => return ViewAction::None,
+    };
+
+    match key.code {
+        KeyCode::Char('y') | KeyCode::Char('Y') => {
+            app.plan_confirm = None;
+            match confirm.action {
+                ConfirmAction::ApprovePlan => ViewAction::PlanApprove,
+                ConfirmAction::DiscardPlan => ViewAction::PlanDiscard,
+            }
+        }
+        KeyCode::Char('n') | KeyCode::Char('N') => {
+            app.plan_confirm = None;
             ViewAction::None
         }
         _ => ViewAction::None,
@@ -313,7 +491,7 @@ fn handle_specs_key(app: &mut App, key: KeyEvent) -> ViewAction {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::SpecItem;
+    use crate::app::{ConfirmAction, SpecItem};
 
     fn make_key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
@@ -904,26 +1082,28 @@ mod tests {
     }
 
     #[test]
-    fn test_plan_enter_toggles_collapse() {
+    fn test_plan_enter_opens_detail() {
         let mut app = app_with_plan();
         // Select the epic (index 1 in visible)
         app.plan_tree.selected = 1;
-        assert!(!app.plan_tree.nodes[1].collapsed);
+        assert!(app.plan_detail.is_none());
 
         handle_key_event(&mut app, make_key(KeyCode::Enter));
-        assert!(app.plan_tree.nodes[1].collapsed);
-
-        handle_key_event(&mut app, make_key(KeyCode::Enter));
-        assert!(!app.plan_tree.nodes[1].collapsed);
+        assert!(app.plan_detail.is_some());
+        assert_eq!(app.plan_detail.as_ref().unwrap().short_id, "W1-E1");
     }
 
     #[test]
     fn test_plan_space_toggles_collapse() {
         let mut app = app_with_plan();
         app.plan_tree.selected = 1;
+        assert!(!app.plan_tree.nodes[1].collapsed);
 
         handle_key_event(&mut app, make_key(KeyCode::Char(' ')));
         assert!(app.plan_tree.nodes[1].collapsed);
+
+        handle_key_event(&mut app, make_key(KeyCode::Char(' ')));
+        assert!(!app.plan_tree.nodes[1].collapsed);
     }
 
     #[test]
@@ -954,5 +1134,323 @@ mod tests {
 
         handle_key_event(&mut app, make_key(KeyCode::Char('j')));
         assert_eq!(app.plan_tree.selected, 0);
+    }
+
+    // --- Plan action keybindings ---
+
+    #[test]
+    fn test_plan_g_opens_generate_dialog() {
+        let mut app = app_with_plan();
+        assert!(app.plan_generate.is_none());
+
+        handle_key_event(&mut app, make_key(KeyCode::Char('g')));
+        assert!(app.plan_generate.is_some());
+    }
+
+    #[test]
+    fn test_plan_f_opens_feedback_input() {
+        let mut app = app_with_plan();
+        assert!(app.plan_feedback.is_none());
+
+        handle_key_event(&mut app, make_key(KeyCode::Char('f')));
+        assert!(app.plan_feedback.is_some());
+    }
+
+    #[test]
+    fn test_plan_a_opens_approve_confirm() {
+        let mut app = app_with_plan();
+        assert!(app.plan_confirm.is_none());
+
+        handle_key_event(&mut app, make_key(KeyCode::Char('a')));
+        assert!(app.plan_confirm.is_some());
+        assert_eq!(
+            app.plan_confirm.as_ref().unwrap().action,
+            ConfirmAction::ApprovePlan
+        );
+    }
+
+    #[test]
+    fn test_plan_d_opens_discard_confirm() {
+        let mut app = app_with_plan();
+        assert!(app.plan_confirm.is_none());
+
+        handle_key_event(&mut app, make_key(KeyCode::Char('d')));
+        assert!(app.plan_confirm.is_some());
+        assert_eq!(
+            app.plan_confirm.as_ref().unwrap().action,
+            ConfirmAction::DiscardPlan
+        );
+    }
+
+    // --- Generate dialog keybindings ---
+
+    fn app_with_generate_dialog() -> App {
+        let mut app = app_with_plan();
+        // Add some approved specs
+        app.specs_list.items = vec![
+            SpecItem {
+                name: "auth-spec".to_string(),
+                status: "approved".to_string(),
+                session_active: false,
+                created_at: "".to_string(),
+            },
+            SpecItem {
+                name: "payment-spec".to_string(),
+                status: "approved".to_string(),
+                session_active: false,
+                created_at: "".to_string(),
+            },
+            SpecItem {
+                name: "draft-spec".to_string(),
+                status: "draft".to_string(),
+                session_active: false,
+                created_at: "".to_string(),
+            },
+        ];
+        app.open_generate_dialog();
+        app
+    }
+
+    #[test]
+    fn test_generate_dialog_only_approved_specs() {
+        let app = app_with_generate_dialog();
+        let gen = app.plan_generate.as_ref().unwrap();
+        assert_eq!(gen.specs.len(), 2); // Only approved specs
+        assert_eq!(gen.specs[0].name, "auth-spec");
+        assert_eq!(gen.specs[1].name, "payment-spec");
+    }
+
+    #[test]
+    fn test_generate_dialog_navigation() {
+        let mut app = app_with_generate_dialog();
+        assert_eq!(app.plan_generate.as_ref().unwrap().cursor, 0);
+
+        handle_key_event(&mut app, make_key(KeyCode::Char('j')));
+        assert_eq!(app.plan_generate.as_ref().unwrap().cursor, 1);
+
+        handle_key_event(&mut app, make_key(KeyCode::Char('k')));
+        assert_eq!(app.plan_generate.as_ref().unwrap().cursor, 0);
+    }
+
+    #[test]
+    fn test_generate_dialog_toggle_selection() {
+        let mut app = app_with_generate_dialog();
+        assert!(!app.plan_generate.as_ref().unwrap().specs[0].selected);
+
+        handle_key_event(&mut app, make_key(KeyCode::Char(' ')));
+        assert!(app.plan_generate.as_ref().unwrap().specs[0].selected);
+
+        handle_key_event(&mut app, make_key(KeyCode::Char(' ')));
+        assert!(!app.plan_generate.as_ref().unwrap().specs[0].selected);
+    }
+
+    #[test]
+    fn test_generate_dialog_toggle_codebase() {
+        let mut app = app_with_generate_dialog();
+        assert!(!app.plan_generate.as_ref().unwrap().with_codebase);
+
+        handle_key_event(&mut app, make_key(KeyCode::Char('c')));
+        assert!(app.plan_generate.as_ref().unwrap().with_codebase);
+
+        handle_key_event(&mut app, make_key(KeyCode::Char('c')));
+        assert!(!app.plan_generate.as_ref().unwrap().with_codebase);
+    }
+
+    #[test]
+    fn test_generate_dialog_esc_closes() {
+        let mut app = app_with_generate_dialog();
+        assert!(app.plan_generate.is_some());
+
+        let (cont, action) = handle_key_event(&mut app, make_key(KeyCode::Esc));
+        assert!(cont);
+        assert_eq!(action, ViewAction::PlanSubViewExit);
+    }
+
+    #[test]
+    fn test_generate_dialog_enter_with_selection() {
+        let mut app = app_with_generate_dialog();
+        // Select first spec
+        handle_key_event(&mut app, make_key(KeyCode::Char(' ')));
+        // Toggle codebase
+        handle_key_event(&mut app, make_key(KeyCode::Char('c')));
+
+        let (cont, action) = handle_key_event(&mut app, make_key(KeyCode::Enter));
+        assert!(cont);
+        assert_eq!(
+            action,
+            ViewAction::PlanGenerate {
+                spec_names: vec!["auth-spec".to_string()],
+                with_codebase: true,
+            }
+        );
+        assert!(app.plan_generate.is_none());
+    }
+
+    #[test]
+    fn test_generate_dialog_enter_without_selection() {
+        let mut app = app_with_generate_dialog();
+
+        let (cont, action) = handle_key_event(&mut app, make_key(KeyCode::Enter));
+        assert!(cont);
+        assert_eq!(action, ViewAction::None);
+        assert!(app.plan_generate.is_none()); // Closes dialog
+        assert_eq!(app.status_message, "No specs selected");
+    }
+
+    #[test]
+    fn test_generate_dialog_blocks_global_keys() {
+        let mut app = app_with_generate_dialog();
+
+        // q should not quit
+        let (cont, _) = handle_key_event(&mut app, make_key(KeyCode::Char('q')));
+        assert!(cont);
+        assert!(!app.should_quit);
+
+        // Number keys should not switch views
+        handle_key_event(&mut app, make_key(KeyCode::Char('1')));
+        assert_eq!(app.current_view, View::Plan);
+    }
+
+    // --- Feedback input keybindings ---
+
+    fn app_with_feedback_input() -> App {
+        let mut app = app_with_plan();
+        app.open_feedback_input();
+        app
+    }
+
+    #[test]
+    fn test_feedback_typing() {
+        let mut app = app_with_feedback_input();
+
+        handle_key_event(&mut app, make_key(KeyCode::Char('h')));
+        handle_key_event(&mut app, make_key(KeyCode::Char('i')));
+        assert_eq!(app.plan_feedback.as_ref().unwrap().input, "hi");
+    }
+
+    #[test]
+    fn test_feedback_backspace() {
+        let mut app = app_with_feedback_input();
+        app.plan_feedback.as_mut().unwrap().input = "hello".to_string();
+
+        handle_key_event(&mut app, make_key(KeyCode::Backspace));
+        assert_eq!(app.plan_feedback.as_ref().unwrap().input, "hell");
+    }
+
+    #[test]
+    fn test_feedback_enter_submits() {
+        let mut app = app_with_feedback_input();
+        app.plan_feedback.as_mut().unwrap().input = "needs more tests".to_string();
+
+        let (cont, action) = handle_key_event(&mut app, make_key(KeyCode::Enter));
+        assert!(cont);
+        assert_eq!(
+            action,
+            ViewAction::PlanFeedback("needs more tests".to_string())
+        );
+        assert!(app.plan_feedback.is_none());
+    }
+
+    #[test]
+    fn test_feedback_enter_empty_does_nothing() {
+        let mut app = app_with_feedback_input();
+
+        let (cont, action) = handle_key_event(&mut app, make_key(KeyCode::Enter));
+        assert!(cont);
+        assert_eq!(action, ViewAction::None);
+        assert!(app.plan_feedback.is_none());
+    }
+
+    #[test]
+    fn test_feedback_esc_closes() {
+        let mut app = app_with_feedback_input();
+
+        let (cont, action) = handle_key_event(&mut app, make_key(KeyCode::Esc));
+        assert!(cont);
+        assert_eq!(action, ViewAction::PlanSubViewExit);
+    }
+
+    // --- Confirm popup keybindings ---
+
+    fn app_with_confirm(action: ConfirmAction) -> App {
+        let mut app = app_with_plan();
+        app.open_confirm(action);
+        app
+    }
+
+    #[test]
+    fn test_confirm_y_approves() {
+        let mut app = app_with_confirm(ConfirmAction::ApprovePlan);
+
+        let (cont, action) = handle_key_event(&mut app, make_key(KeyCode::Char('y')));
+        assert!(cont);
+        assert_eq!(action, ViewAction::PlanApprove);
+        assert!(app.plan_confirm.is_none());
+    }
+
+    #[test]
+    fn test_confirm_y_discards() {
+        let mut app = app_with_confirm(ConfirmAction::DiscardPlan);
+
+        let (cont, action) = handle_key_event(&mut app, make_key(KeyCode::Char('y')));
+        assert!(cont);
+        assert_eq!(action, ViewAction::PlanDiscard);
+        assert!(app.plan_confirm.is_none());
+    }
+
+    #[test]
+    fn test_confirm_n_cancels() {
+        let mut app = app_with_confirm(ConfirmAction::ApprovePlan);
+
+        let (cont, action) = handle_key_event(&mut app, make_key(KeyCode::Char('n')));
+        assert!(cont);
+        assert_eq!(action, ViewAction::None);
+        assert!(app.plan_confirm.is_none());
+    }
+
+    #[test]
+    fn test_confirm_esc_cancels() {
+        let mut app = app_with_confirm(ConfirmAction::ApprovePlan);
+
+        let (cont, action) = handle_key_event(&mut app, make_key(KeyCode::Esc));
+        assert!(cont);
+        assert_eq!(action, ViewAction::PlanSubViewExit);
+    }
+
+    // --- Detail popup keybindings ---
+
+    #[test]
+    fn test_detail_popup_opens_on_enter() {
+        let mut app = app_with_plan();
+        app.plan_tree.selected = 2; // Story node
+
+        handle_key_event(&mut app, make_key(KeyCode::Enter));
+        assert!(app.plan_detail.is_some());
+        let detail = app.plan_detail.as_ref().unwrap();
+        assert_eq!(detail.short_id, "W1-S1");
+        assert_eq!(detail.depth, 2);
+    }
+
+    #[test]
+    fn test_detail_popup_any_key_closes() {
+        let mut app = app_with_plan();
+        app.plan_tree.selected = 1;
+        app.open_plan_detail();
+        assert!(app.plan_detail.is_some());
+
+        // Any key (like 'x') should close the detail popup
+        handle_key_event(&mut app, make_key(KeyCode::Char('x')));
+        assert!(app.plan_detail.is_none());
+    }
+
+    #[test]
+    fn test_detail_popup_esc_closes() {
+        let mut app = app_with_plan();
+        app.open_plan_detail();
+        assert!(app.plan_detail.is_some());
+
+        let (cont, action) = handle_key_event(&mut app, make_key(KeyCode::Esc));
+        assert!(cont);
+        assert_eq!(action, ViewAction::PlanSubViewExit);
     }
 }

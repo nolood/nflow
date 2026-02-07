@@ -4,7 +4,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Row, Table, Tabs, Wrap};
 use ratatui::Frame;
 
-use crate::app::{App, DaemonState, DialogueSessionState, Overlay, View};
+use crate::app::{App, ConfirmAction, DaemonState, DialogueSessionState, Overlay, View};
 
 /// Render the entire TUI frame.
 pub fn render(app: &App, frame: &mut Frame) {
@@ -24,6 +24,17 @@ pub fn render(app: &App, frame: &mut Frame) {
     // Render overlay on top if active
     if let Some(overlay) = &app.overlay {
         render_overlay(overlay, frame, frame.area());
+    }
+
+    // Render plan sub-views on top
+    if app.plan_generate.is_some() {
+        render_generate_dialog(app, frame, frame.area());
+    } else if app.plan_feedback.is_some() {
+        render_feedback_input(app, frame, frame.area());
+    } else if app.plan_confirm.is_some() {
+        render_confirm_popup(app, frame, frame.area());
+    } else if app.plan_detail.is_some() {
+        render_detail_popup(app, frame, frame.area());
     }
 }
 
@@ -252,7 +263,7 @@ fn render_plan_tree(app: &App, frame: &mut Frame, area: Rect) {
         "h:hide verify"
     };
     let title = format!(
-        "Plan — j/k:navigate Enter:expand/collapse {} Esc:back",
+        "Plan — j/k:nav Space:collapse Enter:detail {} g:gen f:feedback a:approve d:discard",
         verify_hint
     );
     let block = Block::default()
@@ -736,6 +747,296 @@ fn render_project_switcher_overlay(frame: &mut Frame, area: Rect) {
     .block(block);
 
     frame.render_widget(content, popup_area);
+}
+
+/// Render the plan generate dialog (select specs + with_codebase checkbox).
+fn render_generate_dialog(app: &App, frame: &mut Frame, area: Rect) {
+    let gen = match &app.plan_generate {
+        Some(g) => g,
+        None => return,
+    };
+
+    let popup_area = centered_rect(60, 60, area);
+    frame.render_widget(Clear, popup_area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title("Generate Plan — Space:toggle j/k:nav c:codebase Enter:submit Esc:cancel")
+        .title_style(
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )
+        .border_style(Style::default().fg(Color::Cyan));
+
+    let mut lines = Vec::new();
+
+    lines.push(Line::from(Span::styled(
+        " Select specs to decompose:",
+        Style::default()
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD),
+    )));
+    lines.push(Line::from(""));
+
+    if gen.specs.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "   No approved specs available.",
+            Style::default().fg(Color::DarkGray),
+        )));
+    } else {
+        for (i, spec) in gen.specs.iter().enumerate() {
+            let checkbox = if spec.selected { "[x]" } else { "[ ]" };
+            let is_cursor = i == gen.cursor;
+            let style = if is_cursor {
+                Style::default().bg(Color::DarkGray).fg(Color::White)
+            } else {
+                Style::default().fg(Color::White)
+            };
+            lines.push(Line::from(Span::styled(
+                format!("   {} {}", checkbox, spec.name),
+                style,
+            )));
+        }
+    }
+
+    lines.push(Line::from(""));
+
+    // --with-codebase checkbox
+    let codebase_check = if gen.with_codebase { "[x]" } else { "[ ]" };
+    lines.push(Line::from(vec![
+        Span::styled("   ", Style::default()),
+        Span::styled(
+            format!("{} Include codebase context (c to toggle)", codebase_check),
+            Style::default().fg(Color::Yellow),
+        ),
+    ]));
+
+    let paragraph = Paragraph::new(lines)
+        .block(block)
+        .wrap(Wrap { trim: false });
+    frame.render_widget(paragraph, popup_area);
+}
+
+/// Render the plan feedback input popup.
+fn render_feedback_input(app: &App, frame: &mut Frame, area: Rect) {
+    let fb = match &app.plan_feedback {
+        Some(f) => f,
+        None => return,
+    };
+
+    let popup_area = centered_rect(60, 30, area);
+    frame.render_widget(Clear, popup_area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title("Plan Feedback — Enter:submit Esc:cancel")
+        .title_style(
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )
+        .border_style(Style::default().fg(Color::Yellow));
+
+    let lines = vec![
+        Line::from(Span::styled(
+            " Enter feedback for the current plan:",
+            Style::default().fg(Color::White),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            format!(" > {}_", fb.input),
+            Style::default().fg(Color::Green),
+        )),
+    ];
+
+    let paragraph = Paragraph::new(lines)
+        .block(block)
+        .wrap(Wrap { trim: false });
+    frame.render_widget(paragraph, popup_area);
+}
+
+/// Render the confirmation popup (approve/discard).
+fn render_confirm_popup(app: &App, frame: &mut Frame, area: Rect) {
+    let confirm = match &app.plan_confirm {
+        Some(c) => c,
+        None => return,
+    };
+
+    let popup_area = centered_rect(40, 20, area);
+    frame.render_widget(Clear, popup_area);
+
+    let border_color = match confirm.action {
+        ConfirmAction::ApprovePlan => Color::Green,
+        ConfirmAction::DiscardPlan => Color::Red,
+    };
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title("Confirm")
+        .title_style(
+            Style::default()
+                .fg(border_color)
+                .add_modifier(Modifier::BOLD),
+        )
+        .border_style(Style::default().fg(border_color));
+
+    let lines = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            format!("  {}", confirm.action.message()),
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  y", Style::default().fg(Color::Green)),
+            Span::styled(" = Yes    ", Style::default().fg(Color::DarkGray)),
+            Span::styled("n", Style::default().fg(Color::Red)),
+            Span::styled(" = No    ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Esc", Style::default().fg(Color::DarkGray)),
+            Span::styled(" = Cancel", Style::default().fg(Color::DarkGray)),
+        ]),
+    ];
+
+    let paragraph = Paragraph::new(lines)
+        .block(block)
+        .wrap(Wrap { trim: false });
+    frame.render_widget(paragraph, popup_area);
+}
+
+/// Render the plan node detail popup.
+fn render_detail_popup(app: &App, frame: &mut Frame, area: Rect) {
+    let detail = match &app.plan_detail {
+        Some(d) => d,
+        None => return,
+    };
+
+    let popup_area = centered_rect(60, 50, area);
+    frame.render_widget(Clear, popup_area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!(
+            "Detail: {} — press any key to close",
+            detail.short_id
+        ))
+        .title_style(
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )
+        .border_style(Style::default().fg(Color::Cyan));
+
+    let (icon, icon_color) = status_icon(&detail.status);
+    let depth_label = match detail.depth {
+        0 => "Wave",
+        1 => "Epic",
+        2 => "Story",
+        3 => "Task",
+        _ => "Item",
+    };
+
+    let mut lines = vec![
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(
+                "  Type: ",
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(depth_label, Style::default().fg(Color::White)),
+        ]),
+        Line::from(vec![
+            Span::styled(
+                "  ID:   ",
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                &detail.short_id,
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled(
+                "  Title: ",
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(&detail.title, Style::default().fg(Color::White)),
+        ]),
+    ];
+
+    if !detail.status.is_empty() {
+        lines.push(Line::from(vec![
+            Span::styled(
+                "  Status: ",
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(format!("{} ", icon), Style::default().fg(icon_color)),
+            Span::styled(&detail.status, Style::default().fg(icon_color)),
+        ]));
+    }
+
+    if let Some(ref progress) = detail.progress {
+        lines.push(Line::from(vec![
+            Span::styled(
+                "  Progress: ",
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(progress, Style::default().fg(Color::White)),
+        ]));
+    }
+
+    if let Some(ref kind) = detail.kind {
+        lines.push(Line::from(vec![
+            Span::styled(
+                "  Kind: ",
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                kind,
+                Style::default().fg(if kind == "verify" {
+                    Color::DarkGray
+                } else {
+                    Color::Blue
+                }),
+            ),
+        ]));
+    }
+
+    if !detail.depends_on.is_empty() {
+        lines.push(Line::from(vec![
+            Span::styled(
+                "  Dependencies: ",
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                detail.depends_on.join(", "),
+                Style::default().fg(Color::Yellow),
+            ),
+        ]));
+    }
+
+    let paragraph = Paragraph::new(lines)
+        .block(block)
+        .wrap(Wrap { trim: false });
+    frame.render_widget(paragraph, popup_area);
 }
 
 /// Render the filter overlay (placeholder for future implementation).

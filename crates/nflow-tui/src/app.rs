@@ -528,6 +528,118 @@ impl PlanTreeState {
     }
 }
 
+/// A selectable spec entry for the generate dialog.
+#[derive(Debug, Clone)]
+pub struct GenerateSpecItem {
+    pub name: String,
+    pub selected: bool,
+}
+
+/// State for the plan generate dialog.
+#[derive(Debug)]
+pub struct PlanGenerateState {
+    /// Available specs to select from.
+    pub specs: Vec<GenerateSpecItem>,
+    /// Currently highlighted item index.
+    pub cursor: usize,
+    /// Whether to include codebase context (--with-codebase).
+    pub with_codebase: bool,
+}
+
+impl PlanGenerateState {
+    pub fn new(spec_names: Vec<String>) -> Self {
+        let specs = spec_names
+            .into_iter()
+            .map(|name| GenerateSpecItem {
+                name,
+                selected: false,
+            })
+            .collect();
+        Self {
+            specs,
+            cursor: 0,
+            with_codebase: false,
+        }
+    }
+
+    pub fn select_prev(&mut self) {
+        if !self.specs.is_empty() && self.cursor > 0 {
+            self.cursor -= 1;
+        }
+    }
+
+    pub fn select_next(&mut self) {
+        if !self.specs.is_empty() && self.cursor < self.specs.len() - 1 {
+            self.cursor += 1;
+        }
+    }
+
+    pub fn toggle_selection(&mut self) {
+        if let Some(spec) = self.specs.get_mut(self.cursor) {
+            spec.selected = !spec.selected;
+        }
+    }
+}
+
+/// State for the plan feedback input.
+#[derive(Debug)]
+pub struct PlanFeedbackState {
+    /// User's feedback text input.
+    pub input: String,
+}
+
+impl PlanFeedbackState {
+    pub fn new() -> Self {
+        Self {
+            input: String::new(),
+        }
+    }
+}
+
+/// Action to confirm in the confirmation popup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfirmAction {
+    ApprovePlan,
+    DiscardPlan,
+}
+
+impl ConfirmAction {
+    pub fn message(&self) -> &'static str {
+        match self {
+            ConfirmAction::ApprovePlan => "Approve current draft wave?",
+            ConfirmAction::DiscardPlan => "Discard current draft wave?",
+        }
+    }
+}
+
+/// State for the confirmation popup.
+#[derive(Debug, Clone)]
+pub struct PlanConfirmState {
+    pub action: ConfirmAction,
+}
+
+/// A detail entry for the plan node detail popup.
+#[derive(Debug, Clone)]
+pub struct PlanDetailState {
+    /// Node short ID.
+    pub short_id: String,
+    /// Node title.
+    pub title: String,
+    /// Node status.
+    pub status: String,
+    /// Description (same as title for now; reserved for future detailed descriptions).
+    #[allow(dead_code)]
+    pub description: String,
+    /// Dependencies (stories only).
+    pub depends_on: Vec<String>,
+    /// Progress (stories only).
+    pub progress: Option<String>,
+    /// Task kind (tasks only).
+    pub kind: Option<String>,
+    /// Node depth.
+    pub depth: u8,
+}
+
 /// Overlay that can be displayed on top of the current view.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Overlay {
@@ -623,6 +735,14 @@ pub struct App {
     pub spec_pager: Option<SpecPagerState>,
     /// Plan tree view state.
     pub plan_tree: PlanTreeState,
+    /// Active plan generate dialog state (if open).
+    pub plan_generate: Option<PlanGenerateState>,
+    /// Active plan feedback input state (if open).
+    pub plan_feedback: Option<PlanFeedbackState>,
+    /// Active plan confirmation popup state (if open).
+    pub plan_confirm: Option<PlanConfirmState>,
+    /// Active plan node detail popup state (if open).
+    pub plan_detail: Option<PlanDetailState>,
 }
 
 impl App {
@@ -641,6 +761,10 @@ impl App {
             spec_dialogue: None,
             spec_pager: None,
             plan_tree: PlanTreeState::new(),
+            plan_generate: None,
+            plan_feedback: None,
+            plan_confirm: None,
+            plan_detail: None,
         }
     }
 
@@ -727,6 +851,63 @@ impl App {
     /// Exit spec pager mode and return to specs list.
     pub fn exit_pager(&mut self) {
         self.spec_pager = None;
+    }
+
+    /// Returns true if any plan sub-view is active (generate, feedback, detail, confirm).
+    pub fn in_plan_sub_view(&self) -> bool {
+        self.plan_generate.is_some()
+            || self.plan_feedback.is_some()
+            || self.plan_confirm.is_some()
+            || self.plan_detail.is_some()
+    }
+
+    /// Open the plan generate dialog with available approved specs.
+    pub fn open_generate_dialog(&mut self) {
+        // Gather approved spec names from the specs list
+        let approved_specs: Vec<String> = self
+            .specs_list
+            .items
+            .iter()
+            .filter(|s| s.status == "approved")
+            .map(|s| s.name.clone())
+            .collect();
+        self.plan_generate = Some(PlanGenerateState::new(approved_specs));
+    }
+
+    /// Open the plan feedback input.
+    pub fn open_feedback_input(&mut self) {
+        self.plan_feedback = Some(PlanFeedbackState::new());
+    }
+
+    /// Open a confirmation popup for the given action.
+    pub fn open_confirm(&mut self, action: ConfirmAction) {
+        self.plan_confirm = Some(PlanConfirmState { action });
+    }
+
+    /// Open the detail popup for the currently selected plan node.
+    pub fn open_plan_detail(&mut self) {
+        let visible = self.plan_tree.visible_nodes();
+        if let Some(&(real_idx, _)) = visible.get(self.plan_tree.selected) {
+            let node = &self.plan_tree.nodes[real_idx];
+            self.plan_detail = Some(PlanDetailState {
+                short_id: node.short_id.clone(),
+                title: node.title.clone(),
+                status: node.status.clone(),
+                description: node.title.clone(),
+                depends_on: node.depends_on.clone(),
+                progress: node.progress.clone(),
+                kind: node.kind.clone(),
+                depth: node.depth,
+            });
+        }
+    }
+
+    /// Close any open plan sub-view.
+    pub fn close_plan_sub_view(&mut self) {
+        self.plan_generate = None;
+        self.plan_feedback = None;
+        self.plan_confirm = None;
+        self.plan_detail = None;
     }
 
     /// Attempt to connect to the daemon and fetch initial state.
@@ -1603,5 +1784,203 @@ mod tests {
         app.exit_dialogue();
         assert!(!app.in_dialogue());
         assert!(app.spec_dialogue.is_none());
+    }
+
+    // --- PlanGenerateState tests ---
+
+    #[test]
+    fn test_generate_state_initial() {
+        let state = PlanGenerateState::new(vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(state.specs.len(), 2);
+        assert_eq!(state.cursor, 0);
+        assert!(!state.with_codebase);
+        assert!(!state.specs[0].selected);
+        assert!(!state.specs[1].selected);
+    }
+
+    #[test]
+    fn test_generate_state_navigation() {
+        let mut state = PlanGenerateState::new(vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(state.cursor, 0);
+
+        state.select_next();
+        assert_eq!(state.cursor, 1);
+
+        state.select_next();
+        assert_eq!(state.cursor, 1); // Can't go past end
+
+        state.select_prev();
+        assert_eq!(state.cursor, 0);
+
+        state.select_prev();
+        assert_eq!(state.cursor, 0); // Can't go below 0
+    }
+
+    #[test]
+    fn test_generate_state_toggle_selection() {
+        let mut state = PlanGenerateState::new(vec!["a".to_string(), "b".to_string()]);
+
+        state.toggle_selection();
+        assert!(state.specs[0].selected);
+        assert!(!state.specs[1].selected);
+
+        state.toggle_selection();
+        assert!(!state.specs[0].selected);
+
+        state.select_next();
+        state.toggle_selection();
+        assert!(state.specs[1].selected);
+    }
+
+    #[test]
+    fn test_generate_state_empty() {
+        let mut state = PlanGenerateState::new(vec![]);
+        // Should not panic
+        state.select_next();
+        state.select_prev();
+        state.toggle_selection();
+    }
+
+    // --- PlanFeedbackState tests ---
+
+    #[test]
+    fn test_feedback_state_initial() {
+        let state = PlanFeedbackState::new();
+        assert!(state.input.is_empty());
+    }
+
+    // --- ConfirmAction tests ---
+
+    #[test]
+    fn test_confirm_action_messages() {
+        assert!(!ConfirmAction::ApprovePlan.message().is_empty());
+        assert!(!ConfirmAction::DiscardPlan.message().is_empty());
+    }
+
+    // --- Plan sub-view lifecycle ---
+
+    #[test]
+    fn test_plan_sub_view_detection() {
+        let mut app = App::new("test".to_string());
+        assert!(!app.in_plan_sub_view());
+
+        app.plan_generate = Some(PlanGenerateState::new(vec![]));
+        assert!(app.in_plan_sub_view());
+        app.plan_generate = None;
+
+        app.plan_feedback = Some(PlanFeedbackState::new());
+        assert!(app.in_plan_sub_view());
+        app.plan_feedback = None;
+
+        app.plan_confirm = Some(PlanConfirmState {
+            action: ConfirmAction::ApprovePlan,
+        });
+        assert!(app.in_plan_sub_view());
+        app.plan_confirm = None;
+
+        app.plan_detail = Some(PlanDetailState {
+            short_id: "W1-E1".to_string(),
+            title: "Test".to_string(),
+            status: "pending".to_string(),
+            description: "Test".to_string(),
+            depends_on: vec![],
+            progress: None,
+            kind: None,
+            depth: 1,
+        });
+        assert!(app.in_plan_sub_view());
+    }
+
+    #[test]
+    fn test_close_plan_sub_view_clears_all() {
+        let mut app = App::new("test".to_string());
+        app.plan_generate = Some(PlanGenerateState::new(vec![]));
+        app.plan_feedback = Some(PlanFeedbackState::new());
+        app.plan_confirm = Some(PlanConfirmState {
+            action: ConfirmAction::ApprovePlan,
+        });
+        app.plan_detail = Some(PlanDetailState {
+            short_id: "".to_string(),
+            title: "".to_string(),
+            status: "".to_string(),
+            description: "".to_string(),
+            depends_on: vec![],
+            progress: None,
+            kind: None,
+            depth: 0,
+        });
+
+        app.close_plan_sub_view();
+        assert!(app.plan_generate.is_none());
+        assert!(app.plan_feedback.is_none());
+        assert!(app.plan_confirm.is_none());
+        assert!(app.plan_detail.is_none());
+    }
+
+    #[test]
+    fn test_open_plan_detail_from_tree() {
+        let mut app = App::new("test".to_string());
+        app.switch_view(View::Plan);
+        let data = serde_json::json!({
+            "wave_number": 1,
+            "status": "approved",
+            "epics": [{
+                "short_id": "W1-E1",
+                "title": "Epic Title",
+                "status": "pending",
+                "stories": [{
+                    "short_id": "W1-S1",
+                    "title": "Story Title",
+                    "status": "ready",
+                    "progress": "1/3",
+                    "depends_on": ["W1-S2"],
+                    "tasks": []
+                }]
+            }]
+        });
+        app.plan_tree.update_from_response(&data);
+
+        // Select the story node (index 2 in visible)
+        app.plan_tree.selected = 2;
+        app.open_plan_detail();
+
+        assert!(app.plan_detail.is_some());
+        let detail = app.plan_detail.as_ref().unwrap();
+        assert_eq!(detail.short_id, "W1-S1");
+        assert_eq!(detail.title, "Story Title");
+        assert_eq!(detail.status, "ready");
+        assert_eq!(detail.progress.as_deref(), Some("1/3"));
+        assert_eq!(detail.depends_on, vec!["W1-S2"]);
+        assert_eq!(detail.depth, 2);
+    }
+
+    #[test]
+    fn test_open_generate_dialog_filters_approved() {
+        let mut app = App::new("test".to_string());
+        app.specs_list.items = vec![
+            SpecItem {
+                name: "draft-spec".to_string(),
+                status: "draft".to_string(),
+                session_active: false,
+                created_at: "".to_string(),
+            },
+            SpecItem {
+                name: "approved-spec".to_string(),
+                status: "approved".to_string(),
+                session_active: false,
+                created_at: "".to_string(),
+            },
+            SpecItem {
+                name: "decomposed-spec".to_string(),
+                status: "decomposed".to_string(),
+                session_active: false,
+                created_at: "".to_string(),
+            },
+        ];
+
+        app.open_generate_dialog();
+        let gen = app.plan_generate.as_ref().unwrap();
+        assert_eq!(gen.specs.len(), 1);
+        assert_eq!(gen.specs[0].name, "approved-spec");
     }
 }

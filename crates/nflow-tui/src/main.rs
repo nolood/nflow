@@ -140,6 +140,24 @@ async fn event_loop(
                 event::ViewAction::PagerExit => {
                     app.exit_pager();
                 }
+                event::ViewAction::PlanGenerate {
+                    spec_names,
+                    with_codebase,
+                } => {
+                    handle_plan_generate(app, client, spec_names, with_codebase).await;
+                }
+                event::ViewAction::PlanFeedback(text) => {
+                    handle_plan_feedback(app, client, &text).await;
+                }
+                event::ViewAction::PlanApprove => {
+                    handle_plan_approve(app, client).await;
+                }
+                event::ViewAction::PlanDiscard => {
+                    handle_plan_discard(app, client).await;
+                }
+                event::ViewAction::PlanSubViewExit => {
+                    app.close_plan_sub_view();
+                }
                 _ => {}
             }
 
@@ -341,6 +359,118 @@ fn handle_dialogue_end(app: &mut App) {
     if let Some(dialogue) = &mut app.spec_dialogue {
         dialogue.add_claude_message("[Session ended by user]".to_string());
         dialogue.session_state = DialogueSessionState::Completed;
+    }
+}
+
+/// Handle plan generate action.
+async fn handle_plan_generate(
+    app: &mut App,
+    client: &mut SocketClient,
+    spec_names: Vec<String>,
+    with_codebase: bool,
+) {
+    let params = serde_json::json!({
+        "project_name": &app.project,
+        "spec_names": spec_names,
+        "with_codebase": with_codebase,
+    });
+
+    match client.send_command("plan.generate", params).await {
+        Ok(resp) if resp.status == ResponseStatus::Ok => {
+            app.status_message = "Plan generation started".to_string();
+            // Refresh plan tree
+            app.fetch_plan(client).await.ok();
+        }
+        Ok(resp) => {
+            let msg = resp
+                .data
+                .get("message")
+                .and_then(|v| v.as_str())
+                .unwrap_or("Failed to generate plan");
+            app.status_message = msg.to_string();
+        }
+        Err(e) => {
+            app.status_message = format!("Error: {}", e);
+        }
+    }
+}
+
+/// Handle plan feedback action.
+async fn handle_plan_feedback(app: &mut App, client: &mut SocketClient, text: &str) {
+    let params = serde_json::json!({
+        "project_name": &app.project,
+        "feedback": text,
+    });
+
+    match client.send_command("plan.feedback", params).await {
+        Ok(resp) if resp.status == ResponseStatus::Ok => {
+            app.status_message = "Feedback sent".to_string();
+            // Refresh plan tree
+            app.fetch_plan(client).await.ok();
+        }
+        Ok(resp) => {
+            let msg = resp
+                .data
+                .get("message")
+                .and_then(|v| v.as_str())
+                .unwrap_or("Failed to send feedback");
+            app.status_message = msg.to_string();
+        }
+        Err(e) => {
+            app.status_message = format!("Error: {}", e);
+        }
+    }
+}
+
+/// Handle plan approve action.
+async fn handle_plan_approve(app: &mut App, client: &mut SocketClient) {
+    let params = serde_json::json!({
+        "project_name": &app.project,
+    });
+
+    match client.send_command("plan.approve", params).await {
+        Ok(resp) if resp.status == ResponseStatus::Ok => {
+            app.status_message = "Plan approved".to_string();
+            // Refresh plan tree
+            app.fetch_plan(client).await.ok();
+        }
+        Ok(resp) => {
+            let msg = resp
+                .data
+                .get("message")
+                .and_then(|v| v.as_str())
+                .unwrap_or("Failed to approve plan");
+            app.status_message = msg.to_string();
+        }
+        Err(e) => {
+            app.status_message = format!("Error: {}", e);
+        }
+    }
+}
+
+/// Handle plan discard action.
+async fn handle_plan_discard(app: &mut App, client: &mut SocketClient) {
+    let params = serde_json::json!({
+        "project_name": &app.project,
+    });
+
+    match client.send_command("plan.discard", params).await {
+        Ok(resp) if resp.status == ResponseStatus::Ok => {
+            app.status_message = "Plan discarded".to_string();
+            // Refresh plan tree
+            app.fetch_plan(client).await.ok();
+        }
+        Ok(resp) => {
+            let msg = resp
+                .data
+                .get("message")
+                .and_then(|v| v.as_str())
+                .unwrap_or("Failed to discard plan");
+            app.status_message = msg.to_string();
+        }
+        Err(e) => {
+            app.status_message = format!("Error: {}", e);
+        }
     }
 }
 
