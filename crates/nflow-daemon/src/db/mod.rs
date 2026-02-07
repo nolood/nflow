@@ -16,6 +16,8 @@ pub enum DbError {
 pub type Result<T> = std::result::Result<T, DbError>;
 
 /// Embedded migration files, ordered by version number.
+pub mod agent_runs;
+pub mod decomposition_sessions;
 pub mod projects;
 pub mod specs;
 pub mod work_items;

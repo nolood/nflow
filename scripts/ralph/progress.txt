@@ -62,6 +62,11 @@
 - Work items use parent_id FK with ON DELETE CASCADE — deleting an epic cascades to stories, stories to tasks
 - list_dependencies_by_session joins on work_items to filter by session (dependencies table has no session_id column)
 - count_tasks_by_status uses GROUP BY + item_type='task' filter to count only tasks under a story
+- AgentRun struct lives in db/agent_runs.rs (daemon layer), not nflow-core — it tracks OS processes
+- AgentRunStatus enum: Running, Succeeded, Failed, Cancelled — separate from WorkItemStatus
+- Decomposition session CRUD uses nflow-core's DecompositionSession/DecompositionSpec structs directly
+- next_wave_number DB implementation: SELECT MAX(wave_number) + 1, scoped by project_id
+- find_draft_session returns the most recent in_progress session (ORDER BY created_at DESC LIMIT 1)
 
 # Ralph Progress Log
 Started: Sat Feb  7 03:49:10 PM MSK 2026
@@ -379,4 +384,32 @@ Started: Sat Feb  7 03:49:10 PM MSK 2026
   - cargo fmt collapses 3-param function signatures and expands Dependency::new calls — follow its lead
   - make_project test helper needs unique names (format with Uuid) when multiple projects are created in different tests
   - Optional fields (branch_name, worktree_path, mr_url, commit_hash, kind) need Option<String> handling in row mapping
+---
+
+## 2026-02-07 - US-015
+- What was implemented: Database CRUD for agent runs and decomposition sessions in nflow-daemon
+  - Created db/agent_runs.rs with AgentRun struct and AgentRunStatus enum (Running, Succeeded, Failed, Cancelled)
+  - insert_agent_run(conn, run) — inserts AgentRun struct with all 11 fields
+  - update_agent_run_status(id, status, exit_code, error_message, finished_at) — updates terminal state fields
+  - find_running_agent_runs() — returns all agent runs with status='running' for crash recovery
+  - count_agent_runs_for_task(work_item_id) — counts total runs for retry warning display
+  - Created db/decomposition_sessions.rs using nflow-core's DecompositionSession/DecompositionSpec structs
+  - insert_decomposition_session(conn, session) — inserts DecompositionSession with all 7 fields
+  - insert_decomposition_spec(conn, spec) — inserts session↔spec mapping
+  - get_decomposition_session(id) — single-row lookup by ID
+  - find_draft_session(project_id) — returns most recent in_progress session
+  - list_sessions_by_project(project_id) — returns all sessions ordered by wave_number
+  - update_session_status(id, status) — updates status and timestamp
+  - next_wave_number(project_id) — SELECT MAX(wave_number) + 1, returns 1 if none exist
+  - 32 new tests (346 total) covering all CRUD operations, cascading deletes, project scoping, SQL injection resistance
+- Files changed:
+  - crates/nflow-daemon/src/db/mod.rs (added agent_runs and decomposition_sessions modules)
+  - crates/nflow-daemon/src/db/agent_runs.rs (new — AgentRun struct, AgentRunStatus enum, CRUD functions with tests)
+  - crates/nflow-daemon/src/db/decomposition_sessions.rs (new — decomposition session and spec CRUD with tests)
+- **Learnings for future iterations:**
+  - AgentRun struct lives in the daemon DB layer, not nflow-core — it's an OS-process tracking concern
+  - DecompositionSession/DecompositionSpec structs are reused from nflow-core — only status_to_str/from_str conversion needed in DB layer
+  - find_draft_session uses ORDER BY created_at DESC LIMIT 1 to get most recent in_progress session
+  - next_wave_number uses SELECT MAX(wave_number) with project_id filter — returns Option<u32> from rusqlite, unwrap_or(0) + 1
+  - cargo fmt collapses short WorkItem::new_epic calls to single lines and reformats query_row closures — follow its lead
 ---
