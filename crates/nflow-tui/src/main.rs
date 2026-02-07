@@ -94,7 +94,10 @@ async fn event_loop(tui: &mut terminal::Tui, app: &mut App) -> error::Result<()>
             .map_err(|e| TuiError::Terminal(format!("failed to poll events: {}", e)))?;
 
         if let Some(Event::Key(key)) = evt {
-            if !event::handle_key_event(app, key) {
+            let (cont, _action) = event::handle_key_event(app, key);
+            // ViewActions (SpecNew, SpecApprove, etc.) will be handled
+            // in future stories that implement daemon communication for these commands.
+            if !cont {
                 break;
             }
         }

@@ -1,7 +1,7 @@
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph, Tabs, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph, Row, Table, Tabs, Wrap};
 use ratatui::Frame;
 
 use crate::app::{App, DaemonState, Overlay, View};
@@ -63,19 +63,145 @@ fn render_header(app: &App, frame: &mut Frame, area: Rect) {
 
 /// Render the main content area based on the active view.
 fn render_content(app: &App, frame: &mut Frame, area: Rect) {
-    let content = match app.current_view {
-        View::Specs => "Specs view — press 'n' to create a new spec",
-        View::Plan => "Plan view — shows decomposition waves",
-        View::Execute => "Execute view — shows running agents",
-        View::Logs => "Logs view — shows agent output",
-    };
+    match app.current_view {
+        View::Specs => render_specs_list(app, frame, area),
+        View::Plan => {
+            let block = Block::default().borders(Borders::ALL).title("Plan");
+            let paragraph = Paragraph::new("Plan view — shows decomposition waves").block(block);
+            frame.render_widget(paragraph, area);
+        }
+        View::Execute => {
+            let block = Block::default().borders(Borders::ALL).title("Execute");
+            let paragraph = Paragraph::new("Execute view — shows running agents").block(block);
+            frame.render_widget(paragraph, area);
+        }
+        View::Logs => {
+            let block = Block::default().borders(Borders::ALL).title("Logs");
+            let paragraph = Paragraph::new("Logs view — shows agent output").block(block);
+            frame.render_widget(paragraph, area);
+        }
+    }
+}
+
+/// Color for a spec status badge.
+fn status_color(status: &str) -> Color {
+    match status {
+        "draft" => Color::Yellow,
+        "approved" => Color::Green,
+        "decomposed" => Color::Blue,
+        _ => Color::DarkGray,
+    }
+}
+
+/// Format a created_at timestamp for display (date only).
+fn format_timestamp(ts: &str) -> String {
+    // created_at comes as RFC 3339, e.g. "2026-02-07T15:30:00+00:00"
+    // Show just the date portion for the compact list
+    if ts.len() >= 10 {
+        ts[..10].to_string()
+    } else {
+        ts.to_string()
+    }
+}
+
+/// Render the specs list view with a table of specs.
+fn render_specs_list(app: &App, frame: &mut Frame, area: Rect) {
+    let specs = &app.specs_list;
+
+    if specs.items.is_empty() {
+        let block = Block::default().borders(Borders::ALL).title("Specs");
+        let empty = Paragraph::new(vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                "  No specs found. Press 'n' to create a new spec.",
+                Style::default().fg(Color::DarkGray),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                "  Keybindings: n:new  a:approve  d:delete  v:view  r:resume",
+                Style::default().fg(Color::DarkGray),
+            )),
+        ])
+        .block(block);
+        frame.render_widget(empty, area);
+        return;
+    }
+
+    // Build table rows
+    let rows: Vec<Row> = specs
+        .items
+        .iter()
+        .enumerate()
+        .map(|(i, spec)| {
+            let color = status_color(&spec.status);
+            let name_style = if i == specs.selected {
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::White)
+            };
+
+            let row = Row::new(vec![
+                Line::from(Span::styled(&*spec.name, name_style)),
+                Line::from(Span::styled(
+                    &*spec.status,
+                    Style::default().fg(color).add_modifier(Modifier::BOLD),
+                )),
+                Line::from(Span::styled(
+                    format_timestamp(&spec.created_at),
+                    Style::default().fg(Color::DarkGray),
+                )),
+            ]);
+
+            if i == specs.selected {
+                row.style(Style::default().bg(Color::DarkGray))
+            } else {
+                row
+            }
+        })
+        .collect();
+
+    let header = Row::new(vec![
+        Line::from(Span::styled(
+            "Name",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(Span::styled(
+            "Status",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(Span::styled(
+            "Created",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )),
+    ])
+    .style(Style::default().bg(Color::Black))
+    .bottom_margin(0);
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(app.current_view.label());
+        .title("Specs")
+        .title_style(Style::default().add_modifier(Modifier::BOLD));
 
-    let paragraph = Paragraph::new(content).block(block);
-    frame.render_widget(paragraph, area);
+    let widths = [
+        Constraint::Percentage(50),
+        Constraint::Percentage(20),
+        Constraint::Percentage(30),
+    ];
+
+    let table = Table::new(rows, widths)
+        .header(header)
+        .block(block)
+        .column_spacing(1);
+
+    frame.render_widget(table, area);
 }
 
 /// Render the status bar at the bottom.

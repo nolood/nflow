@@ -1,6 +1,89 @@
 use crate::error::Result;
 use crate::socket_client::{ResponseStatus, SocketClient};
 
+/// A single spec entry for display in the specs list view.
+#[derive(Debug, Clone)]
+pub struct SpecItem {
+    pub name: String,
+    pub status: String,
+    #[allow(dead_code)] // Used by future spec dialogue/resume views
+    pub session_active: bool,
+    pub created_at: String,
+}
+
+/// State for the specs list view.
+#[derive(Debug)]
+pub struct SpecsListState {
+    pub items: Vec<SpecItem>,
+    pub selected: usize,
+}
+
+impl SpecsListState {
+    pub fn new() -> Self {
+        Self {
+            items: Vec::new(),
+            selected: 0,
+        }
+    }
+
+    /// Move selection up.
+    pub fn select_prev(&mut self) {
+        if !self.items.is_empty() && self.selected > 0 {
+            self.selected -= 1;
+        }
+    }
+
+    /// Move selection down.
+    pub fn select_next(&mut self) {
+        if !self.items.is_empty() && self.selected < self.items.len() - 1 {
+            self.selected += 1;
+        }
+    }
+
+    /// Get the currently selected item (used by action handlers in future stories).
+    #[allow(dead_code)]
+    pub fn selected_item(&self) -> Option<&SpecItem> {
+        self.items.get(self.selected)
+    }
+
+    /// Update specs from daemon response data.
+    pub fn update_from_response(&mut self, data: &serde_json::Value) {
+        if let Some(specs) = data.get("specs").and_then(|v| v.as_array()) {
+            self.items = specs
+                .iter()
+                .map(|s| SpecItem {
+                    name: s
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    status: s
+                        .get("status")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown")
+                        .to_string(),
+                    session_active: s
+                        .get("session_active")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false),
+                    created_at: s
+                        .get("created_at")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                })
+                .collect();
+
+            // Clamp selection to new bounds
+            if self.items.is_empty() {
+                self.selected = 0;
+            } else if self.selected >= self.items.len() {
+                self.selected = self.items.len() - 1;
+            }
+        }
+    }
+}
+
 /// Overlay that can be displayed on top of the current view.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Overlay {
@@ -88,6 +171,8 @@ pub struct App {
     pub current_wave: Option<u32>,
     /// Number of active agents (from daemon status).
     pub active_agent_count: u32,
+    /// Specs list view state.
+    pub specs_list: SpecsListState,
 }
 
 impl App {
@@ -102,6 +187,7 @@ impl App {
             overlay: None,
             current_wave: None,
             active_agent_count: 0,
+            specs_list: SpecsListState::new(),
         }
     }
 
@@ -196,6 +282,25 @@ impl App {
                 self.set_disconnected(&e.to_string());
                 return Err(e);
             }
+        }
+
+        // Fetch specs list
+        self.fetch_specs(client).await.ok();
+
+        Ok(())
+    }
+
+    /// Fetch the specs list from the daemon.
+    pub async fn fetch_specs(&mut self, client: &mut SocketClient) -> Result<()> {
+        let resp = client
+            .send_command(
+                "spec.list",
+                serde_json::json!({ "project_name": &self.project }),
+            )
+            .await?;
+
+        if resp.status == ResponseStatus::Ok {
+            self.specs_list.update_from_response(&resp.data);
         }
 
         Ok(())
@@ -315,5 +420,143 @@ mod tests {
         let app = App::new("test".to_string());
         assert_eq!(app.current_wave, None);
         assert_eq!(app.active_agent_count, 0);
+    }
+
+    // --- SpecsListState tests ---
+
+    #[test]
+    fn test_specs_list_initial_state() {
+        let state = SpecsListState::new();
+        assert!(state.items.is_empty());
+        assert_eq!(state.selected, 0);
+        assert!(state.selected_item().is_none());
+    }
+
+    #[test]
+    fn test_specs_list_navigation() {
+        let mut state = SpecsListState::new();
+        state.items = vec![
+            SpecItem {
+                name: "a".to_string(),
+                status: "draft".to_string(),
+                session_active: false,
+                created_at: "2026-01-01".to_string(),
+            },
+            SpecItem {
+                name: "b".to_string(),
+                status: "approved".to_string(),
+                session_active: false,
+                created_at: "2026-01-02".to_string(),
+            },
+        ];
+
+        assert_eq!(state.selected, 0);
+        assert_eq!(state.selected_item().unwrap().name, "a");
+
+        state.select_next();
+        assert_eq!(state.selected, 1);
+        assert_eq!(state.selected_item().unwrap().name, "b");
+
+        // Can't go past end
+        state.select_next();
+        assert_eq!(state.selected, 1);
+
+        state.select_prev();
+        assert_eq!(state.selected, 0);
+
+        // Can't go past start
+        state.select_prev();
+        assert_eq!(state.selected, 0);
+    }
+
+    #[test]
+    fn test_specs_list_navigation_empty() {
+        let mut state = SpecsListState::new();
+        // Navigation on empty list should not panic
+        state.select_next();
+        assert_eq!(state.selected, 0);
+        state.select_prev();
+        assert_eq!(state.selected, 0);
+    }
+
+    #[test]
+    fn test_specs_list_update_from_response() {
+        let mut state = SpecsListState::new();
+        let data = serde_json::json!({
+            "specs": [
+                {
+                    "name": "auth-spec",
+                    "status": "draft",
+                    "session_active": true,
+                    "created_at": "2026-02-07T15:30:00+00:00"
+                },
+                {
+                    "name": "payment-spec",
+                    "status": "approved",
+                    "session_active": false,
+                    "created_at": "2026-02-07T16:00:00+00:00"
+                }
+            ]
+        });
+
+        state.update_from_response(&data);
+        assert_eq!(state.items.len(), 2);
+        assert_eq!(state.items[0].name, "auth-spec");
+        assert_eq!(state.items[0].status, "draft");
+        assert!(state.items[0].session_active);
+        assert_eq!(state.items[1].name, "payment-spec");
+        assert_eq!(state.items[1].status, "approved");
+    }
+
+    #[test]
+    fn test_specs_list_update_clamps_selection() {
+        let mut state = SpecsListState::new();
+        state.items = vec![
+            SpecItem {
+                name: "a".to_string(),
+                status: "draft".to_string(),
+                session_active: false,
+                created_at: "".to_string(),
+            },
+            SpecItem {
+                name: "b".to_string(),
+                status: "draft".to_string(),
+                session_active: false,
+                created_at: "".to_string(),
+            },
+            SpecItem {
+                name: "c".to_string(),
+                status: "draft".to_string(),
+                session_active: false,
+                created_at: "".to_string(),
+            },
+        ];
+        state.selected = 2;
+
+        // Update with fewer items should clamp selection
+        let data = serde_json::json!({
+            "specs": [
+                { "name": "only-one", "status": "draft", "session_active": false, "created_at": "" }
+            ]
+        });
+        state.update_from_response(&data);
+        assert_eq!(state.items.len(), 1);
+        assert_eq!(state.selected, 0);
+    }
+
+    #[test]
+    fn test_specs_list_update_empty_response() {
+        let mut state = SpecsListState::new();
+        let data = serde_json::json!({ "specs": [] });
+        state.update_from_response(&data);
+        assert!(state.items.is_empty());
+        assert_eq!(state.selected, 0);
+    }
+
+    #[test]
+    fn test_initial_specs_list() {
+        let app = App::new("test".to_string());
+        assert!(app.specs_list.items.is_empty());
+        assert_eq!(app.specs_list.selected, 0);
     }
 }
