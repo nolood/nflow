@@ -1,8 +1,10 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use nflow_core::decomposition::{DecompositionSession, DecompositionSpec};
 use nflow_core::project::{CreateProjectParams, GitProvider, ProjectService};
 use nflow_core::spec::{Spec, SpecStatus};
+use nflow_core::work_item::{auto_generate_verify_tasks, Dependency, WorkItem};
 
 use crate::db;
 use crate::socket::{HandlerResult, Request, Response, StreamingResponseLine};
@@ -43,6 +45,7 @@ fn dispatch(req: Request, state: &HandlerState) -> HandlerResult {
         "spec.reopen" => HandlerResult::Single(handle_spec_reopen(req, state)),
         "spec.delete" => HandlerResult::Single(handle_spec_delete(req, state)),
         "spec.resume" => handle_spec_resume(req, state),
+        "plan.generate" => handle_plan_generate(req, state),
         _ => HandlerResult::Single(Response::error(
             req.id,
             &format!("unknown command: {}", req.command),
@@ -1296,6 +1299,680 @@ fn handle_spec_resume(req: Request, state: &HandlerState) -> HandlerResult {
     });
 
     HandlerResult::Streaming(rx)
+}
+
+/// Handle "plan.generate" command — decompose specs into a work item DAG.
+///
+/// Receives: { project_name, spec_names?, with_codebase? }
+/// Returns (streaming): Claude output during decomposition, then final summary.
+/// Final summary: { wave_number, epic_count, story_count, task_count }
+fn handle_plan_generate(req: Request, state: &HandlerState) -> HandlerResult {
+    let id = req.id.clone();
+
+    // Parse required params
+    let project_name = match req.params.get("project_name").and_then(|v| v.as_str()) {
+        Some(n) => n.to_string(),
+        None => {
+            return HandlerResult::Single(Response::error(
+                id,
+                "missing required parameter: project_name",
+            ));
+        }
+    };
+
+    let spec_names: Option<Vec<String>> = req
+        .params
+        .get("spec_names")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        });
+
+    let with_codebase = req
+        .params
+        .get("with_codebase")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+
+    // Open DB connection
+    let conn = match db::open_connection(&state.db_path) {
+        Ok(c) => c,
+        Err(e) => {
+            return HandlerResult::Single(Response::error(id, &format!("database error: {}", e)));
+        }
+    };
+
+    // Find project by name
+    let project = match db::projects::get_project_by_name(&conn, &project_name) {
+        Ok(Some(p)) => p,
+        Ok(None) => {
+            return HandlerResult::Single(Response::error(
+                id,
+                &format!("NOT_FOUND: project '{}' not found", project_name),
+            ));
+        }
+        Err(e) => {
+            return HandlerResult::Single(Response::error(id, &format!("database error: {}", e)));
+        }
+    };
+
+    // Validate no draft wave exists for this project
+    match db::decomposition_sessions::find_draft_session(&conn, &project.id) {
+        Ok(Some(_)) => {
+            return HandlerResult::Single(Response::error(
+                id,
+                "INVALID_STATE: project already has a draft wave (in_progress). Approve or discard it first.",
+            ));
+        }
+        Ok(None) => {}
+        Err(e) => {
+            return HandlerResult::Single(Response::error(id, &format!("database error: {}", e)));
+        }
+    }
+
+    // Find specs to decompose
+    let specs = if let Some(names) = &spec_names {
+        // Specific specs requested — look them up by name
+        let mut found = Vec::new();
+        for name in names {
+            match db::specs::get_spec_by_name(&conn, &project.id, name) {
+                Ok(Some(s)) => {
+                    if s.status != SpecStatus::Approved {
+                        return HandlerResult::Single(Response::error(
+                            id,
+                            &format!(
+                                "INVALID_STATE: spec '{}' is {} (must be approved)",
+                                s.name, s.status
+                            ),
+                        ));
+                    }
+                    found.push(s);
+                }
+                Ok(None) => {
+                    return HandlerResult::Single(Response::error(
+                        id,
+                        &format!("NOT_FOUND: spec '{}' not found", name),
+                    ));
+                }
+                Err(e) => {
+                    return HandlerResult::Single(Response::error(
+                        id,
+                        &format!("database error: {}", e),
+                    ));
+                }
+            }
+        }
+        found
+    } else {
+        // Find all unassigned approved specs
+        match db::specs::find_unassigned_approved_specs(&conn, &project.id) {
+            Ok(s) => s,
+            Err(e) => {
+                return HandlerResult::Single(Response::error(
+                    id,
+                    &format!("database error: {}", e),
+                ));
+            }
+        }
+    };
+
+    if specs.is_empty() {
+        return HandlerResult::Single(Response::error(
+            id,
+            "NOT_FOUND: no approved specs available for decomposition",
+        ));
+    }
+
+    // Read spec file contents
+    let mut specs_with_content: Vec<(Spec, String)> = Vec::new();
+    for spec in &specs {
+        match std::fs::read_to_string(&spec.file_path) {
+            Ok(content) => specs_with_content.push((spec.clone(), content)),
+            Err(e) => {
+                return HandlerResult::Single(Response::error(
+                    id,
+                    &format!("failed to read spec file '{}': {}", spec.file_path, e),
+                ));
+            }
+        }
+    }
+
+    // Get next wave number
+    let wave_number = match db::decomposition_sessions::next_wave_number(&conn, &project.id) {
+        Ok(n) => n,
+        Err(e) => {
+            return HandlerResult::Single(Response::error(id, &format!("database error: {}", e)));
+        }
+    };
+
+    // Create decomposition session
+    let has_in_progress = |_pid: uuid::Uuid| -> bool { false }; // Already checked above
+    let session = match DecompositionSession::new(project.id, has_in_progress, wave_number - 1) {
+        Ok(s) => s,
+        Err(e) => {
+            return HandlerResult::Single(Response::error(
+                id,
+                &format!("failed to create session: {}", e),
+            ));
+        }
+    };
+
+    // Insert session into DB
+    if let Err(e) = db::decomposition_sessions::insert_decomposition_session(&conn, &session) {
+        return HandlerResult::Single(Response::error(id, &format!("database error: {}", e)));
+    }
+
+    // Link specs to session
+    for spec in &specs {
+        let ds = DecompositionSpec::new(session.id, spec.id);
+        if let Err(e) = db::decomposition_sessions::insert_decomposition_spec(&conn, &ds) {
+            return HandlerResult::Single(Response::error(id, &format!("database error: {}", e)));
+        }
+    }
+
+    // Build the decomposition prompt
+    let decompose_prompt = nflow_claude::context::build_decompose_prompt(&specs_with_content);
+
+    // Load and render the decompose template
+    let nflow_home = match crate::daemon::nflow_home() {
+        Ok(h) => h,
+        Err(e) => {
+            return HandlerResult::Single(Response::error(
+                id,
+                &format!("failed to get nflow home: {}", e),
+            ));
+        }
+    };
+    let override_dir = nflow_home.join("prompts");
+    let override_path = if override_dir.is_dir() {
+        Some(override_dir)
+    } else {
+        None
+    };
+
+    let template = match nflow_claude::prompt::load_template("decompose", override_path.as_deref())
+    {
+        Ok(t) => t,
+        Err(e) => {
+            return HandlerResult::Single(Response::error(
+                id,
+                &format!("failed to load template: {}", e),
+            ));
+        }
+    };
+
+    let mut vars = std::collections::HashMap::new();
+    vars.insert("specs_content", decompose_prompt.as_str());
+    vars.insert("project_name", project.name.as_str());
+    let prompt = match nflow_claude::prompt::render_template(&template, &vars) {
+        Ok(p) => p,
+        Err(e) => {
+            return HandlerResult::Single(Response::error(
+                id,
+                &format!("failed to render template: {}", e),
+            ));
+        }
+    };
+
+    // Determine working directory
+    let working_dir = if with_codebase {
+        PathBuf::from(&project.path)
+    } else {
+        nflow_home
+            .join("projects")
+            .join(&project.name)
+            .join("specs")
+    };
+
+    // Build RunConfig for decomposition
+    let run_config =
+        nflow_claude::runner::RunConfig::for_decompose(prompt, with_codebase, working_dir);
+
+    // Create streaming channel and spawn Claude streaming
+    let (tx, rx) = tokio::sync::mpsc::channel(64);
+    let session_id = session.id;
+    let db_path = state.db_path.clone();
+    let spec_ids: Vec<uuid::Uuid> = specs.iter().map(|s| s.id).collect();
+
+    let initial_id = id.clone();
+    tokio::spawn(async move {
+        // Send initial response with session info
+        let _ = tx
+            .send(StreamingResponseLine::data(
+                initial_id.clone(),
+                serde_json::json!({
+                    "session_id": session_id.to_string(),
+                    "wave_number": wave_number,
+                    "spec_count": spec_ids.len(),
+                }),
+            ))
+            .await;
+
+        stream_claude_decompose(
+            tx,
+            initial_id,
+            run_config,
+            session_id,
+            wave_number,
+            spec_ids,
+            &db_path,
+        )
+        .await;
+    });
+
+    HandlerResult::Streaming(rx)
+}
+
+/// Stream Claude decomposition output and process the result.
+///
+/// On completion, parses the Claude output as JSON containing epics, stories,
+/// tasks, and dependencies. Creates work items, auto-generates verify tasks,
+/// validates the DAG, and persists everything to the database.
+async fn stream_claude_decompose(
+    tx: tokio::sync::mpsc::Sender<StreamingResponseLine>,
+    req_id: String,
+    run_config: nflow_claude::runner::RunConfig,
+    session_id: uuid::Uuid,
+    wave_number: u32,
+    spec_ids: Vec<uuid::Uuid>,
+    db_path: &Path,
+) {
+    // Spawn Claude process
+    let runner = nflow_claude::runner::ClaudeRunner::default();
+    let process = match runner.spawn(&run_config) {
+        Ok(p) => p,
+        Err(e) => {
+            let _ = tx
+                .send(StreamingResponseLine::error(
+                    req_id,
+                    &format!("failed to spawn Claude: {}", e),
+                ))
+                .await;
+            return;
+        }
+    };
+
+    // Stream Claude output and collect the final result text
+    let mut parser = nflow_claude::stream::StreamParser::new(process.stdout);
+    let mut result_text = String::new();
+
+    loop {
+        match parser.next_event().await {
+            Ok(Some(event)) => {
+                // Capture result text for parsing
+                if let nflow_claude::stream::StreamEvent::Result { ref text, .. } = event {
+                    result_text = text.clone();
+                }
+
+                let event_json = match &event {
+                    nflow_claude::stream::StreamEvent::TextDelta { text } => {
+                        serde_json::json!({"type": "text", "text": text})
+                    }
+                    nflow_claude::stream::StreamEvent::ToolUse { name, input } => {
+                        serde_json::json!({"type": "tool_use", "name": name, "input": input})
+                    }
+                    nflow_claude::stream::StreamEvent::ToolResult { content } => {
+                        serde_json::json!({"type": "tool_result", "content": content})
+                    }
+                    nflow_claude::stream::StreamEvent::Result { text, session_id } => {
+                        serde_json::json!({"type": "result", "text": text, "session_id": session_id})
+                    }
+                    nflow_claude::stream::StreamEvent::Error { message } => {
+                        serde_json::json!({"type": "error", "message": message})
+                    }
+                    nflow_claude::stream::StreamEvent::ParseError { line, reason } => {
+                        serde_json::json!({"type": "parse_error", "line": line, "reason": reason})
+                    }
+                };
+
+                if tx
+                    .send(StreamingResponseLine::data(req_id.clone(), event_json))
+                    .await
+                    .is_err()
+                {
+                    break; // Client disconnected
+                }
+            }
+            Ok(None) => break, // Stream ended
+            Err(e) => {
+                let _ = tx
+                    .send(StreamingResponseLine::error(
+                        req_id.clone(),
+                        &format!("stream error: {}", e),
+                    ))
+                    .await;
+                break;
+            }
+        }
+    }
+
+    // Store claude_session_id
+    let claude_session_id = parser.session_id().map(|s| s.to_string());
+    if let (Ok(conn), Some(ref csid)) = (db::open_connection(db_path), &claude_session_id) {
+        let mut session_update =
+            match db::decomposition_sessions::get_decomposition_session(&conn, &session_id) {
+                Ok(Some(s)) => s,
+                _ => {
+                    let _ = tx
+                        .send(StreamingResponseLine::error(
+                            req_id,
+                            "failed to retrieve session for update",
+                        ))
+                        .await;
+                    return;
+                }
+            };
+        session_update.set_claude_session_id(csid.clone());
+        let _ = db::decomposition_sessions::insert_decomposition_session(&conn, &session_update);
+    }
+
+    // Parse Claude's JSON output into work items
+    if result_text.is_empty() {
+        let _ = tx
+            .send(StreamingResponseLine::error(
+                req_id,
+                "Claude did not produce a result — decomposition failed",
+            ))
+            .await;
+        return;
+    }
+
+    // Extract JSON from result text (may be wrapped in markdown code fences)
+    let json_text = extract_json_from_text(&result_text);
+
+    let parsed: serde_json::Value = match serde_json::from_str(json_text) {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = tx
+                .send(StreamingResponseLine::error(
+                    req_id,
+                    &format!("failed to parse Claude output as JSON: {}", e),
+                ))
+                .await;
+            return;
+        }
+    };
+
+    // Build work items from parsed JSON
+    let conn = match db::open_connection(db_path) {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = tx
+                .send(StreamingResponseLine::error(
+                    req_id,
+                    &format!("database error: {}", e),
+                ))
+                .await;
+            return;
+        }
+    };
+
+    match build_and_persist_work_items(&conn, &parsed, session_id, wave_number, &spec_ids) {
+        Ok(counts) => {
+            let _ = tx
+                .send(StreamingResponseLine::done(
+                    req_id,
+                    serde_json::json!({
+                        "session_id": session_id.to_string(),
+                        "wave_number": wave_number,
+                        "epic_count": counts.0,
+                        "story_count": counts.1,
+                        "task_count": counts.2,
+                    }),
+                ))
+                .await;
+        }
+        Err(e) => {
+            let _ = tx.send(StreamingResponseLine::error(req_id, &e)).await;
+        }
+    }
+}
+
+/// Extract JSON from text that may contain markdown code fences.
+fn extract_json_from_text(text: &str) -> &str {
+    let trimmed = text.trim();
+    // Try to find JSON within ```json ... ``` blocks
+    if let Some(start) = trimmed.find("```json") {
+        let json_start = start + 7; // skip "```json"
+        if let Some(end) = trimmed[json_start..].find("```") {
+            return trimmed[json_start..json_start + end].trim();
+        }
+    }
+    // Try plain ``` blocks
+    if let Some(start) = trimmed.find("```") {
+        let json_start = start + 3;
+        // Skip optional language identifier on the same line
+        let after_backticks = &trimmed[json_start..];
+        let content_start = after_backticks.find('\n').map_or(0, |i| i + 1);
+        if let Some(end) = after_backticks[content_start..].find("```") {
+            return after_backticks[content_start..content_start + end].trim();
+        }
+    }
+    // Return as-is
+    trimmed
+}
+
+/// Build work items from Claude's JSON output, validate DAG, and persist to DB.
+///
+/// Expected JSON format:
+/// ```json
+/// {
+///   "epics": [{
+///     "id": "E1",
+///     "title": "...",
+///     "description": "...",
+///     "stories": [{
+///       "id": "S1",
+///       "title": "...",
+///       "description": "...",
+///       "acceptance_criteria": "...",
+///       "depends_on": ["S2"],
+///       "tasks": [{
+///         "id": "T1",
+///         "title": "...",
+///         "description": "...",
+///         "acceptance_criteria": "..."
+///       }]
+///     }]
+///   }]
+/// }
+/// ```
+///
+/// Returns (epic_count, story_count, task_count) on success.
+fn build_and_persist_work_items(
+    conn: &rusqlite::Connection,
+    parsed: &serde_json::Value,
+    session_id: uuid::Uuid,
+    wave_number: u32,
+    spec_ids: &[uuid::Uuid],
+) -> std::result::Result<(usize, usize, usize), String> {
+    let epics_arr = parsed
+        .get("epics")
+        .and_then(|v| v.as_array())
+        .ok_or("JSON missing 'epics' array")?;
+
+    let mut all_stories: Vec<WorkItem> = Vec::new();
+    let mut all_impl_tasks: Vec<WorkItem> = Vec::new();
+    let mut dependency_refs: Vec<(String, Vec<String>)> = Vec::new(); // (story_short_id, depends_on_short_ids)
+    let mut short_id_to_uuid: std::collections::HashMap<String, uuid::Uuid> =
+        std::collections::HashMap::new();
+
+    let mut epic_sort = 0i32;
+    let mut story_sort = 0i32;
+
+    for epic_val in epics_arr {
+        let epic_short_id = epic_val
+            .get("id")
+            .and_then(|v| v.as_str())
+            .unwrap_or(&format!("E{}", epic_sort + 1))
+            .to_string();
+        let epic_title = epic_val
+            .get("title")
+            .and_then(|v| v.as_str())
+            .unwrap_or("Untitled Epic")
+            .to_string();
+        let epic_description = epic_val
+            .get("description")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        let epic = WorkItem::new_epic(
+            session_id,
+            epic_title,
+            epic_description,
+            epic_short_id.clone(),
+            epic_sort,
+        );
+        epic_sort += 1;
+
+        db::work_items::insert_work_item(conn, &epic)
+            .map_err(|e| format!("failed to insert epic: {}", e))?;
+
+        // Process stories under this epic
+        if let Some(stories_arr) = epic_val.get("stories").and_then(|v| v.as_array()) {
+            for story_val in stories_arr {
+                let story_short_id = story_val
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(&format!("S{}", story_sort + 1))
+                    .to_string();
+                let story_title = story_val
+                    .get("title")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("Untitled Story")
+                    .to_string();
+                let story_description = story_val
+                    .get("description")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let story_ac = story_val
+                    .get("acceptance_criteria")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+
+                // Wave-prefix the short_id
+                let wave_short_id = format!("W{}-{}", wave_number, story_short_id);
+
+                let story = WorkItem::new_story(
+                    epic.id,
+                    session_id,
+                    story_title,
+                    story_description,
+                    story_ac,
+                    wave_short_id.clone(),
+                    story_sort,
+                );
+                story_sort += 1;
+
+                short_id_to_uuid.insert(story_short_id.clone(), story.id);
+
+                // Collect dependency references
+                let depends_on: Vec<String> = story_val
+                    .get("depends_on")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_str().map(String::from))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if !depends_on.is_empty() {
+                    dependency_refs.push((story_short_id.clone(), depends_on));
+                }
+
+                db::work_items::insert_work_item(conn, &story)
+                    .map_err(|e| format!("failed to insert story: {}", e))?;
+
+                all_stories.push(story.clone());
+
+                // Process tasks under this story
+                let mut task_sort = 0i32;
+                if let Some(tasks_arr) = story_val.get("tasks").and_then(|v| v.as_array()) {
+                    for task_val in tasks_arr {
+                        let task_short_id = task_val
+                            .get("id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or(&format!("T{}", task_sort / 2 + 1))
+                            .to_string();
+                        let task_title = task_val
+                            .get("title")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("Untitled Task")
+                            .to_string();
+                        let task_description = task_val
+                            .get("description")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let task_ac = task_val
+                            .get("acceptance_criteria")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+
+                        let task = WorkItem::new_task(
+                            story.id,
+                            session_id,
+                            task_title,
+                            task_description,
+                            task_ac,
+                            task_short_id,
+                            task_sort,
+                        );
+                        task_sort += 2; // Leave room for verify tasks (sort_order + 1)
+
+                        db::work_items::insert_work_item(conn, &task)
+                            .map_err(|e| format!("failed to insert task: {}", e))?;
+
+                        all_impl_tasks.push(task);
+                    }
+                }
+            }
+        }
+    }
+
+    // Auto-generate verify tasks
+    let verify_tasks = auto_generate_verify_tasks(&all_impl_tasks);
+    let task_count = all_impl_tasks.len() + verify_tasks.len();
+    for vt in &verify_tasks {
+        db::work_items::insert_work_item(conn, vt)
+            .map_err(|e| format!("failed to insert verify task: {}", e))?;
+    }
+
+    // Resolve and insert dependencies
+    let mut dependencies: Vec<Dependency> = Vec::new();
+    for (blocked_short_id, blocker_short_ids) in &dependency_refs {
+        let blocked_uuid = short_id_to_uuid
+            .get(blocked_short_id)
+            .ok_or(format!("dependency: unknown story '{}'", blocked_short_id))?;
+        for blocker_short_id in blocker_short_ids {
+            let blocker_uuid = short_id_to_uuid.get(blocker_short_id).ok_or(format!(
+                "dependency: unknown blocker story '{}'",
+                blocker_short_id
+            ))?;
+            let dep = Dependency::new(*blocker_uuid, *blocked_uuid);
+            db::work_items::insert_dependency(conn, &dep)
+                .map_err(|e| format!("failed to insert dependency: {}", e))?;
+            dependencies.push(dep);
+        }
+    }
+
+    // Validate DAG (cycle check)
+    nflow_core::dag::build_dag(&all_stories, &dependencies)
+        .map_err(|e| format!("DAG validation failed: {}", e))?;
+
+    // Mark specs as decomposed
+    for spec_id in spec_ids {
+        db::specs::update_spec_status(conn, spec_id, SpecStatus::Decomposed)
+            .map_err(|e| format!("failed to update spec status: {}", e))?;
+    }
+
+    Ok((epic_sort as usize, all_stories.len(), task_count))
 }
 
 /// Check if a path is a git repository using synchronous git command.

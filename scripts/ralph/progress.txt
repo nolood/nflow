@@ -110,6 +110,12 @@
 - Session completion: spec file existence check (Path::new(spec_file_path).exists()) determines if Q&A is done
 - Soft-delete: update status to 'deleted', filter out in handler (not DB); use force=true for approved specs
 - spec.resume is a streaming handler: validates draft + not active + has session_id, then streams like spec.new
+- plan.generate is a streaming handler: sync DB setup in handler, async Claude spawn in tokio::spawn, parse JSON result on completion
+- Claude decompose output: extract JSON from markdown code fences (```json ... ```) before parsing
+- build_and_persist_work_items is sync (runs in tokio::spawn context) — uses db::open_connection for its own connection
+- Wave-prefix story short IDs: format!("W{}-{}", wave_number, story_short_id) for uniqueness across waves
+- Task sort_order uses step of 2 (0, 2, 4...) to leave room for verify tasks at sort_order + 1
+- Decomposition session pre-check: validate no in_progress session exists before creating new one, then pass |_| false to constructor
 
 # Ralph Progress Log
 Started: Sat Feb  7 03:49:10 PM MSK 2026
@@ -1258,4 +1264,32 @@ Started: Sat Feb  7 03:49:10 PM MSK 2026
   - spec.resume validates: draft status, session not active, has previous claude_session_id — all three must hold
   - cargo fmt breaks long Response::error calls with format! to multi-line — follow its lead
   - Test helpers insert_test_spec and insert_test_spec_with_session reduce boilerplate in DB setup
+---
+
+## 2026-02-07 - US-048
+- What was implemented: Command handler — plan generate (decompose specs into work item DAG)
+  - `handle_plan_generate` streaming handler: receives { project_name, spec_names?, with_codebase? }
+  - Validates no draft wave exists for the project (INVALID_STATE)
+  - Finds unassigned approved specs (or specific named specs), reads spec file contents
+  - Creates DecompositionSession with auto-incremented wave_number, links specs via DecompositionSpec
+  - Spawns Claude with RunConfig::for_decompose() and decompose.md template, streams output
+  - `stream_claude_decompose` async function: streams Claude events, captures result text
+  - `extract_json_from_text` helper: extracts JSON from markdown code fences (```json...```)
+  - `build_and_persist_work_items` sync function: parses JSON into epics→stories→tasks hierarchy
+  - Auto-generates verify tasks via `auto_generate_verify_tasks()`
+  - Resolves story dependency references (short_id→UUID) and inserts dependencies
+  - Validates DAG with `build_dag()` (cycle check)
+  - Marks specs as decomposed via `update_spec_status(Decomposed)`
+  - Returns { wave_number, epic_count, story_count, task_count }
+  - Added dispatch route: "plan.generate" => handle_plan_generate
+  - Added imports: DecompositionSession, DecompositionSpec, auto_generate_verify_tasks, Dependency, WorkItem
+- Files changed:
+  - crates/nflow-daemon/src/handlers.rs (handle_plan_generate, stream_claude_decompose, extract_json_from_text, build_and_persist_work_items functions + dispatch route)
+- **Learnings for future iterations:**
+  - Streaming handlers follow pattern: sync DB setup + validation in handler fn, async Claude spawn in tokio::spawn
+  - Claude output may be wrapped in ```json...``` code fences — always extract before parsing
+  - Task sort_order uses step of 2 (0, 2, 4...) to leave room for verify tasks at +1
+  - Wave-prefix story short IDs (W{wave}-{id}) for cross-wave uniqueness
+  - Pre-check for in_progress session, then pass |_| false closure to DecompositionSession::new to avoid double-check
+  - build_and_persist_work_items opens its own DB connection (runs in async context via tokio::spawn)
 ---
