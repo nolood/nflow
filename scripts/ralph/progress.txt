@@ -1,3 +1,29 @@
+## Codebase Patterns
+- Workspace root Cargo.toml uses `[workspace.package]` for shared version/edition/rust-version
+- Use `workspace = true` in crate Cargo.toml to inherit shared fields
+- nflow-core must NEVER have tokio, async, or IO deps — keep it pure logic
+- All other crates depend on nflow-core via `{ workspace = true }`
+- Empty .rs module files need a trailing newline to pass `cargo fmt --check`
+- Binary crates use `[[bin]]` in Cargo.toml with explicit path
+
 # Ralph Progress Log
 Started: Sat Feb  7 03:49:10 PM MSK 2026
+---
+
+## 2026-02-07 - US-001
+- What was implemented: Six-crate Rust workspace skeleton (nflow-core, nflow-claude, nflow-git, nflow-daemon, nflow-cli, nflow-tui)
+- Files changed:
+  - Cargo.toml (workspace root)
+  - crates/nflow-core/Cargo.toml, src/lib.rs, src/{config,dag,db,error,project,scheduler,spec,work_item}.rs
+  - crates/nflow-claude/Cargo.toml, src/lib.rs, src/{prompt,runner,session,stream}.rs
+  - crates/nflow-git/Cargo.toml, src/lib.rs, src/{branch,mr,worktree}.rs
+  - crates/nflow-daemon/Cargo.toml, src/main.rs
+  - crates/nflow-cli/Cargo.toml, src/main.rs
+  - crates/nflow-tui/Cargo.toml, src/main.rs
+  - .gitignore
+- **Learnings for future iterations:**
+  - cargo fmt wants at least a trailing newline in empty .rs files
+  - nflow-core deps: uuid, chrono, serde, serde_json, thiserror — no IO deps
+  - Module stubs are empty files — each future US will fill them in
+  - Rust 1.92 available on this system, rust-version set to 1.75 min
 ---
