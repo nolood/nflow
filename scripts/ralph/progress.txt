@@ -465,6 +465,11 @@ Started: Sat Feb  7 03:49:10 PM MSK 2026
 - tokio "time" feature needed for tokio::time::timeout
 - tokio::process::Command + Stdio::piped for stdout/stderr + Stdio::null for stdin
 - Lines<BufReader<ChildStdout>> for line-by-line async streaming from spawned process
+- GitError enum in nflow-git/src/error.rs: PathAlreadyExists, NotAGitRepository, CommandFailed, Io
+- Use CLI (`git rev-parse --is-inside-work-tree`) for repo validation — git2 requires OpenSSL which may not be available
+- run_git_command() is an async helper: runs git CLI, returns stdout on success, GitError::CommandFailed on failure
+- Use `--initial-branch=main` when creating bare repos in tests to ensure consistent branch naming
+- tempfile crate as dev-dependency of nflow-git for test temp dirs
 ---
 
 ## 2026-02-07 - US-017
@@ -647,4 +652,28 @@ Started: Sat Feb  7 03:49:10 PM MSK 2026
   - tokio "time" feature is needed for tokio::time::timeout used in wait_with_timeout
   - SIGTERM escalation to SIGKILL test: use `bash -c "trap '' TERM; sleep 60"` to ignore SIGTERM
   - cargo fmt collapses short .map_err closures with single-field structs to one line
+---
+
+## 2026-02-07 - US-025
+- What was implemented: Worktree creation in nflow-git
+  - GitError enum in error.rs: PathAlreadyExists, NotAGitRepository, CommandFailed, Io
+  - validate_git_repo() async function using `git rev-parse --is-inside-work-tree` (CLI, not git2 — OpenSSL not available)
+  - run_git_command() async helper: runs git CLI with args, pipes stdout/stderr, returns stdout or CommandFailed error
+  - create_worktree(repo_path, worktree_path, base_branch) -> Result<()>
+    - Validates repo_path is a git repository
+    - Validates worktree_path doesn't already exist (PathAlreadyExists error)
+    - Runs `git fetch origin {base_branch}`
+    - Runs `git worktree add {worktree_path} origin/{base_branch}`
+  - 9 new tests (495 total) covering success, path exists, not a repo, invalid branch, parent dir creation, git command helpers
+- Files changed:
+  - crates/nflow-git/Cargo.toml (added tempfile dev-dependency, tokio macros+rt-multi-thread for tests)
+  - crates/nflow-git/src/error.rs (new — GitError enum with Result type alias)
+  - crates/nflow-git/src/lib.rs (added error module)
+  - crates/nflow-git/src/worktree.rs (full worktree creation implementation with tests)
+- **Learnings for future iterations:**
+  - git2 crate requires OpenSSL (openssl-sys) which may not be installed — use CLI fallback for all operations
+  - `git rev-parse --is-inside-work-tree` is a reliable CLI-based repo validation
+  - `git init --bare` defaults to "master" branch unless `--initial-branch=main` is specified — use in tests for consistency
+  - `git worktree add` auto-creates parent directories — no need to mkdir -p beforehand
+  - tokio test requires macros + rt-multi-thread features in dev-dependencies
 ---

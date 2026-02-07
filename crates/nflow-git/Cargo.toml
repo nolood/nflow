@@ -9,3 +9,7 @@ description = "Git operations — worktree management, branch creation, MR/PR cr
 nflow-core = { workspace = true }
 thiserror = "2"
 tokio = { version = "1", features = ["process"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tempfile = "3"
