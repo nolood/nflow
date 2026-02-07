@@ -19,6 +19,10 @@
 - auto_generate_verify_tasks() works on a slice of WorkItems, filtering for impl tasks only
 - skip_task() takes &mut impl_task + &mut [WorkItem] slice for paired verify manipulation
 - find_paired_verify/find_paired_impl use parent_id + sort_order±1 matching
+- ShortIdGenerator has independent counters for epic/story/task — counters are per-decomposition-session
+- ShortIdRegistry maps (wave, short_id) -> UUID; resolve() accepts "W1-S1" or bare "S1" with optional context_wave
+- parse_wave_prefixed() and parse_short_id() are pure parsing functions — no registry needed
+- assign_short_ids() updates generator counters from existing IDs to avoid collisions
 
 # Ralph Progress Log
 Started: Sat Feb  7 03:49:10 PM MSK 2026
@@ -119,4 +123,27 @@ Started: Sat Feb  7 03:49:10 PM MSK 2026
   - skip_task needs to handle both pending verify (cancel) and failed verify (skip) cases
   - auto_generate_verify_tasks works on slices and filters for impl tasks — safe to pass mixed item types
   - find_paired_verify/impl use sort_order adjacency (±1), not ID matching
+---
+
+## 2026-02-07 - US-006
+- What was implemented: Short ID system in nflow-core
+  - ShortIdGenerator: sequential ID generation scoped per session (E1, S1, T1 with independent counters)
+  - ShortIdGenerator::verify_id(): appends 'v' to impl short_id (T1 -> T1v)
+  - DisplayId struct with Display impl for wave-prefixed format (W1-E1, W1-S1, W1-T1v)
+  - parse_wave_prefixed(): parses "W1-S1" format, case-insensitive, with validation
+  - parse_short_id(): parses bare IDs like "E1", "S3", "T2v" into (prefix, number, is_verify)
+  - ShortIdRegistry: maps (wave, short_id) -> UUID, supports register/register_items/resolve_with_wave/resolve
+  - resolve() accepts both "W1-S1" (wave-prefixed) and "S1" (bare) formats
+  - Bare IDs resolved via context_wave first, then fallback to all-wave search with ambiguity detection
+  - assign_short_ids(): bulk-assigns short IDs to WorkItems, preserving existing ones and updating counters
+  - 44 new tests (145 total) covering all acceptance criteria
+- Files changed:
+  - crates/nflow-core/src/short_id.rs (new module — full Short ID system)
+  - crates/nflow-core/src/lib.rs (added short_id module)
+- **Learnings for future iterations:**
+  - ShortIdGenerator has independent counters for epic/story/task — they don't interfere
+  - ShortIdRegistry resolve() tries context_wave first for bare IDs, then falls through to all-wave search
+  - parse_wave_prefixed returns None for invalid formats — callers treat as bare short ID
+  - assign_short_ids() scans existing IDs to advance counters — prevents ID collisions when some items are pre-assigned
+  - cargo fmt breaks long function call args into multi-line format — don't fight it in tests
 ---
