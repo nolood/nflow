@@ -640,6 +640,392 @@ pub struct PlanDetailState {
     pub depth: u8,
 }
 
+/// A node in the execute tree view (similar to PlanTreeNode but with execution-specific fields).
+#[derive(Debug, Clone)]
+pub struct ExecuteTreeNode {
+    /// Display short_id (e.g., "W1-E1", "W1-S1", "W1-T1").
+    pub short_id: String,
+    /// Title of the work item.
+    pub title: String,
+    /// Status string (e.g., "pending", "ready", "in_progress", "done", "failed", "cancelled").
+    pub status: String,
+    /// Node depth level: 0=wave, 1=epic, 2=story, 3=task.
+    pub depth: u8,
+    /// Whether this node is collapsed (children hidden).
+    pub collapsed: bool,
+    /// Whether this node has children.
+    pub has_children: bool,
+    /// Task kind: "impl" or "verify" (tasks only).
+    pub kind: Option<String>,
+    /// Progress string for stories (e.g., "2/5").
+    pub progress: Option<String>,
+}
+
+/// State for the execute tree view (left pane).
+#[derive(Debug)]
+pub struct ExecuteTreeState {
+    /// All tree nodes (flattened).
+    pub nodes: Vec<ExecuteTreeNode>,
+    /// Current selected index in the visible nodes list.
+    pub selected: usize,
+    /// Whether to hide verify tasks.
+    pub hide_verify: bool,
+}
+
+impl ExecuteTreeState {
+    pub fn new() -> Self {
+        Self {
+            nodes: Vec::new(),
+            selected: 0,
+            hide_verify: false,
+        }
+    }
+
+    /// Get visible nodes (respecting collapsed state and verify filter).
+    pub fn visible_nodes(&self) -> Vec<(usize, &ExecuteTreeNode)> {
+        let mut result = Vec::new();
+        let mut skip_depth: Option<u8> = None;
+
+        for (i, node) in self.nodes.iter().enumerate() {
+            if let Some(sd) = skip_depth {
+                if node.depth > sd {
+                    continue;
+                }
+                skip_depth = None;
+            }
+
+            if self.hide_verify && node.depth == 3 {
+                if let Some(ref kind) = node.kind {
+                    if kind == "verify" {
+                        continue;
+                    }
+                }
+            }
+
+            result.push((i, node));
+
+            if node.collapsed && node.has_children {
+                skip_depth = Some(node.depth);
+            }
+        }
+
+        result
+    }
+
+    /// Move selection up.
+    pub fn select_prev(&mut self) {
+        let visible = self.visible_nodes();
+        if visible.is_empty() {
+            return;
+        }
+        if self.selected > 0 {
+            self.selected -= 1;
+        }
+    }
+
+    /// Move selection down.
+    pub fn select_next(&mut self) {
+        let visible = self.visible_nodes();
+        if visible.is_empty() {
+            return;
+        }
+        if self.selected < visible.len() - 1 {
+            self.selected += 1;
+        }
+    }
+
+    /// Toggle collapse on the selected node.
+    pub fn toggle_collapse(&mut self) {
+        let visible = self.visible_nodes();
+        if let Some(&(real_idx, _)) = visible.get(self.selected) {
+            if self.nodes[real_idx].has_children {
+                self.nodes[real_idx].collapsed = !self.nodes[real_idx].collapsed;
+            }
+        }
+    }
+
+    /// Toggle verify task visibility.
+    pub fn toggle_verify_visibility(&mut self) {
+        self.hide_verify = !self.hide_verify;
+        let visible = self.visible_nodes();
+        if !visible.is_empty() && self.selected >= visible.len() {
+            self.selected = visible.len() - 1;
+        }
+    }
+
+    /// Get the short_id of the currently selected task (depth 3), if any.
+    pub fn selected_task_id(&self) -> Option<String> {
+        let visible = self.visible_nodes();
+        if let Some(&(real_idx, _)) = visible.get(self.selected) {
+            let node = &self.nodes[real_idx];
+            if node.depth == 3 {
+                return Some(node.short_id.clone());
+            }
+        }
+        None
+    }
+
+    /// Get the status of the currently selected task, if any.
+    pub fn selected_task_status(&self) -> Option<String> {
+        let visible = self.visible_nodes();
+        if let Some(&(real_idx, _)) = visible.get(self.selected) {
+            let node = &self.nodes[real_idx];
+            if node.depth == 3 {
+                return Some(node.status.clone());
+            }
+        }
+        None
+    }
+
+    /// Find and select the first in_progress task. Returns true if found.
+    pub fn auto_select_running_task(&mut self) -> bool {
+        let visible = self.visible_nodes();
+        for (vi, &(_, node)) in visible.iter().enumerate() {
+            if node.depth == 3 && node.status == "in_progress" {
+                self.selected = vi;
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Update tree from daemon exec.status response data.
+    pub fn update_from_response(&mut self, data: &serde_json::Value) {
+        let mut nodes = Vec::new();
+
+        if let Some(waves) = data.get("waves").and_then(|v| v.as_array()) {
+            for wave in waves {
+                let wave_number = wave
+                    .get("wave_number")
+                    .and_then(|v| v.as_u64())
+                    .map(|n| n as u32);
+                let wave_status = wave
+                    .get("status")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+
+                let wave_label = wave_number
+                    .map(|w| format!("W{}", w))
+                    .unwrap_or_else(|| "Wave".to_string());
+                let has_epics = wave
+                    .get("epics")
+                    .and_then(|v| v.as_array())
+                    .is_some_and(|a| !a.is_empty());
+
+                nodes.push(ExecuteTreeNode {
+                    short_id: wave_label,
+                    title: wave_status,
+                    status: String::new(),
+                    depth: 0,
+                    collapsed: false,
+                    has_children: has_epics,
+                    kind: None,
+                    progress: None,
+                });
+
+                if let Some(epics) = wave.get("epics").and_then(|v| v.as_array()) {
+                    for epic in epics {
+                        let epic_short_id = epic
+                            .get("short_id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let epic_title = epic
+                            .get("title")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let epic_status = epic
+                            .get("status")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let stories = epic.get("stories").and_then(|v| v.as_array());
+                        let has_stories = stories.is_some_and(|s| !s.is_empty());
+
+                        nodes.push(ExecuteTreeNode {
+                            short_id: epic_short_id,
+                            title: epic_title,
+                            status: epic_status,
+                            depth: 1,
+                            collapsed: false,
+                            has_children: has_stories,
+                            kind: None,
+                            progress: None,
+                        });
+
+                        if let Some(stories) = stories {
+                            for story in stories {
+                                let story_short_id = story
+                                    .get("short_id")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
+                                let story_title = story
+                                    .get("title")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
+                                let story_status = story
+                                    .get("status")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
+                                let story_progress = story
+                                    .get("progress")
+                                    .and_then(|v| v.as_str())
+                                    .map(|s| s.to_string());
+                                let tasks = story.get("tasks").and_then(|v| v.as_array());
+                                let has_tasks = tasks.is_some_and(|t| !t.is_empty());
+
+                                nodes.push(ExecuteTreeNode {
+                                    short_id: story_short_id,
+                                    title: story_title,
+                                    status: story_status,
+                                    depth: 2,
+                                    collapsed: false,
+                                    has_children: has_tasks,
+                                    kind: None,
+                                    progress: story_progress,
+                                });
+
+                                if let Some(tasks) = tasks {
+                                    for task in tasks {
+                                        let task_short_id = task
+                                            .get("short_id")
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("")
+                                            .to_string();
+                                        let task_title = task
+                                            .get("title")
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("")
+                                            .to_string();
+                                        let task_status = task
+                                            .get("status")
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("")
+                                            .to_string();
+                                        let task_kind = task
+                                            .get("kind")
+                                            .and_then(|v| v.as_str())
+                                            .map(|s| s.to_string());
+
+                                        nodes.push(ExecuteTreeNode {
+                                            short_id: task_short_id,
+                                            title: task_title,
+                                            status: task_status,
+                                            depth: 3,
+                                            collapsed: false,
+                                            has_children: false,
+                                            kind: task_kind,
+                                            progress: None,
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        self.nodes = nodes;
+
+        // Clamp selection
+        let visible = self.visible_nodes();
+        if !visible.is_empty() && self.selected >= visible.len() {
+            self.selected = visible.len() - 1;
+        }
+    }
+}
+
+/// State for the execute output pane (right pane).
+#[derive(Debug)]
+pub struct ExecuteOutputState {
+    /// Short ID of the currently displayed task (if any).
+    pub task_id: Option<String>,
+    /// Log lines for the currently displayed task.
+    pub lines: Vec<String>,
+    /// Whether we're streaming live output.
+    pub is_streaming: bool,
+    /// Streaming request ID (for validating response lines).
+    pub request_id: Option<String>,
+    /// Current scroll offset (0 = bottom for streaming, 0 = top for historical).
+    pub scroll_offset: u16,
+    /// Total number of lines.
+    pub total_lines: u16,
+}
+
+impl ExecuteOutputState {
+    pub fn new() -> Self {
+        Self {
+            task_id: None,
+            lines: Vec::new(),
+            is_streaming: false,
+            request_id: None,
+            scroll_offset: 0,
+            total_lines: 0,
+        }
+    }
+
+    /// Set the displayed task and its log lines (historical).
+    pub fn set_historical(&mut self, task_id: String, lines: Vec<String>) {
+        self.task_id = Some(task_id);
+        self.total_lines = lines.len() as u16;
+        self.lines = lines;
+        self.is_streaming = false;
+        self.request_id = None;
+        self.scroll_offset = 0;
+    }
+
+    /// Start streaming output for a task.
+    pub fn start_streaming(&mut self, task_id: String, request_id: String) {
+        self.task_id = Some(task_id);
+        self.lines.clear();
+        self.total_lines = 0;
+        self.is_streaming = true;
+        self.request_id = Some(request_id);
+        self.scroll_offset = 0;
+    }
+
+    /// Append a line of streaming output.
+    pub fn append_line(&mut self, line: String) {
+        self.lines.push(line);
+        self.total_lines = self.lines.len() as u16;
+        // Auto-scroll when streaming (keep at bottom)
+        self.scroll_offset = 0;
+    }
+
+    /// Stop streaming.
+    pub fn stop_streaming(&mut self) {
+        self.is_streaming = false;
+        self.request_id = None;
+    }
+
+    /// Clear the output pane.
+    #[allow(dead_code)] // Used by future execute view features (e.g., task completion)
+    pub fn clear(&mut self) {
+        self.task_id = None;
+        self.lines.clear();
+        self.total_lines = 0;
+        self.is_streaming = false;
+        self.request_id = None;
+        self.scroll_offset = 0;
+    }
+
+    /// Scroll up in the output pane.
+    pub fn scroll_up(&mut self) {
+        self.scroll_offset = self.scroll_offset.saturating_add(1);
+    }
+
+    /// Scroll down in the output pane.
+    pub fn scroll_down(&mut self) {
+        self.scroll_offset = self.scroll_offset.saturating_sub(1);
+    }
+}
+
 /// Overlay that can be displayed on top of the current view.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Overlay {
@@ -743,6 +1129,10 @@ pub struct App {
     pub plan_confirm: Option<PlanConfirmState>,
     /// Active plan node detail popup state (if open).
     pub plan_detail: Option<PlanDetailState>,
+    /// Execute tree view state (left pane).
+    pub execute_tree: ExecuteTreeState,
+    /// Execute output pane state (right pane).
+    pub execute_output: ExecuteOutputState,
 }
 
 impl App {
@@ -765,6 +1155,8 @@ impl App {
             plan_feedback: None,
             plan_confirm: None,
             plan_detail: None,
+            execute_tree: ExecuteTreeState::new(),
+            execute_output: ExecuteOutputState::new(),
         }
     }
 
@@ -965,6 +1357,29 @@ impl App {
 
         if resp.status == ResponseStatus::Ok {
             self.plan_tree.update_from_response(&resp.data);
+        }
+
+        Ok(())
+    }
+
+    /// Returns true if the execute output pane is streaming.
+    pub fn in_execute_streaming(&self) -> bool {
+        self.execute_output.is_streaming
+    }
+
+    /// Fetch the execute tree from the daemon.
+    pub async fn fetch_execute(&mut self, client: &mut SocketClient) -> Result<()> {
+        let resp = client
+            .send_command(
+                "exec.status",
+                serde_json::json!({ "project_name": &self.project }),
+            )
+            .await?;
+
+        if resp.status == ResponseStatus::Ok {
+            self.execute_tree.update_from_response(&resp.data);
+            // Auto-select the first running task on data load
+            self.execute_tree.auto_select_running_task();
         }
 
         Ok(())

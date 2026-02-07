@@ -52,6 +52,8 @@ pub enum ViewAction {
     PlanDiscard,
     /// User closed a plan sub-view (generate dialog, feedback input, detail popup, confirm popup).
     PlanSubViewExit,
+    /// Request to fetch and display a task's log output.
+    ExecuteSelectTask(String),
 }
 
 /// Handle a key event, returning true if the app should continue, false to quit.
@@ -275,6 +277,7 @@ fn handle_view_key(app: &mut App, key: KeyEvent) -> ViewAction {
     match app.current_view {
         View::Specs => handle_specs_key(app, key),
         View::Plan => handle_plan_key(app, key),
+        View::Execute => handle_execute_key(app, key),
         _ => ViewAction::None,
     }
 }
@@ -458,6 +461,49 @@ fn handle_confirm_key(app: &mut App, key: KeyEvent) -> ViewAction {
         }
         KeyCode::Char('n') | KeyCode::Char('N') => {
             app.plan_confirm = None;
+            ViewAction::None
+        }
+        _ => ViewAction::None,
+    }
+}
+
+/// Handle key events in the Execute split view.
+fn handle_execute_key(app: &mut App, key: KeyEvent) -> ViewAction {
+    match key.code {
+        // Navigation
+        KeyCode::Up | KeyCode::Char('k') => {
+            app.execute_tree.select_prev();
+            ViewAction::None
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            app.execute_tree.select_next();
+            ViewAction::None
+        }
+        // Toggle collapse
+        KeyCode::Char(' ') => {
+            app.execute_tree.toggle_collapse();
+            ViewAction::None
+        }
+        // Toggle verify task visibility
+        KeyCode::Char('h') => {
+            app.execute_tree.toggle_verify_visibility();
+            ViewAction::None
+        }
+        // Enter: view selected task's output
+        KeyCode::Enter => {
+            if let Some(task_id) = app.execute_tree.selected_task_id() {
+                ViewAction::ExecuteSelectTask(task_id)
+            } else {
+                ViewAction::None
+            }
+        }
+        // Scroll output pane
+        KeyCode::Char('J') => {
+            app.execute_output.scroll_down();
+            ViewAction::None
+        }
+        KeyCode::Char('K') => {
+            app.execute_output.scroll_up();
             ViewAction::None
         }
         _ => ViewAction::None,

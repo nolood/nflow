@@ -88,9 +88,7 @@ fn render_content(app: &App, frame: &mut Frame, area: Rect) {
             render_plan_tree(app, frame, area);
         }
         View::Execute => {
-            let block = Block::default().borders(Borders::ALL).title("Execute");
-            let paragraph = Paragraph::new("Execute view — shows running agents").block(block);
-            frame.render_widget(paragraph, area);
+            render_execute_view(app, frame, area);
         }
         View::Logs => {
             let block = Block::default().borders(Borders::ALL).title("Logs");
@@ -391,6 +389,237 @@ fn render_plan_tree(app: &App, frame: &mut Frame, area: Rect) {
 
     let paragraph = Paragraph::new(lines).block(block);
     frame.render_widget(paragraph, area);
+}
+
+/// Render the execute split view with task tree (left 40%) and agent output (right 60%).
+fn render_execute_view(app: &App, frame: &mut Frame, area: Rect) {
+    let tree = &app.execute_tree;
+
+    if tree.nodes.is_empty() {
+        let block = Block::default().borders(Borders::ALL).title("Execute");
+        let empty = Paragraph::new(vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                "  No execution data available.",
+                Style::default().fg(Color::DarkGray),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                "  Approve a plan and start execution to see progress here.",
+                Style::default().fg(Color::DarkGray),
+            )),
+        ])
+        .block(block);
+        frame.render_widget(empty, area);
+        return;
+    }
+
+    // Split: 40% tree, 60% output
+    let chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
+        .split(area);
+
+    render_execute_tree(app, frame, chunks[0]);
+    render_execute_output(app, frame, chunks[1]);
+}
+
+/// Render the execute task tree (left pane).
+fn render_execute_tree(app: &App, frame: &mut Frame, area: Rect) {
+    let tree = &app.execute_tree;
+
+    let verify_hint = if tree.hide_verify {
+        "h:show verify"
+    } else {
+        "h:hide verify"
+    };
+    let title = format!("Tasks — j/k:nav Space:collapse {} Enter:log", verify_hint);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(title)
+        .title_style(Style::default().add_modifier(Modifier::BOLD));
+
+    let inner_height = area.height.saturating_sub(2) as usize;
+    let visible = tree.visible_nodes();
+
+    // Scroll offset to keep selection visible
+    let scroll_offset = if tree.selected >= inner_height {
+        tree.selected - inner_height + 1
+    } else {
+        0
+    };
+
+    let mut lines: Vec<Line> = Vec::new();
+    for (vi, &(_, node)) in visible
+        .iter()
+        .enumerate()
+        .skip(scroll_offset)
+        .take(inner_height)
+    {
+        let is_selected = vi == tree.selected;
+
+        let indent = "  ".repeat(node.depth as usize);
+
+        let collapse_indicator = if node.has_children {
+            if node.collapsed {
+                "▸ "
+            } else {
+                "▾ "
+            }
+        } else {
+            "  "
+        };
+
+        let (icon, icon_color) = if node.depth == 0 {
+            ("", Color::DarkGray)
+        } else {
+            status_icon(&node.status)
+        };
+
+        let mut spans = Vec::new();
+
+        spans.push(Span::raw(format!("{}{}", indent, collapse_indicator)));
+
+        if !icon.is_empty() {
+            spans.push(Span::styled(
+                format!("{} ", icon),
+                Style::default().fg(icon_color),
+            ));
+        }
+
+        let id_color = match node.depth {
+            0 => Color::Yellow,
+            1 => Color::Magenta,
+            2 => Color::Cyan,
+            _ => Color::DarkGray,
+        };
+        spans.push(Span::styled(
+            &node.short_id,
+            Style::default().fg(id_color).add_modifier(Modifier::BOLD),
+        ));
+
+        spans.push(Span::raw(" "));
+
+        let title_style = if node.depth == 3 {
+            if node.kind.as_deref() == Some("verify") {
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::ITALIC)
+            } else {
+                Style::default().fg(Color::White)
+            }
+        } else {
+            Style::default().fg(Color::White)
+        };
+        spans.push(Span::styled(&*node.title, title_style));
+
+        // Story progress
+        if node.depth == 2 {
+            if let Some(ref progress) = node.progress {
+                spans.push(Span::styled(
+                    format!(" ({})", progress),
+                    Style::default().fg(Color::DarkGray),
+                ));
+            }
+        }
+
+        // Task kind
+        if node.depth == 3 {
+            if let Some(ref kind) = node.kind {
+                let kind_style = if kind == "verify" {
+                    Style::default().fg(Color::DarkGray)
+                } else {
+                    Style::default().fg(Color::Blue)
+                };
+                spans.push(Span::styled(format!(" [{}]", kind), kind_style));
+            }
+        }
+
+        let mut line = Line::from(spans);
+        if is_selected {
+            line = line.style(Style::default().bg(Color::DarkGray));
+        }
+        lines.push(line);
+    }
+
+    let paragraph = Paragraph::new(lines).block(block);
+    frame.render_widget(paragraph, area);
+}
+
+/// Render the execute output pane (right pane).
+fn render_execute_output(app: &App, frame: &mut Frame, area: Rect) {
+    let output = &app.execute_output;
+
+    let title = if let Some(ref task_id) = output.task_id {
+        if output.is_streaming {
+            format!("Output: {} (live)", task_id)
+        } else {
+            format!("Output: {} (historical)", task_id)
+        }
+    } else {
+        "Output — select a task to view".to_string()
+    };
+
+    let border_color = if output.is_streaming {
+        Color::Cyan
+    } else {
+        Color::White
+    };
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(title)
+        .title_style(Style::default().add_modifier(Modifier::BOLD))
+        .border_style(Style::default().fg(border_color));
+
+    if output.lines.is_empty() {
+        let hint = if output.task_id.is_some() {
+            "No output available for this task."
+        } else {
+            "Select a task in the tree and press Enter to view its output."
+        };
+        let empty = Paragraph::new(vec![
+            Line::from(""),
+            Line::from(Span::styled(hint, Style::default().fg(Color::DarkGray))),
+        ])
+        .block(block);
+        frame.render_widget(empty, area);
+        return;
+    }
+
+    let inner_height = area.height.saturating_sub(2);
+
+    // For streaming: auto-scroll to bottom (offset 0 = bottom)
+    // For historical: scroll from top (offset 0 = top)
+    let content_lines: Vec<Line> = output
+        .lines
+        .iter()
+        .map(|l| Line::from(l.as_str()))
+        .collect();
+
+    if output.is_streaming {
+        // Streaming: show most recent lines, scroll_offset moves up from bottom
+        let total = content_lines.len() as u16;
+        let max_scroll = total.saturating_sub(inner_height);
+        let scroll = max_scroll.saturating_sub(output.scroll_offset);
+
+        let paragraph = Paragraph::new(content_lines)
+            .block(block)
+            .wrap(Wrap { trim: false })
+            .scroll((scroll, 0));
+        frame.render_widget(paragraph, area);
+    } else {
+        // Historical: normal top-to-bottom scroll
+        let total = content_lines.len() as u16;
+        let max_scroll = total.saturating_sub(inner_height);
+        let scroll = output.scroll_offset.min(max_scroll);
+
+        let paragraph = Paragraph::new(content_lines)
+            .block(block)
+            .wrap(Wrap { trim: false })
+            .scroll((scroll, 0));
+        frame.render_widget(paragraph, area);
+    }
 }
 
 /// Render the spec content pager sub-view.
