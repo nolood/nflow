@@ -2,6 +2,8 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use chrono::Utc;
+use nix::sys::signal::{kill, Signal};
+use nix::unistd::Pid;
 use rusqlite::Connection;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
@@ -1501,12 +1503,178 @@ async fn execute_start_story(
 ///
 /// Returns (scheduler_actions, story_progress_actions).
 /// The caller (daemon main loop) is responsible for executing both sets of actions.
+/// Check for agent processes that have exceeded the wall-clock timeout.
+///
+/// On each scheduler tick, compares `now - started_at` against `max_time_per_task`.
+/// For timed-out agents:
+/// 1. Sends SIGTERM, waits 10 seconds, then SIGKILL if still alive
+/// 2. Marks agent_run as failed
+/// 3. Marks task as failed with reason "wall-clock timeout exceeded ({max_time}s)"
+/// 4. Marks parent story as failed
+/// 5. Logs timeout at WARN level
+///
+/// Returns story progress actions for failed stories.
+pub fn check_agent_timeouts(
+    conn: &Connection,
+    event_bus: Option<&SharedEventBus>,
+) -> Vec<StoryProgressAction> {
+    let running = match db::agent_runs::find_running_agent_runs(conn) {
+        Ok(r) => r,
+        Err(e) => {
+            warn!("timeout: failed to find running agent runs: {}", e);
+            return Vec::new();
+        }
+    };
+
+    if running.is_empty() {
+        return Vec::new();
+    }
+
+    let config = Config::default();
+    let max_time = config.max_time_per_task;
+    let now = Utc::now();
+
+    let mut progress_actions = Vec::new();
+
+    for run in &running {
+        let elapsed = now
+            .signed_duration_since(run.started_at)
+            .num_seconds()
+            .max(0) as u64;
+
+        if elapsed <= max_time {
+            continue;
+        }
+
+        // Timed out!
+        warn!(
+            "timeout: agent {} (pid={:?}) for task {} exceeded wall-clock timeout ({}s > {}s)",
+            run.id, run.pid, run.work_item_id, elapsed, max_time
+        );
+
+        // Send SIGTERM, wait 10s, then SIGKILL if still alive
+        if let Some(pid) = run.pid {
+            terminate_agent_process(pid);
+        }
+
+        // Mark agent_run as failed
+        let error_msg = format!("wall-clock timeout exceeded ({}s)", max_time);
+        if let Err(e) = db::agent_runs::update_agent_run_status(
+            conn,
+            &run.id,
+            AgentRunStatus::Failed,
+            None,
+            Some(&error_msg),
+            Some(now),
+        ) {
+            warn!("timeout: failed to update agent run {}: {}", run.id, e);
+            continue;
+        }
+
+        // Mark task as failed
+        let work_item = match db::work_items::get_work_item_by_id(conn, &run.work_item_id) {
+            Ok(Some(item)) => item,
+            Ok(None) => {
+                warn!(
+                    "timeout: work item {} not found for agent {}",
+                    run.work_item_id, run.id
+                );
+                continue;
+            }
+            Err(e) => {
+                warn!(
+                    "timeout: failed to load work item {}: {}",
+                    run.work_item_id, e
+                );
+                continue;
+            }
+        };
+
+        let old_status = work_item.status.to_string();
+        if let Err(e) =
+            db::work_items::update_work_item_status(conn, &run.work_item_id, WorkItemStatus::Failed)
+        {
+            warn!(
+                "timeout: failed to mark task {} as failed: {}",
+                run.work_item_id, e
+            );
+            continue;
+        }
+
+        info!(
+            "timeout: task {} failed due to wall-clock timeout ({}s)",
+            run.work_item_id, max_time
+        );
+        broadcast_status_change(
+            event_bus,
+            &run.work_item_id,
+            &work_item,
+            &old_status,
+            "failed",
+            conn,
+        );
+
+        // Fail the parent story
+        if let Some(action) = determine_story_progress(conn, &work_item, false, event_bus) {
+            progress_actions.push(action);
+        }
+    }
+
+    progress_actions
+}
+
+/// Terminate an agent process: SIGTERM, wait 10 seconds, then SIGKILL if still alive.
+fn terminate_agent_process(pid: u32) {
+    let nix_pid = Pid::from_raw(pid as i32);
+
+    // Send SIGTERM
+    match kill(nix_pid, Signal::SIGTERM) {
+        Ok(()) => {
+            info!("timeout: sent SIGTERM to agent pid={}", pid);
+        }
+        Err(nix::errno::Errno::ESRCH) => {
+            // Process already dead
+            return;
+        }
+        Err(e) => {
+            warn!("timeout: failed to send SIGTERM to pid={}: {}", pid, e);
+            return;
+        }
+    }
+
+    // Wait up to 10 seconds for the process to exit
+    for _ in 0..100 {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        if !crate::recovery::is_process_alive(pid) {
+            info!("timeout: agent pid={} exited after SIGTERM", pid);
+            return;
+        }
+    }
+
+    // Still alive — send SIGKILL
+    warn!(
+        "timeout: agent pid={} still alive after 10s, sending SIGKILL",
+        pid
+    );
+    match kill(nix_pid, Signal::SIGKILL) {
+        Ok(()) => {
+            info!("timeout: sent SIGKILL to agent pid={}", pid);
+        }
+        Err(nix::errno::Errno::ESRCH) => {
+            // Already dead
+        }
+        Err(e) => {
+            warn!("timeout: failed to send SIGKILL to pid={}: {}", pid, e);
+        }
+    }
+}
+
 pub fn scheduler_tick(
     conn: &Connection,
     event_bus: Option<&SharedEventBus>,
 ) -> (Vec<(Uuid, SchedulerAction)>, Vec<StoryProgressAction>) {
     // Phase 0: Reap finished agent processes before scheduling
-    let (reaped, progress_actions) = reap_finished_agents(conn, event_bus);
+    let (reaped, mut progress_actions) = reap_finished_agents(conn, event_bus);
     if reaped > 0 {
         debug!("scheduler: reaped {} finished agent(s)", reaped);
     }
@@ -1515,6 +1683,13 @@ pub fn scheduler_tick(
             "scheduler: {} story progress action(s) from reaping",
             progress_actions.len()
         );
+    }
+
+    // Phase 0.5: Check for wall-clock timeouts on running agents
+    let timeout_actions = check_agent_timeouts(conn, event_bus);
+    if !timeout_actions.is_empty() {
+        debug!("scheduler: {} agent(s) timed out", timeout_actions.len());
+        progress_actions.extend(timeout_actions);
     }
 
     let projects = match db::projects::list_projects(conn) {
@@ -2841,5 +3016,157 @@ mod tests {
             }
             _ => panic!("expected StatusChange event for story completion"),
         }
+    }
+
+    // --- check_agent_timeouts tests ---
+
+    #[test]
+    fn timeout_returns_empty_when_no_running_agents() {
+        let conn = test_conn();
+        let actions = check_agent_timeouts(&conn, None);
+        assert!(actions.is_empty());
+    }
+
+    #[test]
+    fn timeout_skips_agents_within_time_limit() {
+        let conn = test_conn();
+        let (_project, _session, _epic, story, impl_task, _verify_task) =
+            setup_story_with_tasks(&conn);
+
+        // Mark story and task as in_progress
+        db::work_items::update_work_item_status(&conn, &story.id, WorkItemStatus::InProgress)
+            .unwrap();
+        db::work_items::update_work_item_status(&conn, &impl_task.id, WorkItemStatus::InProgress)
+            .unwrap();
+
+        // Create a running agent that started just now (well within timeout)
+        let agent = make_running_agent(impl_task.id, Some(4_000_000_000));
+        insert_agent_run(&conn, &agent).unwrap();
+
+        let actions = check_agent_timeouts(&conn, None);
+        assert!(actions.is_empty());
+
+        // Task should still be in_progress
+        let item = db::work_items::get_work_item_by_id(&conn, &impl_task.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(item.status, WorkItemStatus::InProgress);
+    }
+
+    #[test]
+    fn timeout_fails_agent_and_task_when_exceeded() {
+        let conn = test_conn();
+        let (_project, _session, _epic, story, impl_task, _verify_task) =
+            setup_story_with_tasks(&conn);
+
+        // Mark story and task as in_progress
+        db::work_items::update_work_item_status(&conn, &story.id, WorkItemStatus::InProgress)
+            .unwrap();
+        db::work_items::update_work_item_status(&conn, &impl_task.id, WorkItemStatus::InProgress)
+            .unwrap();
+
+        // Create a running agent that started 2 hours ago (well past default 1800s timeout)
+        let mut agent = make_running_agent(impl_task.id, None); // No PID — skip signal sending
+        agent.started_at = Utc::now() - chrono::Duration::hours(2);
+        insert_agent_run(&conn, &agent).unwrap();
+
+        let actions = check_agent_timeouts(&conn, None);
+
+        // Should produce a FailStory action
+        assert_eq!(actions.len(), 1);
+        match &actions[0] {
+            StoryProgressAction::FailStory { story_id } => {
+                assert_eq!(*story_id, story.id);
+            }
+            other => panic!("expected FailStory, got {:?}", other),
+        }
+
+        // Agent run should be marked as failed
+        let runs = db::agent_runs::find_running_agent_runs(&conn).unwrap();
+        assert!(runs.is_empty()); // No more running agents
+
+        // Task should be failed
+        let item = db::work_items::get_work_item_by_id(&conn, &impl_task.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(item.status, WorkItemStatus::Failed);
+
+        // Story should be failed (via determine_story_progress)
+        let story_item = db::work_items::get_work_item_by_id(&conn, &story.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(story_item.status, WorkItemStatus::Failed);
+    }
+
+    #[test]
+    fn timeout_broadcasts_status_change_events() {
+        let conn = test_conn();
+        let (_project, _session, _epic, story, impl_task, _verify_task) =
+            setup_story_with_tasks(&conn);
+
+        db::work_items::update_work_item_status(&conn, &story.id, WorkItemStatus::InProgress)
+            .unwrap();
+        db::work_items::update_work_item_status(&conn, &impl_task.id, WorkItemStatus::InProgress)
+            .unwrap();
+
+        let mut agent = make_running_agent(impl_task.id, None);
+        agent.started_at = Utc::now() - chrono::Duration::hours(2);
+        insert_agent_run(&conn, &agent).unwrap();
+
+        let bus = crate::events::new_event_bus(16);
+        let client = crate::events::ClientId::new();
+        let mut rx = bus.subscribe(client);
+
+        let _actions = check_agent_timeouts(&conn, Some(&bus));
+
+        // Should broadcast task failure and story failure
+        let task_event = rx.try_recv().unwrap();
+        match task_event {
+            Event::StatusChange {
+                item_id,
+                new_status,
+                ..
+            } => {
+                assert_eq!(item_id, impl_task.id.to_string());
+                assert_eq!(new_status, "failed");
+            }
+            _ => panic!("expected StatusChange for task failure"),
+        }
+
+        let story_event = rx.try_recv().unwrap();
+        match story_event {
+            Event::StatusChange {
+                item_id,
+                new_status,
+                ..
+            } => {
+                assert_eq!(item_id, story.id.to_string());
+                assert_eq!(new_status, "failed");
+            }
+            _ => panic!("expected StatusChange for story failure"),
+        }
+    }
+
+    #[test]
+    fn timeout_integrated_into_scheduler_tick() {
+        let conn = test_conn();
+        let (_project, _session, _epic, story, impl_task, _verify_task) =
+            setup_story_with_tasks(&conn);
+
+        db::work_items::update_work_item_status(&conn, &story.id, WorkItemStatus::InProgress)
+            .unwrap();
+        db::work_items::update_work_item_status(&conn, &impl_task.id, WorkItemStatus::InProgress)
+            .unwrap();
+
+        let mut agent = make_running_agent(impl_task.id, None);
+        agent.started_at = Utc::now() - chrono::Duration::hours(2);
+        insert_agent_run(&conn, &agent).unwrap();
+
+        let (_actions, progress_actions) = scheduler_tick(&conn, None);
+
+        // Timeout should produce FailStory in progress_actions
+        assert!(progress_actions.iter().any(
+            |a| matches!(a, StoryProgressAction::FailStory { story_id } if *story_id == story.id)
+        ));
     }
 }

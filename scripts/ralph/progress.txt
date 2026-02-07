@@ -1,6 +1,7 @@
 ## Codebase Patterns
 - Story completion lifecycle: rebase → push → MR creation → DB update → worktree cleanup → event broadcast (all in execute_complete_story)
 - On any failure during story completion (rebase/push/MR), story is rolled back to Failed status via fail_story_on_completion_error()
+- Wall-clock timeout: check_agent_timeouts() runs as Phase 0.5 in scheduler_tick (after reaping, before scheduling). Uses nix SIGTERM→sleep(10s)→SIGKILL pattern.
 - build_mr_context() from nflow-claude returns HashMap<String, String>; convert to HashMap<&str, &str> via .iter().map() for render_template()
 - Scheduler loop runs on main tokio task with tokio::time::interval(2s) — serialized, no concurrent DB writes
 - scheduler_tick() takes &Connection, builds SchedulerState per project from DB, calls nflow-core schedule()
@@ -1506,4 +1507,26 @@ Started: Sat Feb  7 03:49:10 PM MSK 2026
   - Story completion is an async operation (git commands) that runs after the sync determine_story_progress sets status=Done
   - If story completion fails, we roll back status from Done→Failed (not from InProgress→Failed) — important distinction
   - Config loading for cleanup_worktrees currently uses defaults; per-project config DB lookup is a TODO for config integration US
+---
+
+## 2026-02-07 - US-058
+- What was implemented: Scheduler — wall-clock timeout detection and agent termination
+  - `check_agent_timeouts()` function in scheduler_loop.rs — runs as Phase 0.5 of scheduler_tick
+  - On each tick: queries all running agent_runs, compares `Utc::now() - started_at` against `max_time_per_task` (default 1800s)
+  - For timed-out agents: sends SIGTERM via nix, polls is_process_alive() every 100ms for 10s, then SIGKILL if still alive
+  - `terminate_agent_process()` helper encapsulates the SIGTERM→wait→SIGKILL escalation pattern
+  - Marks agent_run as failed with error_message "wall-clock timeout exceeded ({max_time}s)"
+  - Marks task as failed, then calls determine_story_progress(succeeded=false) to fail the parent story
+  - Broadcasts StatusChange events for both task and story failure
+  - Logs at WARN level when timeout is detected, INFO level for signal sending
+  - Integrated into scheduler_tick: timeout_actions are collected and merged with progress_actions from reaping
+  - 5 new tests (363 workspace total): no running agents, within time limit, timeout exceeded (task+story failed), broadcasts events, integration into scheduler_tick
+- Files changed:
+  - crates/nflow-daemon/src/scheduler_loop.rs (+~160 lines — check_agent_timeouts, terminate_agent_process, Phase 0.5 in scheduler_tick, 5 tests)
+- **Learnings for future iterations:**
+  - Use nix::sys::signal::kill directly for SIGTERM/SIGKILL in sync context (not ClaudeProcess::terminate which is async)
+  - Polling with std::thread::sleep(100ms) in a loop for SIGTERM grace period — blocks the scheduler tick but only on exceptional timeout path
+  - AgentRun.started_at is already a DateTime<Utc> — use chrono signed_duration_since for elapsed time comparison
+  - Tests use None for PID to skip signal sending (no actual process to kill) — isolates DB logic testing from OS process management
+  - Pre-existing flaky test: daemon::tests::test_pid_file_and_daemon_running (filesystem race condition)
 ---
