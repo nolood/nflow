@@ -241,6 +241,293 @@ impl SpecPagerState {
     }
 }
 
+/// A node in the plan tree view.
+#[derive(Debug, Clone)]
+pub struct PlanTreeNode {
+    /// Display short_id (e.g., "W1-E1", "W1-S1", "W1-T1").
+    pub short_id: String,
+    /// Title of the work item.
+    pub title: String,
+    /// Status string (e.g., "pending", "ready", "in_progress", "done", "failed", "cancelled").
+    pub status: String,
+    /// Node depth level: 0=wave, 1=epic, 2=story, 3=task.
+    pub depth: u8,
+    /// Whether this node is collapsed (children hidden).
+    pub collapsed: bool,
+    /// Whether this node has children.
+    pub has_children: bool,
+    /// Dependencies as display IDs (stories only).
+    pub depends_on: Vec<String>,
+    /// Progress string for stories (e.g., "2/5").
+    pub progress: Option<String>,
+    /// Task kind: "impl" or "verify" (tasks only).
+    pub kind: Option<String>,
+}
+
+/// State for the plan tree view.
+#[derive(Debug)]
+pub struct PlanTreeState {
+    /// All tree nodes (flattened).
+    pub nodes: Vec<PlanTreeNode>,
+    /// Current selected index in the visible nodes list.
+    pub selected: usize,
+    /// Whether to hide verify tasks.
+    pub hide_verify: bool,
+    /// Wave number being displayed.
+    pub wave_number: Option<u32>,
+    /// Wave status (e.g., "in_progress", "approved").
+    pub wave_status: Option<String>,
+}
+
+impl PlanTreeState {
+    pub fn new() -> Self {
+        Self {
+            nodes: Vec::new(),
+            selected: 0,
+            hide_verify: false,
+            wave_number: None,
+            wave_status: None,
+        }
+    }
+
+    /// Get visible nodes (respecting collapsed state and verify filter).
+    pub fn visible_nodes(&self) -> Vec<(usize, &PlanTreeNode)> {
+        let mut result = Vec::new();
+        let mut skip_depth: Option<u8> = None;
+
+        for (i, node) in self.nodes.iter().enumerate() {
+            // Skip children of collapsed nodes
+            if let Some(sd) = skip_depth {
+                if node.depth > sd {
+                    continue;
+                }
+                skip_depth = None;
+            }
+
+            // Filter out verify tasks if hide_verify is on
+            if self.hide_verify && node.depth == 3 {
+                if let Some(ref kind) = node.kind {
+                    if kind == "verify" {
+                        continue;
+                    }
+                }
+            }
+
+            result.push((i, node));
+
+            if node.collapsed && node.has_children {
+                skip_depth = Some(node.depth);
+            }
+        }
+
+        result
+    }
+
+    /// Move selection up.
+    pub fn select_prev(&mut self) {
+        let visible = self.visible_nodes();
+        if visible.is_empty() {
+            return;
+        }
+        if self.selected > 0 {
+            self.selected -= 1;
+        }
+    }
+
+    /// Move selection down.
+    pub fn select_next(&mut self) {
+        let visible = self.visible_nodes();
+        if visible.is_empty() {
+            return;
+        }
+        if self.selected < visible.len() - 1 {
+            self.selected += 1;
+        }
+    }
+
+    /// Toggle collapse on the selected node.
+    pub fn toggle_collapse(&mut self) {
+        let visible = self.visible_nodes();
+        if let Some(&(real_idx, _)) = visible.get(self.selected) {
+            if self.nodes[real_idx].has_children {
+                self.nodes[real_idx].collapsed = !self.nodes[real_idx].collapsed;
+            }
+        }
+    }
+
+    /// Toggle verify task visibility.
+    pub fn toggle_verify_visibility(&mut self) {
+        self.hide_verify = !self.hide_verify;
+        // Clamp selection
+        let visible = self.visible_nodes();
+        if !visible.is_empty() && self.selected >= visible.len() {
+            self.selected = visible.len() - 1;
+        }
+    }
+
+    /// Update tree from daemon plan.show response data.
+    pub fn update_from_response(&mut self, data: &serde_json::Value) {
+        let wave_number = data
+            .get("wave_number")
+            .and_then(|v| v.as_u64())
+            .map(|n| n as u32);
+        let wave_status = data
+            .get("status")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+
+        self.wave_number = wave_number;
+        self.wave_status = wave_status.clone();
+
+        let mut nodes = Vec::new();
+
+        // Add wave root node
+        let wave_label = wave_number
+            .map(|w| format!("W{}", w))
+            .unwrap_or_else(|| "Wave".to_string());
+        let has_epics = data
+            .get("epics")
+            .and_then(|v| v.as_array())
+            .is_some_and(|a| !a.is_empty());
+        nodes.push(PlanTreeNode {
+            short_id: wave_label,
+            title: wave_status.unwrap_or_default(),
+            status: String::new(),
+            depth: 0,
+            collapsed: false,
+            has_children: has_epics,
+            depends_on: Vec::new(),
+            progress: None,
+            kind: None,
+        });
+
+        if let Some(epics) = data.get("epics").and_then(|v| v.as_array()) {
+            for epic in epics {
+                let epic_short_id = epic
+                    .get("short_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let epic_title = epic
+                    .get("title")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let epic_status = epic
+                    .get("status")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let stories = epic.get("stories").and_then(|v| v.as_array());
+                let has_stories = stories.is_some_and(|s| !s.is_empty());
+
+                nodes.push(PlanTreeNode {
+                    short_id: epic_short_id,
+                    title: epic_title,
+                    status: epic_status,
+                    depth: 1,
+                    collapsed: false,
+                    has_children: has_stories,
+                    depends_on: Vec::new(),
+                    progress: None,
+                    kind: None,
+                });
+
+                if let Some(stories) = stories {
+                    for story in stories {
+                        let story_short_id = story
+                            .get("short_id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let story_title = story
+                            .get("title")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let story_status = story
+                            .get("status")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let story_progress = story
+                            .get("progress")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string());
+                        let story_deps: Vec<String> = story
+                            .get("depends_on")
+                            .and_then(|v| v.as_array())
+                            .map(|arr| {
+                                arr.iter()
+                                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        let tasks = story.get("tasks").and_then(|v| v.as_array());
+                        let has_tasks = tasks.is_some_and(|t| !t.is_empty());
+
+                        nodes.push(PlanTreeNode {
+                            short_id: story_short_id,
+                            title: story_title,
+                            status: story_status,
+                            depth: 2,
+                            collapsed: false,
+                            has_children: has_tasks,
+                            depends_on: story_deps,
+                            progress: story_progress,
+                            kind: None,
+                        });
+
+                        if let Some(tasks) = tasks {
+                            for task in tasks {
+                                let task_short_id = task
+                                    .get("short_id")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
+                                let task_title = task
+                                    .get("title")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
+                                let task_status = task
+                                    .get("status")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
+                                let task_kind = task
+                                    .get("kind")
+                                    .and_then(|v| v.as_str())
+                                    .map(|s| s.to_string());
+
+                                nodes.push(PlanTreeNode {
+                                    short_id: task_short_id,
+                                    title: task_title,
+                                    status: task_status,
+                                    depth: 3,
+                                    collapsed: false,
+                                    has_children: false,
+                                    depends_on: Vec::new(),
+                                    progress: None,
+                                    kind: task_kind,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        self.nodes = nodes;
+
+        // Clamp selection
+        let visible = self.visible_nodes();
+        if !visible.is_empty() && self.selected >= visible.len() {
+            self.selected = visible.len() - 1;
+        }
+    }
+}
+
 /// Overlay that can be displayed on top of the current view.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Overlay {
@@ -334,6 +621,8 @@ pub struct App {
     pub spec_dialogue: Option<SpecDialogueState>,
     /// Active spec pager state (if in pager sub-view).
     pub spec_pager: Option<SpecPagerState>,
+    /// Plan tree view state.
+    pub plan_tree: PlanTreeState,
 }
 
 impl App {
@@ -351,6 +640,7 @@ impl App {
             specs_list: SpecsListState::new(),
             spec_dialogue: None,
             spec_pager: None,
+            plan_tree: PlanTreeState::new(),
         }
     }
 
@@ -479,6 +769,22 @@ impl App {
 
         // Fetch specs list
         self.fetch_specs(client).await.ok();
+
+        Ok(())
+    }
+
+    /// Fetch the plan tree from the daemon.
+    pub async fn fetch_plan(&mut self, client: &mut SocketClient) -> Result<()> {
+        let resp = client
+            .send_command(
+                "plan.show",
+                serde_json::json!({ "project_name": &self.project }),
+            )
+            .await?;
+
+        if resp.status == ResponseStatus::Ok {
+            self.plan_tree.update_from_response(&resp.data);
+        }
 
         Ok(())
     }
@@ -953,6 +1259,335 @@ mod tests {
         app.exit_pager();
         assert!(!app.in_pager());
         assert!(app.spec_pager.is_none());
+    }
+
+    // --- PlanTreeState tests ---
+
+    #[test]
+    fn test_plan_tree_initial_state() {
+        let state = PlanTreeState::new();
+        assert!(state.nodes.is_empty());
+        assert_eq!(state.selected, 0);
+        assert!(!state.hide_verify);
+        assert!(state.wave_number.is_none());
+    }
+
+    #[test]
+    fn test_plan_tree_update_from_response() {
+        let mut state = PlanTreeState::new();
+        let data = serde_json::json!({
+            "wave_number": 1,
+            "status": "approved",
+            "epics": [
+                {
+                    "short_id": "W1-E1",
+                    "title": "Auth Epic",
+                    "status": "pending",
+                    "stories": [
+                        {
+                            "short_id": "W1-S1",
+                            "title": "Login Story",
+                            "status": "ready",
+                            "progress": "0/2",
+                            "depends_on": [],
+                            "tasks": [
+                                {
+                                    "short_id": "W1-T1",
+                                    "title": "Implement login",
+                                    "status": "pending",
+                                    "kind": "impl"
+                                },
+                                {
+                                    "short_id": "W1-T1v",
+                                    "title": "Verify login",
+                                    "status": "pending",
+                                    "kind": "verify"
+                                }
+                            ]
+                        }
+                    ]
+                }
+            ]
+        });
+
+        state.update_from_response(&data);
+        assert_eq!(state.wave_number, Some(1));
+        assert_eq!(state.wave_status.as_deref(), Some("approved"));
+        // wave + epic + story + 2 tasks = 5
+        assert_eq!(state.nodes.len(), 5);
+        assert_eq!(state.nodes[0].depth, 0); // wave
+        assert_eq!(state.nodes[1].depth, 1); // epic
+        assert_eq!(state.nodes[2].depth, 2); // story
+        assert_eq!(state.nodes[3].depth, 3); // task impl
+        assert_eq!(state.nodes[4].depth, 3); // task verify
+    }
+
+    #[test]
+    fn test_plan_tree_navigation() {
+        let mut state = PlanTreeState::new();
+        let data = serde_json::json!({
+            "wave_number": 1,
+            "status": "approved",
+            "epics": [{
+                "short_id": "W1-E1",
+                "title": "Epic",
+                "status": "pending",
+                "stories": [{
+                    "short_id": "W1-S1",
+                    "title": "Story",
+                    "status": "pending",
+                    "progress": "0/1",
+                    "depends_on": [],
+                    "tasks": [{
+                        "short_id": "W1-T1",
+                        "title": "Task",
+                        "status": "pending",
+                        "kind": "impl"
+                    }]
+                }]
+            }]
+        });
+        state.update_from_response(&data);
+
+        assert_eq!(state.selected, 0);
+        state.select_next();
+        assert_eq!(state.selected, 1);
+        state.select_next();
+        assert_eq!(state.selected, 2);
+        state.select_next();
+        assert_eq!(state.selected, 3);
+        // Can't go past end
+        state.select_next();
+        assert_eq!(state.selected, 3);
+
+        state.select_prev();
+        assert_eq!(state.selected, 2);
+        state.selected = 0;
+        // Can't go below 0
+        state.select_prev();
+        assert_eq!(state.selected, 0);
+    }
+
+    #[test]
+    fn test_plan_tree_collapse() {
+        let mut state = PlanTreeState::new();
+        let data = serde_json::json!({
+            "wave_number": 1,
+            "status": "approved",
+            "epics": [{
+                "short_id": "W1-E1",
+                "title": "Epic",
+                "status": "pending",
+                "stories": [{
+                    "short_id": "W1-S1",
+                    "title": "Story",
+                    "status": "pending",
+                    "progress": "0/1",
+                    "depends_on": [],
+                    "tasks": [{
+                        "short_id": "W1-T1",
+                        "title": "Task",
+                        "status": "pending",
+                        "kind": "impl"
+                    }]
+                }]
+            }]
+        });
+        state.update_from_response(&data);
+
+        // All 4 nodes visible
+        assert_eq!(state.visible_nodes().len(), 4);
+
+        // Collapse the epic (index 1 in visible)
+        state.selected = 1;
+        state.toggle_collapse();
+        assert!(state.nodes[1].collapsed);
+        // Now only wave + epic visible (story and task hidden)
+        assert_eq!(state.visible_nodes().len(), 2);
+
+        // Uncollapse
+        state.toggle_collapse();
+        assert!(!state.nodes[1].collapsed);
+        assert_eq!(state.visible_nodes().len(), 4);
+    }
+
+    #[test]
+    fn test_plan_tree_toggle_verify() {
+        let mut state = PlanTreeState::new();
+        let data = serde_json::json!({
+            "wave_number": 1,
+            "status": "approved",
+            "epics": [{
+                "short_id": "W1-E1",
+                "title": "Epic",
+                "status": "pending",
+                "stories": [{
+                    "short_id": "W1-S1",
+                    "title": "Story",
+                    "status": "pending",
+                    "progress": "0/2",
+                    "depends_on": [],
+                    "tasks": [
+                        {
+                            "short_id": "W1-T1",
+                            "title": "Impl",
+                            "status": "pending",
+                            "kind": "impl"
+                        },
+                        {
+                            "short_id": "W1-T1v",
+                            "title": "Verify",
+                            "status": "pending",
+                            "kind": "verify"
+                        }
+                    ]
+                }]
+            }]
+        });
+        state.update_from_response(&data);
+
+        // 5 nodes visible: wave, epic, story, impl task, verify task
+        assert_eq!(state.visible_nodes().len(), 5);
+
+        state.toggle_verify_visibility();
+        assert!(state.hide_verify);
+        // Verify task hidden: 4 visible
+        assert_eq!(state.visible_nodes().len(), 4);
+
+        state.toggle_verify_visibility();
+        assert!(!state.hide_verify);
+        assert_eq!(state.visible_nodes().len(), 5);
+    }
+
+    #[test]
+    fn test_plan_tree_empty_response() {
+        let mut state = PlanTreeState::new();
+        let data = serde_json::json!({
+            "wave_number": 1,
+            "status": "in_progress",
+            "epics": []
+        });
+        state.update_from_response(&data);
+        // Only wave node
+        assert_eq!(state.nodes.len(), 1);
+        assert_eq!(state.nodes[0].depth, 0);
+    }
+
+    #[test]
+    fn test_plan_tree_story_dependencies() {
+        let mut state = PlanTreeState::new();
+        let data = serde_json::json!({
+            "wave_number": 1,
+            "status": "approved",
+            "epics": [{
+                "short_id": "W1-E1",
+                "title": "Epic",
+                "status": "pending",
+                "stories": [{
+                    "short_id": "W1-S1",
+                    "title": "Story",
+                    "status": "pending",
+                    "progress": "0/0",
+                    "depends_on": ["W1-S2", "W1-S3"],
+                    "tasks": []
+                }]
+            }]
+        });
+        state.update_from_response(&data);
+
+        // Story node at index 2
+        assert_eq!(state.nodes[2].depends_on, vec!["W1-S2", "W1-S3"]);
+    }
+
+    #[test]
+    fn test_plan_tree_selection_clamps_on_verify_toggle() {
+        let mut state = PlanTreeState::new();
+        let data = serde_json::json!({
+            "wave_number": 1,
+            "status": "approved",
+            "epics": [{
+                "short_id": "W1-E1",
+                "title": "Epic",
+                "status": "pending",
+                "stories": [{
+                    "short_id": "W1-S1",
+                    "title": "Story",
+                    "status": "pending",
+                    "progress": "0/2",
+                    "depends_on": [],
+                    "tasks": [
+                        { "short_id": "W1-T1", "title": "Impl", "status": "pending", "kind": "impl" },
+                        { "short_id": "W1-T1v", "title": "Verify", "status": "pending", "kind": "verify" }
+                    ]
+                }]
+            }]
+        });
+        state.update_from_response(&data);
+
+        // Select the last item (verify task at visible index 4)
+        state.selected = 4;
+        state.toggle_verify_visibility();
+        // Selection should be clamped to 3 (last visible is impl task)
+        assert!(state.selected <= 3);
+    }
+
+    #[test]
+    fn test_plan_tree_navigation_empty() {
+        let mut state = PlanTreeState::new();
+        // Navigation on empty tree should not panic
+        state.select_next();
+        assert_eq!(state.selected, 0);
+        state.select_prev();
+        assert_eq!(state.selected, 0);
+    }
+
+    #[test]
+    fn test_plan_tree_toggle_collapse_no_children() {
+        let mut state = PlanTreeState::new();
+        let data = serde_json::json!({
+            "wave_number": 1,
+            "status": "approved",
+            "epics": [{
+                "short_id": "W1-E1",
+                "title": "Epic",
+                "status": "pending",
+                "stories": [{
+                    "short_id": "W1-S1",
+                    "title": "Story",
+                    "status": "pending",
+                    "progress": "0/1",
+                    "depends_on": [],
+                    "tasks": [{
+                        "short_id": "W1-T1",
+                        "title": "Task",
+                        "status": "pending",
+                        "kind": "impl"
+                    }]
+                }]
+            }]
+        });
+        state.update_from_response(&data);
+
+        // Select a leaf node (task)
+        state.selected = 3;
+        state.toggle_collapse();
+        // Task has no children — collapsed should remain false
+        assert!(!state.nodes[3].collapsed);
+    }
+
+    #[test]
+    fn test_app_plan_tree_initial() {
+        let app = App::new("test".to_string());
+        assert!(app.plan_tree.nodes.is_empty());
+        assert_eq!(app.plan_tree.selected, 0);
+        assert!(!app.plan_tree.hide_verify);
+    }
+
+    #[test]
+    fn test_dialogue_ctrl_c_still_quits_with_plan_tree() {
+        // Ensure plan_tree field doesn't break App construction
+        let app = App::new("test".to_string());
+        assert!(app.plan_tree.wave_number.is_none());
     }
 
     #[test]

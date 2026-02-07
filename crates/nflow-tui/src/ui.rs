@@ -74,9 +74,7 @@ fn render_content(app: &App, frame: &mut Frame, area: Rect) {
             }
         }
         View::Plan => {
-            let block = Block::default().borders(Borders::ALL).title("Plan");
-            let paragraph = Paragraph::new("Plan view — shows decomposition waves").block(block);
-            frame.render_widget(paragraph, area);
+            render_plan_tree(app, frame, area);
         }
         View::Execute => {
             let block = Block::default().borders(Borders::ALL).title("Execute");
@@ -210,6 +208,178 @@ fn render_specs_list(app: &App, frame: &mut Frame, area: Rect) {
         .column_spacing(1);
 
     frame.render_widget(table, area);
+}
+
+/// Status icon for a work item status string.
+fn status_icon(status: &str) -> (&str, Color) {
+    match status {
+        "pending" => ("○", Color::DarkGray),
+        "ready" => ("●", Color::White),
+        "in_progress" => ("▶", Color::Cyan),
+        "done" => ("✓", Color::Green),
+        "failed" => ("✗", Color::Red),
+        "cancelled" => ("⊘", Color::DarkGray),
+        _ => (" ", Color::DarkGray),
+    }
+}
+
+/// Render the plan tree view with collapsible hierarchy.
+fn render_plan_tree(app: &App, frame: &mut Frame, area: Rect) {
+    let tree = &app.plan_tree;
+
+    if tree.nodes.is_empty() {
+        let block = Block::default().borders(Borders::ALL).title("Plan");
+        let empty = Paragraph::new(vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                "  No decomposition waves found.",
+                Style::default().fg(Color::DarkGray),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                "  Use 'nflow plan generate' to create a plan.",
+                Style::default().fg(Color::DarkGray),
+            )),
+        ])
+        .block(block);
+        frame.render_widget(empty, area);
+        return;
+    }
+
+    let verify_hint = if tree.hide_verify {
+        "h:show verify"
+    } else {
+        "h:hide verify"
+    };
+    let title = format!(
+        "Plan — j/k:navigate Enter:expand/collapse {} Esc:back",
+        verify_hint
+    );
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(title)
+        .title_style(Style::default().add_modifier(Modifier::BOLD));
+
+    let inner_height = area.height.saturating_sub(2) as usize;
+    let visible = tree.visible_nodes();
+
+    // Scroll offset to keep selection visible
+    let scroll_offset = if tree.selected >= inner_height {
+        tree.selected - inner_height + 1
+    } else {
+        0
+    };
+
+    let mut lines: Vec<Line> = Vec::new();
+    for (vi, &(_, node)) in visible
+        .iter()
+        .enumerate()
+        .skip(scroll_offset)
+        .take(inner_height)
+    {
+        let is_selected = vi == tree.selected;
+
+        // Build indentation
+        let indent = "  ".repeat(node.depth as usize);
+
+        // Collapse indicator
+        let collapse_indicator = if node.has_children {
+            if node.collapsed {
+                "▸ "
+            } else {
+                "▾ "
+            }
+        } else {
+            "  "
+        };
+
+        // Status icon
+        let (icon, icon_color) = if node.depth == 0 {
+            // Wave node - no status icon
+            ("", Color::DarkGray)
+        } else {
+            status_icon(&node.status)
+        };
+
+        // Build the line spans
+        let mut spans = Vec::new();
+
+        // Indent + collapse
+        spans.push(Span::raw(format!("{}{}", indent, collapse_indicator)));
+
+        // Status icon
+        if !icon.is_empty() {
+            spans.push(Span::styled(
+                format!("{} ", icon),
+                Style::default().fg(icon_color),
+            ));
+        }
+
+        // Short ID
+        let id_color = match node.depth {
+            0 => Color::Yellow,
+            1 => Color::Magenta,
+            2 => Color::Cyan,
+            _ => Color::DarkGray,
+        };
+        spans.push(Span::styled(
+            &node.short_id,
+            Style::default().fg(id_color).add_modifier(Modifier::BOLD),
+        ));
+
+        spans.push(Span::raw(" "));
+
+        // Title
+        let title_style = if node.depth == 3 {
+            if node.kind.as_deref() == Some("verify") {
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::ITALIC)
+            } else {
+                Style::default().fg(Color::White)
+            }
+        } else {
+            Style::default().fg(Color::White)
+        };
+        spans.push(Span::styled(&*node.title, title_style));
+
+        // Story-specific: progress + dependencies
+        if node.depth == 2 {
+            if let Some(ref progress) = node.progress {
+                spans.push(Span::styled(
+                    format!(" ({})", progress),
+                    Style::default().fg(Color::DarkGray),
+                ));
+            }
+            if !node.depends_on.is_empty() {
+                spans.push(Span::styled(
+                    format!(" [blocks: {}]", node.depends_on.join(", ")),
+                    Style::default().fg(Color::Yellow),
+                ));
+            }
+        }
+
+        // Task kind indicator
+        if node.depth == 3 {
+            if let Some(ref kind) = node.kind {
+                let kind_style = if kind == "verify" {
+                    Style::default().fg(Color::DarkGray)
+                } else {
+                    Style::default().fg(Color::Blue)
+                };
+                spans.push(Span::styled(format!(" [{}]", kind), kind_style));
+            }
+        }
+
+        let mut line = Line::from(spans);
+        if is_selected {
+            line = line.style(Style::default().bg(Color::DarkGray));
+        }
+        lines.push(line);
+    }
+
+    let paragraph = Paragraph::new(lines).block(block);
+    frame.render_widget(paragraph, area);
 }
 
 /// Render the spec content pager sub-view.

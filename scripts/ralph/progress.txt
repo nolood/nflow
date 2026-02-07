@@ -39,6 +39,9 @@
 - TUI list state pattern: XxxListState struct with items Vec, selected usize, select_prev/select_next, update_from_response
 - centered_rect(percent_x, percent_y, area) computes a centered Rect for popup overlays; use Clear widget before rendering popup
 - TUI pager sub-view pattern: SpecPagerState with lines Vec, scroll_offset, total_lines; handle_pager_key checked before handle_dialogue_key; pager blocks all global keys (q exits pager, not app); spec.view command returns { name, status, content }
+- TUI plan tree view: PlanTreeState with flat Vec<PlanTreeNode>, visible_nodes() filters collapsed/verify; depth=0 wave, 1 epic, 2 story, 3 task; status icons mapped from string status; collapsible via toggle_collapse(); h toggles hide_verify
+- plan.show daemon command returns { wave_number, status, epics: [{ short_id, title, status, stories: [{ ..., progress, depends_on, tasks }] }] }
+- visible_nodes() pattern: iterate all nodes, skip children when parent.collapsed, filter verify tasks when hide_verify — returns Vec<(real_index, &node)> for mapping back to flat array
 - Story completion lifecycle: rebase → push → MR creation → DB update → worktree cleanup → event broadcast (all in execute_complete_story)
 - On any failure during story completion (rebase/push/MR), story is rolled back to Failed status via fail_story_on_completion_error()
 - Wall-clock timeout: check_agent_timeouts() runs as Phase 0.5 in scheduler_tick (after reaping, before scheduling). Uses nix SIGTERM→sleep(10s)→SIGKILL pattern.
@@ -1997,4 +2000,19 @@ Started: Sat Feb  7 03:49:10 PM MSK 2026
   - For pager scroll, visible_height is needed but not available in event handler — use estimate, clamp in render
   - spec.view daemon command returns { name, status, content } — content is the full markdown file
   - q key in pager exits pager (not app) — sub-views capture q before it reaches global quit handler
+---
+
+## 2026-02-08 - US-079
+- What was implemented: TUI plan tree view with collapsible hierarchy (Wave→Epic→Story→Task)
+- Files changed:
+  - crates/nflow-tui/src/app.rs: Added PlanTreeNode struct, PlanTreeState with visible_nodes(), collapse, verify filter, update_from_response()
+  - crates/nflow-tui/src/event.rs: Added handle_plan_key() for j/k navigation, Enter/Space collapse, h verify toggle
+  - crates/nflow-tui/src/ui.rs: Added render_plan_tree() with status icons, indentation, collapse indicators, progress, dependencies
+  - crates/nflow-tui/src/main.rs: Added fetch_plan() call on initial connect
+- **Learnings for future iterations:**
+  - Plan tree uses flat Vec with depth field + visible_nodes() filtering — simpler than a real tree structure
+  - visible_nodes() returns (real_index, &node) tuples to map selections back to the flat array for mutations
+  - Status icon mapping: pending=○, ready=●, in_progress=▶, done=✓, failed=✗, cancelled=⊘
+  - plan.show response is hierarchical JSON: wave→epics→stories→tasks, flattened on client side with depth markers
+  - handle_view_key dispatch pattern: just add new arm for View::Plan → handle_plan_key(app, key)
 ---

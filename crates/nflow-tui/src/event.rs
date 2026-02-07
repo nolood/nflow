@@ -255,6 +255,33 @@ fn handle_dialogue_key(app: &mut App, key: KeyEvent) -> ViewAction {
 fn handle_view_key(app: &mut App, key: KeyEvent) -> ViewAction {
     match app.current_view {
         View::Specs => handle_specs_key(app, key),
+        View::Plan => handle_plan_key(app, key),
+        _ => ViewAction::None,
+    }
+}
+
+/// Handle key events in the Plan tree view.
+fn handle_plan_key(app: &mut App, key: KeyEvent) -> ViewAction {
+    match key.code {
+        // Navigation
+        KeyCode::Up | KeyCode::Char('k') => {
+            app.plan_tree.select_prev();
+            ViewAction::None
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            app.plan_tree.select_next();
+            ViewAction::None
+        }
+        // Toggle collapse
+        KeyCode::Enter | KeyCode::Char(' ') => {
+            app.plan_tree.toggle_collapse();
+            ViewAction::None
+        }
+        // Toggle verify task visibility
+        KeyCode::Char('h') => {
+            app.plan_tree.toggle_verify_visibility();
+            ViewAction::None
+        }
         _ => ViewAction::None,
     }
 }
@@ -812,5 +839,120 @@ mod tests {
         );
         assert!(!cont);
         assert!(app.should_quit);
+    }
+
+    // --- Plan view keybindings ---
+
+    fn app_with_plan() -> App {
+        let mut app = App::new("test".to_string());
+        app.switch_view(View::Plan);
+        let data = serde_json::json!({
+            "wave_number": 1,
+            "status": "approved",
+            "epics": [{
+                "short_id": "W1-E1",
+                "title": "Epic",
+                "status": "pending",
+                "stories": [{
+                    "short_id": "W1-S1",
+                    "title": "Story",
+                    "status": "ready",
+                    "progress": "0/2",
+                    "depends_on": [],
+                    "tasks": [
+                        { "short_id": "W1-T1", "title": "Impl Task", "status": "pending", "kind": "impl" },
+                        { "short_id": "W1-T1v", "title": "Verify Task", "status": "pending", "kind": "verify" }
+                    ]
+                }]
+            }]
+        });
+        app.plan_tree.update_from_response(&data);
+        app
+    }
+
+    #[test]
+    fn test_plan_j_navigates_down() {
+        let mut app = app_with_plan();
+        assert_eq!(app.plan_tree.selected, 0);
+
+        handle_key_event(&mut app, make_key(KeyCode::Char('j')));
+        assert_eq!(app.plan_tree.selected, 1);
+    }
+
+    #[test]
+    fn test_plan_k_navigates_up() {
+        let mut app = app_with_plan();
+        app.plan_tree.selected = 2;
+
+        handle_key_event(&mut app, make_key(KeyCode::Char('k')));
+        assert_eq!(app.plan_tree.selected, 1);
+    }
+
+    #[test]
+    fn test_plan_arrow_down_navigates() {
+        let mut app = app_with_plan();
+        handle_key_event(&mut app, make_key(KeyCode::Down));
+        assert_eq!(app.plan_tree.selected, 1);
+    }
+
+    #[test]
+    fn test_plan_arrow_up_navigates() {
+        let mut app = app_with_plan();
+        app.plan_tree.selected = 1;
+        handle_key_event(&mut app, make_key(KeyCode::Up));
+        assert_eq!(app.plan_tree.selected, 0);
+    }
+
+    #[test]
+    fn test_plan_enter_toggles_collapse() {
+        let mut app = app_with_plan();
+        // Select the epic (index 1 in visible)
+        app.plan_tree.selected = 1;
+        assert!(!app.plan_tree.nodes[1].collapsed);
+
+        handle_key_event(&mut app, make_key(KeyCode::Enter));
+        assert!(app.plan_tree.nodes[1].collapsed);
+
+        handle_key_event(&mut app, make_key(KeyCode::Enter));
+        assert!(!app.plan_tree.nodes[1].collapsed);
+    }
+
+    #[test]
+    fn test_plan_space_toggles_collapse() {
+        let mut app = app_with_plan();
+        app.plan_tree.selected = 1;
+
+        handle_key_event(&mut app, make_key(KeyCode::Char(' ')));
+        assert!(app.plan_tree.nodes[1].collapsed);
+    }
+
+    #[test]
+    fn test_plan_h_toggles_verify() {
+        let mut app = app_with_plan();
+        assert!(!app.plan_tree.hide_verify);
+        assert_eq!(app.plan_tree.visible_nodes().len(), 5);
+
+        handle_key_event(&mut app, make_key(KeyCode::Char('h')));
+        assert!(app.plan_tree.hide_verify);
+        assert_eq!(app.plan_tree.visible_nodes().len(), 4);
+    }
+
+    #[test]
+    fn test_plan_keys_only_in_plan_view() {
+        let mut app = app_with_plan();
+        app.switch_view(View::Specs);
+
+        // 'h' in Specs view should not toggle plan verify
+        handle_key_event(&mut app, make_key(KeyCode::Char('h')));
+        assert!(!app.plan_tree.hide_verify);
+    }
+
+    #[test]
+    fn test_plan_keys_blocked_with_overlay() {
+        let mut app = app_with_plan();
+        app.toggle_overlay(Overlay::Help);
+
+        handle_key_event(&mut app, make_key(KeyCode::Char('j')));
+        assert_eq!(app.plan_tree.selected, 0);
     }
 }

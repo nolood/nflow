@@ -70,6 +70,9 @@ async fn run(args: Args) -> error::Result<()> {
     // Try initial connection
     app.connect(&mut client).await.ok();
 
+    // Fetch plan tree data
+    app.fetch_plan(&mut client).await.ok();
+
     // Set up terminal
     let mut tui = terminal::setup()?;
 
