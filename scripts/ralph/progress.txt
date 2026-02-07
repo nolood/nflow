@@ -1,6 +1,8 @@
 ## Codebase Patterns
 - nix crate needs features = ["signal", "process", "fs"] for dup2/setsid/signal handling in daemon
 - Tests sharing filesystem state (PID files) must be serialized in a single test to avoid parallel race conditions
+- Avoid TOCTOU in read_pid_file: use fs::read_to_string directly and catch NotFound, instead of checking exists() then reading
+- Use matches!() macro for simple bool-returning match expressions to satisfy clippy match_like_matches_macro lint
 - NFLOW_DAEMON_MODE env var controls background vs foreground daemon behavior
 - Workspace root Cargo.toml uses `[workspace.package]` for shared version/edition/rust-version
 - Use `workspace = true` in crate Cargo.toml to inherit shared fields
@@ -899,4 +901,27 @@ Started: Sat Feb  7 03:49:10 PM MSK 2026
   - Use `errno == EAGAIN || errno == EWOULDBLOCK` instead of matches! to avoid unreachable_patterns warning
   - open_lock_file() must be called fresh each time in the polling loop (Flock::lock consumes the File)
   - find_daemon_binary: check next to current_exe first for co-located binaries (cargo install scenario)
+---
+
+## 2026-02-07 - US-036
+- What was implemented: Daemon status checking and clean stopping in nflow-cli
+  - DaemonStatus struct with running, pid, uptime fields and Display impl (human-readable formatting with hours/minutes/seconds)
+  - daemon_status() reads PID file, checks process alive via signal 0, reports status + PID + uptime
+  - Cleans up stale PID file when process is dead but PID file still exists
+  - daemon_stop() sends SIGTERM to daemon PID, returns stopped PID
+  - Handles stale PID gracefully (cleans up file, returns clear error message)
+  - is_process_alive() helper using matches! macro pattern with signal 0
+  - pid_file_uptime() estimates uptime from PID file modification time
+  - Fixed TOCTOU race in read_pid_file(): atomic read+catch NotFound instead of exists()+read()
+  - Fixed remove_pid_file(): catch NotFound instead of exists()+remove()
+  - Consolidated PID-file-dependent tests into single sequential test to avoid parallel race conditions
+  - 6 new tests (14 nflow-cli total, 598 workspace total)
+- Files changed:
+  - crates/nflow-cli/src/daemon_client.rs (added DaemonStatus, daemon_status, daemon_stop, is_process_alive, remove_pid_file, pid_file_uptime; fixed read_pid_file TOCTOU; consolidated tests)
+- **Learnings for future iterations:**
+  - Use matches!() macro for simple bool-returning match expressions (clippy match_like_matches_macro)
+  - Avoid TOCTOU in file operations: read directly and catch NotFound, don't check exists() then read
+  - PID file modification time is a reasonable proxy for daemon start time / uptime
+  - Tests sharing PID file must be serialized — consolidate into single sequential test function
+  - DaemonStatus::Display uses hour/minute/second breakdown for human-readable uptime
 ---

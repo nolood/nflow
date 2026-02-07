@@ -3,7 +3,7 @@ use std::fs::{self, File, OpenOptions};
 use std::path::PathBuf;
 use std::process::Command;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use nix::fcntl::{Flock, FlockArg};
 
@@ -45,10 +45,11 @@ fn ensure_nflow_home() -> Result<()> {
 /// Reads the PID from ~/.nflow/daemon.pid. Returns None if file doesn't exist.
 fn read_pid_file() -> Result<Option<u32>> {
     let pid_path = pid_file_path()?;
-    if !pid_path.exists() {
-        return Ok(None);
-    }
-    let content = fs::read_to_string(&pid_path)?;
+    let content = match fs::read_to_string(&pid_path) {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
     let pid = content.trim().parse::<u32>().map_err(|e| {
         CliError::Io(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -240,6 +241,126 @@ pub fn ensure_daemon() -> Result<()> {
     }
 }
 
+/// Status information for the daemon process.
+pub struct DaemonStatus {
+    pub running: bool,
+    pub pid: Option<u32>,
+    pub uptime: Option<Duration>,
+}
+
+impl std::fmt::Display for DaemonStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if !self.running {
+            return write!(f, "nflow daemon is not running");
+        }
+        let pid = self.pid.unwrap_or(0);
+        match self.uptime {
+            Some(uptime) => {
+                let secs = uptime.as_secs();
+                let hours = secs / 3600;
+                let mins = (secs % 3600) / 60;
+                let secs = secs % 60;
+                write!(
+                    f,
+                    "nflow daemon is running (pid: {}, uptime: {}h {}m {}s)",
+                    pid, hours, mins, secs
+                )
+            }
+            None => write!(f, "nflow daemon is running (pid: {})", pid),
+        }
+    }
+}
+
+/// Check daemon status: reads PID file, checks if process is alive,
+/// reports status + PID + uptime.
+///
+/// If the PID file exists but the process is dead, cleans up the stale PID file.
+pub fn daemon_status() -> Result<DaemonStatus> {
+    match read_pid_file()? {
+        None => Ok(DaemonStatus {
+            running: false,
+            pid: None,
+            uptime: None,
+        }),
+        Some(pid) => {
+            let alive = is_process_alive(pid);
+            if !alive {
+                // Clean up stale PID file
+                let _ = remove_pid_file();
+                return Ok(DaemonStatus {
+                    running: false,
+                    pid: None,
+                    uptime: None,
+                });
+            }
+
+            let uptime = pid_file_uptime();
+            Ok(DaemonStatus {
+                running: true,
+                pid: Some(pid),
+                uptime,
+            })
+        }
+    }
+}
+
+/// Stop the daemon by sending SIGTERM to the PID read from the PID file.
+///
+/// Returns the PID of the stopped daemon process, or an error if the
+/// daemon is not running or the signal cannot be sent.
+pub fn daemon_stop() -> Result<u32> {
+    match read_pid_file()? {
+        None => Err(CliError::Socket("daemon is not running".to_string())),
+        Some(pid) => {
+            if !is_process_alive(pid) {
+                // Clean up stale PID file
+                let _ = remove_pid_file();
+                return Err(CliError::Socket(
+                    "daemon is not running (stale PID file cleaned up)".to_string(),
+                ));
+            }
+
+            // Send SIGTERM
+            let nix_pid = nix::unistd::Pid::from_raw(pid as i32);
+            nix::sys::signal::kill(nix_pid, nix::sys::signal::Signal::SIGTERM).map_err(|e| {
+                CliError::Io(std::io::Error::other(format!(
+                    "failed to send SIGTERM to daemon (pid: {}): {}",
+                    pid, e
+                )))
+            })?;
+
+            Ok(pid)
+        }
+    }
+}
+
+/// Check if a process is alive by sending signal 0.
+fn is_process_alive(pid: u32) -> bool {
+    let nix_pid = nix::unistd::Pid::from_raw(pid as i32);
+    matches!(
+        nix::sys::signal::kill(nix_pid, None),
+        Ok(()) | Err(nix::errno::Errno::EPERM)
+    )
+}
+
+/// Remove the PID file.
+fn remove_pid_file() -> Result<()> {
+    let pid_path = pid_file_path()?;
+    match fs::remove_file(&pid_path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Read the PID file's modification time to estimate uptime.
+fn pid_file_uptime() -> Option<Duration> {
+    let pid_path = pid_file_path().ok()?;
+    let metadata = fs::metadata(&pid_path).ok()?;
+    let modified = metadata.modified().ok()?;
+    SystemTime::now().duration_since(modified).ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -336,5 +457,95 @@ mod tests {
         // Smoke test — behavior depends on whether daemon is actually running
         let result = ensure_daemon();
         let _ = result;
+    }
+
+    #[test]
+    fn test_is_process_alive_current() {
+        let pid = std::process::id();
+        assert!(is_process_alive(pid));
+    }
+
+    #[test]
+    fn test_is_process_alive_dead() {
+        // Use a PID that's almost certainly not alive
+        assert!(!is_process_alive(999_999_999));
+    }
+
+    #[test]
+    fn test_daemon_status_running_display() {
+        let status = DaemonStatus {
+            running: true,
+            pid: Some(1234),
+            uptime: Some(Duration::from_secs(3661)),
+        };
+        let display = status.to_string();
+        assert!(display.contains("pid: 1234"));
+        assert!(display.contains("1h 1m 1s"));
+    }
+
+    #[test]
+    fn test_daemon_status_running_no_uptime() {
+        let status = DaemonStatus {
+            running: true,
+            pid: Some(5678),
+            uptime: None,
+        };
+        let display = status.to_string();
+        assert!(display.contains("pid: 5678"));
+        assert!(!display.contains("uptime"));
+    }
+
+    #[test]
+    fn test_remove_pid_file_idempotent() {
+        let _ = remove_pid_file();
+        // Second call should not fail
+        assert!(remove_pid_file().is_ok());
+    }
+
+    /// Tests that share the PID file must run sequentially in a single test
+    /// to avoid race conditions from parallel test execution.
+    #[test]
+    fn test_daemon_status_and_stop_with_pid_file() {
+        ensure_nflow_home().unwrap();
+        let pid_path = pid_file_path().unwrap();
+
+        // 1. No PID file → status reports not running
+        let _ = remove_pid_file();
+        let status = daemon_status().unwrap();
+        assert!(!status.running);
+        assert!(status.pid.is_none());
+        assert!(status.uptime.is_none());
+        assert_eq!(status.to_string(), "nflow daemon is not running");
+
+        // 2. No PID file → stop returns error
+        let result = daemon_stop();
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("not running"));
+
+        // 3. Write a dead PID → status reports not running and cleans up
+        fs::write(&pid_path, "999999999").unwrap();
+        let status = daemon_status().unwrap();
+        assert!(!status.running);
+        assert!(status.pid.is_none());
+        assert!(!pid_path.exists());
+
+        // 4. Write a dead PID again → stop returns error with stale message and cleans up
+        fs::write(&pid_path, "999999999").unwrap();
+        let result = daemon_stop();
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("not running"));
+        assert!(err.contains("stale"));
+        assert!(!pid_path.exists());
+
+        // 5. Uptime estimation: write a PID file, check uptime is small
+        fs::write(&pid_path, "12345").unwrap();
+        let uptime = pid_file_uptime();
+        assert!(uptime.is_some());
+        assert!(uptime.unwrap() < Duration::from_secs(5));
+
+        // Cleanup
+        let _ = remove_pid_file();
     }
 }
