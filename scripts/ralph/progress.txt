@@ -3,6 +3,9 @@
 - Protocol types duplicated in CLI (not shared with daemon crate) — keeps CLI independent of daemon internals
 - Tests using Unix sockets must use unique socket paths per test, NOT env var overrides (parallel test execution races on shared env vars)
 - command_timeout() maps command prefix to timeout: spec./plan. → 300s, others → 60s
+- Streaming spec dialogue flow: stream events until done:true (has spec_id), then prompt user for answer, send spec.answer to start new stream
+- CLI command dispatch: streaming commands (spec.new, spec.resume, log -f) handled in run(), non-streaming delegated to build_command()
+- Ctrl+C handling: AtomicBool shared via Arc, tokio::signal::ctrl_c() sets flag, checked in streaming loops and user input
 - CLI uses clap::Parser with nested Subcommand enums: Cli → Commands → DaemonCommand/SpecCommand/PlanCommand/etc. Global flags use `#[arg(global = true)]`
 - Filesystem security: ~/.nflow/ created with 0700, enforce_dir_permissions() checks & fixes too-open dirs, socket 0600, DB inherits from dir
 - Config files: global at ~/.nflow/config.toml, per-project at ~/.nflow/projects/{name}/config.toml — both use TOML format with PartialConfig struct
@@ -1799,4 +1802,22 @@ Started: Sat Feb  7 03:49:10 PM MSK 2026
   - Protocol types should be duplicated in CLI crate (not shared) to avoid coupling CLI to daemon internals
   - tokio split stream: need both read_half and write_half for full-duplex socket communication
   - Debug derive doesn't work on BufReader<ReadHalf<UnixStream>> — use manual Debug impl with finish_non_exhaustive()
+---
+
+## 2026-02-08 - US-071
+- What was implemented: CLI streaming client with full command dispatch
+  - `streaming.rs` module: handle_log_follow() for `nflow log -f`, handle_spec_dialogue() for interactive spec sessions
+  - Full command dispatch in main.rs: tokio::main async runtime, Ctrl+C handler, build_command() for all CLI→daemon command mapping
+  - Streaming spec dialogue: reads events until done:true, extracts spec_id, prompts user on question events, sends spec.answer for next round
+  - Log follow: streams events from exec.log with follow=true, prints each line, handles Ctrl+C gracefully
+  - Non-streaming response handling: handle_response() with JSON mode support, error extraction from daemon responses
+  - Project auto-detection from current directory name when --project flag not set
+- Files changed:
+  - crates/nflow-cli/src/streaming.rs (new — streaming log follow and spec dialogue handlers)
+  - crates/nflow-cli/src/main.rs (rewritten — full async command dispatch, response handling, 13 unit tests)
+- **Learnings for future iterations:**
+  - Spec dialogue question flow: daemon streams all events, question event is mid-stream, done:true has spec_id — prompt user *after* stream ends
+  - Use tokio::select! with AtomicBool polling for cancellation during stdin reads (no direct way to interrupt blocking stdin in async)
+  - build_command() unreachable arms for streaming commands that are handled before the match — ensures compiler catches unhandled commands
+  - Pre-existing test_acquire_lock_contention is flaky in parallel execution (race on daemon.lock file) — run with --test-threads=1 to pass reliably
 ---
