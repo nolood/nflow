@@ -2,7 +2,15 @@ use clap::{Parser, Subcommand};
 
 /// nflow — CLI/TUI orchestrator for Claude Code agents
 #[derive(Debug, Parser)]
-#[command(name = "nflow", version, about, long_about = None)]
+#[command(name = "nflow", version, about, long_about = None, after_long_help = "\
+Exit codes:\n  \
+  0  success\n  \
+  1  general error\n  \
+  2  daemon not running\n  \
+  3  entity not found\n  \
+  4  invalid arguments\n  \
+  5  invalid state transition\
+")]
 pub struct Cli {
     /// Override project (default: detected from current directory)
     #[arg(long, global = true)]

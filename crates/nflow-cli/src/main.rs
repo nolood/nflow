@@ -25,7 +25,7 @@ async fn main() -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("{}", format::format_error(&e.to_string()));
-            ExitCode::FAILURE
+            e.exit_code()
         }
     }
 }
