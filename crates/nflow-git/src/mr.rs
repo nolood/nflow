@@ -112,6 +112,102 @@ pub async fn create_github_pr(
     }
 }
 
+/// Checks whether `glab` is authenticated by running `glab auth status`.
+///
+/// Returns Ok(()) if authenticated, or AuthError with details if not.
+async fn check_glab_auth(worktree_path: &Path) -> Result<()> {
+    let output = tokio::process::Command::new("glab")
+        .args(["auth", "status"])
+        .current_dir(worktree_path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .await
+        .map_err(|e| GitError::CommandFailed(format!("Failed to run glab auth status: {}", e)))?;
+
+    if output.status.success() {
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        Err(GitError::AuthError(format!(
+            "glab is not authenticated: {}",
+            stderr.trim()
+        )))
+    }
+}
+
+/// Creates a GitLab merge request via `glab mr create`.
+///
+/// Runs `glab mr create --title {title} --description {body} --target-branch {base_branch}`
+/// in the given worktree directory. Returns the MR URL on success.
+///
+/// # Errors
+///
+/// - `CliNotFound` if `glab` is not in PATH
+/// - `AuthError` if `glab` is not authenticated
+/// - `CommandFailed` if `glab mr create` fails for other reasons
+pub async fn create_gitlab_mr(
+    worktree_path: &Path,
+    title: &str,
+    body: &str,
+    base_branch: &str,
+) -> Result<String> {
+    validate_git_repo(worktree_path).await?;
+    check_cli_available("glab").await?;
+    check_glab_auth(worktree_path).await?;
+
+    let output = tokio::process::Command::new("glab")
+        .args([
+            "mr",
+            "create",
+            "--title",
+            title,
+            "--description",
+            body,
+            "--target-branch",
+            base_branch,
+        ])
+        .current_dir(worktree_path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .await
+        .map_err(|e| GitError::CommandFailed(format!("Failed to run glab mr create: {}", e)))?;
+
+    if output.status.success() {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        // glab may output additional text; find the URL line
+        let mr_url = stdout
+            .lines()
+            .find(|line| line.starts_with("http://") || line.starts_with("https://"))
+            .unwrap_or_else(|| stdout.trim())
+            .trim()
+            .to_string();
+        if mr_url.is_empty() {
+            return Err(GitError::CommandFailed(
+                "glab mr create succeeded but returned no URL".to_string(),
+            ));
+        }
+        Ok(mr_url)
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let msg = stderr.trim().to_string();
+        let lower = msg.to_lowercase();
+
+        if lower.contains("authentication")
+            || lower.contains("not logged in")
+            || lower.contains("auth login")
+        {
+            Err(GitError::AuthError(msg))
+        } else {
+            Err(GitError::CommandFailed(format!(
+                "glab mr create failed: {}",
+                msg
+            )))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -216,5 +312,76 @@ mod tests {
         // Verify the CliNotFound variant can be constructed and matched
         let err = GitError::CliNotFound("test".to_string());
         assert!(matches!(err, GitError::CliNotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn test_check_cli_available_glab() {
+        // glab may or may not be installed — test that the function doesn't panic
+        let result = check_cli_available("glab").await;
+        match result {
+            Ok(()) => {}
+            Err(GitError::CliNotFound(msg)) => {
+                assert!(msg.contains("glab"), "Error should mention glab: {}", msg);
+            }
+            Err(e) => panic!("Unexpected error: {:?}", e),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_create_gitlab_mr_not_a_repo() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let fake = dir.path().join("not-a-repo");
+        std::fs::create_dir_all(&fake).unwrap();
+
+        let result = create_gitlab_mr(&fake, "title", "body", "main").await;
+        assert!(result.is_err());
+        assert!(
+            matches!(result.unwrap_err(), GitError::NotAGitRepository(_)),
+            "Expected NotAGitRepository for non-repo path"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_create_gitlab_mr_glab_not_installed() {
+        // Skip if glab is actually installed
+        if check_cli_available("glab").await.is_ok() {
+            return;
+        }
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+
+        tokio::process::Command::new("git")
+            .args(["init", "--initial-branch=main"])
+            .current_dir(&repo)
+            .output()
+            .await
+            .unwrap();
+
+        let result = create_gitlab_mr(&repo, "title", "body", "main").await;
+        assert!(result.is_err());
+        assert!(
+            matches!(result.unwrap_err(), GitError::CliNotFound(_)),
+            "Expected CliNotFound when glab is not installed"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_check_glab_auth_not_a_repo() {
+        // check_glab_auth doesn't validate repo, but it runs in a directory.
+        let dir = tempfile::TempDir::new().unwrap();
+        let _ = check_glab_auth(dir.path()).await;
+        // We don't assert the result since it depends on glab installation and auth state
+    }
+
+    #[test]
+    fn test_cli_not_found_error_message_glab() {
+        let err = GitError::CliNotFound(
+            "'glab' not found in PATH. Install it to create PRs/MRs.".to_string(),
+        );
+        let msg = format!("{}", err);
+        assert!(msg.contains("glab"));
+        assert!(msg.contains("not found"));
     }
 }
