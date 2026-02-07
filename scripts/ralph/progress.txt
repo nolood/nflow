@@ -15,6 +15,10 @@
 - propagate_epic_status() takes a slice of statuses, not full WorkItems — keeps it simple
 - Use `contains()` instead of `iter().any(|s| *s == ...)` for clippy compliance (manual_contains lint)
 - Dependency is story-level only — validated by convention, not struct constraints
+- Task state machine: pending→in_progress→done|failed|cancelled; failed→in_progress(retry), failed→done(skip); pending→cancelled
+- auto_generate_verify_tasks() works on a slice of WorkItems, filtering for impl tasks only
+- skip_task() takes &mut impl_task + &mut [WorkItem] slice for paired verify manipulation
+- find_paired_verify/find_paired_impl use parent_id + sort_order±1 matching
 
 # Ralph Progress Log
 Started: Sat Feb  7 03:49:10 PM MSK 2026
@@ -95,4 +99,24 @@ Started: Sat Feb  7 03:49:10 PM MSK 2026
   - propagate_epic_status() rules: all_pending→Pending, all_cancelled→Cancelled, any_in_progress/ready→InProgress, any_failed(no in_progress)→Failed, all_done/cancelled→Done
   - clippy warns about `iter().any(|s| *s == val)` — use `contains(&val)` instead (manual_contains lint)
   - cargo fmt collapses short assert_eq! calls to single lines — don't fight it
+---
+
+## 2026-02-07 - US-005
+- What was implemented: Task model with impl/verify pairing in nflow-core
+  - Task constructor: new_task() creates impl tasks under a story
+  - Task state machine: task_start(), task_complete(commit_hash), task_fail(), task_cancel(), task_skip()
+  - assert_task() guard prevents task methods on non-task items
+  - auto_generate_verify_tasks() generates verify tasks from impl tasks (kind=Verify, short_id="{id}v", sort_order=impl+1)
+  - skip_task() skips impl task and cancels/skips paired verify task
+  - find_paired_verify() / find_paired_impl() match by parent_id and adjacent sort_order
+  - get_next_pending_task() returns lowest sort_order pending task for a story
+  - commit_hash stored on task_complete()
+  - 35 new tests (101 total) covering all acceptance criteria
+- Files changed:
+  - crates/nflow-core/src/work_item.rs (task constructor, state machine, helper functions, tests)
+- **Learnings for future iterations:**
+  - Task state machine is simpler than story (no Ready state, pending goes directly to in_progress)
+  - skip_task needs to handle both pending verify (cancel) and failed verify (skip) cases
+  - auto_generate_verify_tasks works on slices and filters for impl tasks — safe to pass mixed item types
+  - find_paired_verify/impl use sort_order adjacency (±1), not ID matching
 ---

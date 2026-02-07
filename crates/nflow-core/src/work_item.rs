@@ -264,6 +264,238 @@ impl WorkItem {
         }
         Ok(())
     }
+
+    fn assert_task(&self) -> Result<()> {
+        if self.item_type != ItemType::Task {
+            return Err(NflowError::InvalidState(format!(
+                "expected task, got {}",
+                self.item_type
+            )));
+        }
+        Ok(())
+    }
+
+    // --- Task constructors ---
+
+    /// Create a new impl task under a story.
+    pub fn new_task(
+        parent_id: Uuid,
+        decomposition_session_id: Uuid,
+        title: String,
+        description: String,
+        acceptance_criteria: String,
+        short_id: String,
+        sort_order: i32,
+    ) -> Self {
+        let now = Utc::now();
+        Self {
+            id: Uuid::new_v4(),
+            parent_id: Some(parent_id),
+            decomposition_session_id,
+            item_type: ItemType::Task,
+            kind: Some(TaskKind::Impl),
+            title,
+            description,
+            acceptance_criteria,
+            status: WorkItemStatus::Pending,
+            short_id,
+            sort_order,
+            branch_name: None,
+            worktree_path: None,
+            mr_url: None,
+            commit_hash: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    // --- Task state machine ---
+
+    /// Start a task.
+    /// Valid: Pending -> InProgress, Failed -> InProgress (retry).
+    pub fn task_start(&mut self) -> Result<()> {
+        self.assert_task()?;
+        match self.status {
+            WorkItemStatus::Pending | WorkItemStatus::Failed => {
+                self.status = WorkItemStatus::InProgress;
+                self.updated_at = Utc::now();
+                Ok(())
+            }
+            _ => Err(NflowError::InvalidTransition {
+                from: self.status.to_string(),
+                to: "in_progress".into(),
+            }),
+        }
+    }
+
+    /// Mark a task as done with optional commit hash (for impl tasks).
+    /// Valid: InProgress -> Done.
+    pub fn task_complete(&mut self, commit_hash: Option<String>) -> Result<()> {
+        self.assert_task()?;
+        if self.status != WorkItemStatus::InProgress {
+            return Err(NflowError::InvalidTransition {
+                from: self.status.to_string(),
+                to: "done".into(),
+            });
+        }
+        self.status = WorkItemStatus::Done;
+        if commit_hash.is_some() {
+            self.commit_hash = commit_hash;
+        }
+        self.updated_at = Utc::now();
+        Ok(())
+    }
+
+    /// Mark a task as failed.
+    /// Valid: InProgress -> Failed.
+    pub fn task_fail(&mut self) -> Result<()> {
+        self.assert_task()?;
+        if self.status != WorkItemStatus::InProgress {
+            return Err(NflowError::InvalidTransition {
+                from: self.status.to_string(),
+                to: "failed".into(),
+            });
+        }
+        self.status = WorkItemStatus::Failed;
+        self.updated_at = Utc::now();
+        Ok(())
+    }
+
+    /// Cancel a task.
+    /// Valid: Pending -> Cancelled.
+    pub fn task_cancel(&mut self) -> Result<()> {
+        self.assert_task()?;
+        if self.status != WorkItemStatus::Pending {
+            return Err(NflowError::InvalidTransition {
+                from: self.status.to_string(),
+                to: "cancelled".into(),
+            });
+        }
+        self.status = WorkItemStatus::Cancelled;
+        self.updated_at = Utc::now();
+        Ok(())
+    }
+
+    /// Skip a failed task (mark as done with skip metadata).
+    /// Valid: Failed -> Done.
+    pub fn task_skip(&mut self) -> Result<()> {
+        self.assert_task()?;
+        if self.status != WorkItemStatus::Failed {
+            return Err(NflowError::InvalidTransition {
+                from: self.status.to_string(),
+                to: "done".into(),
+            });
+        }
+        self.status = WorkItemStatus::Done;
+        self.updated_at = Utc::now();
+        Ok(())
+    }
+}
+
+/// Generate verify tasks for a list of impl tasks.
+/// For each impl task, inserts a verify task immediately after it (sort_order = impl.sort_order + 1).
+/// Verify task short_id = "{impl_short_id}v".
+/// Returns the list of newly created verify tasks.
+pub fn auto_generate_verify_tasks(impl_tasks: &[WorkItem]) -> Vec<WorkItem> {
+    impl_tasks
+        .iter()
+        .filter(|t| t.item_type == ItemType::Task && t.kind == Some(TaskKind::Impl))
+        .map(|impl_task| {
+            let now = Utc::now();
+            WorkItem {
+                id: Uuid::new_v4(),
+                parent_id: impl_task.parent_id,
+                decomposition_session_id: impl_task.decomposition_session_id,
+                item_type: ItemType::Task,
+                kind: Some(TaskKind::Verify),
+                title: format!("Verify: {}", impl_task.title),
+                description: format!(
+                    "Verify that '{}' was implemented correctly.",
+                    impl_task.title
+                ),
+                acceptance_criteria: String::new(),
+                status: WorkItemStatus::Pending,
+                short_id: format!("{}v", impl_task.short_id),
+                sort_order: impl_task.sort_order + 1,
+                branch_name: None,
+                worktree_path: None,
+                mr_url: None,
+                commit_hash: None,
+                created_at: now,
+                updated_at: now,
+            }
+        })
+        .collect()
+}
+
+/// Skip an impl task and its paired verify task.
+/// Marks both as done (skipped). Returns error if the impl task can't be skipped.
+pub fn skip_task(impl_task: &mut WorkItem, tasks: &mut [WorkItem]) -> Result<()> {
+    impl_task.task_skip()?;
+    // Find and skip the paired verify task
+    if let Some(verify) = find_paired_verify_mut(impl_task, tasks) {
+        // Verify task may be pending — cancel it, or if failed, skip it
+        match verify.status {
+            WorkItemStatus::Pending => {
+                verify.task_cancel()?;
+            }
+            WorkItemStatus::Failed => {
+                verify.task_skip()?;
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// Find the paired verify task for an impl task.
+/// Matches by parent_id and sort_order = impl.sort_order + 1 with kind=Verify.
+pub fn find_paired_verify<'a>(impl_task: &WorkItem, tasks: &'a [WorkItem]) -> Option<&'a WorkItem> {
+    tasks.iter().find(|t| {
+        t.item_type == ItemType::Task
+            && t.kind == Some(TaskKind::Verify)
+            && t.parent_id == impl_task.parent_id
+            && t.sort_order == impl_task.sort_order + 1
+    })
+}
+
+/// Find the paired verify task (mutable) for an impl task.
+fn find_paired_verify_mut<'a>(
+    impl_task: &WorkItem,
+    tasks: &'a mut [WorkItem],
+) -> Option<&'a mut WorkItem> {
+    let parent_id = impl_task.parent_id;
+    let expected_sort_order = impl_task.sort_order + 1;
+    tasks.iter_mut().find(|t| {
+        t.item_type == ItemType::Task
+            && t.kind == Some(TaskKind::Verify)
+            && t.parent_id == parent_id
+            && t.sort_order == expected_sort_order
+    })
+}
+
+/// Find the paired impl task for a verify task.
+/// Matches by parent_id and sort_order = verify.sort_order - 1 with kind=Impl.
+pub fn find_paired_impl<'a>(verify_task: &WorkItem, tasks: &'a [WorkItem]) -> Option<&'a WorkItem> {
+    tasks.iter().find(|t| {
+        t.item_type == ItemType::Task
+            && t.kind == Some(TaskKind::Impl)
+            && t.parent_id == verify_task.parent_id
+            && t.sort_order == verify_task.sort_order - 1
+    })
+}
+
+/// Get the next pending task by sort_order within a story.
+/// Returns the task with the lowest sort_order that is still pending.
+pub fn get_next_pending_task(story_id: Uuid, tasks: &[WorkItem]) -> Option<&WorkItem> {
+    tasks
+        .iter()
+        .filter(|t| {
+            t.item_type == ItemType::Task
+                && t.parent_id == Some(story_id)
+                && t.status == WorkItemStatus::Pending
+        })
+        .min_by_key(|t| t.sort_order)
 }
 
 /// Compute the materialized epic status from child story statuses.
@@ -708,5 +940,465 @@ mod tests {
         let t2 = story.updated_at;
         story.story_complete().unwrap();
         assert!(story.updated_at >= t2);
+    }
+
+    // =========================================================
+    // US-005: Task (impl and verify) tests
+    // =========================================================
+
+    fn make_impl_task(
+        story_id: Uuid,
+        session_id: Uuid,
+        short_id: &str,
+        sort_order: i32,
+    ) -> WorkItem {
+        WorkItem::new_task(
+            story_id,
+            session_id,
+            format!("Task {short_id}"),
+            "Desc".into(),
+            "AC".into(),
+            short_id.into(),
+            sort_order,
+        )
+    }
+
+    // --- Task constructor ---
+
+    #[test]
+    fn new_task_has_correct_fields() {
+        let session_id = Uuid::new_v4();
+        let story_id = Uuid::new_v4();
+        let task = make_impl_task(story_id, session_id, "T1", 0);
+
+        assert_eq!(task.item_type, ItemType::Task);
+        assert_eq!(task.kind, Some(TaskKind::Impl));
+        assert_eq!(task.parent_id, Some(story_id));
+        assert_eq!(task.decomposition_session_id, session_id);
+        assert_eq!(task.status, WorkItemStatus::Pending);
+        assert_eq!(task.short_id, "T1");
+        assert_eq!(task.sort_order, 0);
+        assert!(task.commit_hash.is_none());
+    }
+
+    // --- Task state machine: happy paths ---
+
+    #[test]
+    fn task_pending_to_in_progress() {
+        let session_id = Uuid::new_v4();
+        let story_id = Uuid::new_v4();
+        let mut task = make_impl_task(story_id, session_id, "T1", 0);
+
+        assert!(task.task_start().is_ok());
+        assert_eq!(task.status, WorkItemStatus::InProgress);
+    }
+
+    #[test]
+    fn task_in_progress_to_done() {
+        let session_id = Uuid::new_v4();
+        let story_id = Uuid::new_v4();
+        let mut task = make_impl_task(story_id, session_id, "T1", 0);
+
+        task.task_start().unwrap();
+        assert!(task.task_complete(None).is_ok());
+        assert_eq!(task.status, WorkItemStatus::Done);
+    }
+
+    #[test]
+    fn task_in_progress_to_done_with_commit_hash() {
+        let session_id = Uuid::new_v4();
+        let story_id = Uuid::new_v4();
+        let mut task = make_impl_task(story_id, session_id, "T1", 0);
+
+        task.task_start().unwrap();
+        assert!(task.task_complete(Some("abc123".into())).is_ok());
+        assert_eq!(task.status, WorkItemStatus::Done);
+        assert_eq!(task.commit_hash, Some("abc123".into()));
+    }
+
+    #[test]
+    fn task_in_progress_to_failed() {
+        let session_id = Uuid::new_v4();
+        let story_id = Uuid::new_v4();
+        let mut task = make_impl_task(story_id, session_id, "T1", 0);
+
+        task.task_start().unwrap();
+        assert!(task.task_fail().is_ok());
+        assert_eq!(task.status, WorkItemStatus::Failed);
+    }
+
+    #[test]
+    fn task_failed_to_in_progress_retry() {
+        let session_id = Uuid::new_v4();
+        let story_id = Uuid::new_v4();
+        let mut task = make_impl_task(story_id, session_id, "T1", 0);
+
+        task.task_start().unwrap();
+        task.task_fail().unwrap();
+        assert!(task.task_start().is_ok());
+        assert_eq!(task.status, WorkItemStatus::InProgress);
+    }
+
+    #[test]
+    fn task_pending_to_cancelled() {
+        let session_id = Uuid::new_v4();
+        let story_id = Uuid::new_v4();
+        let mut task = make_impl_task(story_id, session_id, "T1", 0);
+
+        assert!(task.task_cancel().is_ok());
+        assert_eq!(task.status, WorkItemStatus::Cancelled);
+    }
+
+    #[test]
+    fn task_failed_to_done_skip() {
+        let session_id = Uuid::new_v4();
+        let story_id = Uuid::new_v4();
+        let mut task = make_impl_task(story_id, session_id, "T1", 0);
+
+        task.task_start().unwrap();
+        task.task_fail().unwrap();
+        assert!(task.task_skip().is_ok());
+        assert_eq!(task.status, WorkItemStatus::Done);
+    }
+
+    // --- Task state machine: invalid transitions ---
+
+    #[test]
+    fn task_start_from_done_fails() {
+        let session_id = Uuid::new_v4();
+        let story_id = Uuid::new_v4();
+        let mut task = make_impl_task(story_id, session_id, "T1", 0);
+
+        task.task_start().unwrap();
+        task.task_complete(None).unwrap();
+        let err = task.task_start().unwrap_err();
+        assert!(matches!(err, NflowError::InvalidTransition { .. }));
+    }
+
+    #[test]
+    fn task_start_from_cancelled_fails() {
+        let session_id = Uuid::new_v4();
+        let story_id = Uuid::new_v4();
+        let mut task = make_impl_task(story_id, session_id, "T1", 0);
+
+        task.task_cancel().unwrap();
+        let err = task.task_start().unwrap_err();
+        assert!(matches!(err, NflowError::InvalidTransition { .. }));
+    }
+
+    #[test]
+    fn task_complete_from_pending_fails() {
+        let session_id = Uuid::new_v4();
+        let story_id = Uuid::new_v4();
+        let mut task = make_impl_task(story_id, session_id, "T1", 0);
+
+        let err = task.task_complete(None).unwrap_err();
+        assert!(matches!(err, NflowError::InvalidTransition { .. }));
+    }
+
+    #[test]
+    fn task_fail_from_pending_fails() {
+        let session_id = Uuid::new_v4();
+        let story_id = Uuid::new_v4();
+        let mut task = make_impl_task(story_id, session_id, "T1", 0);
+
+        let err = task.task_fail().unwrap_err();
+        assert!(matches!(err, NflowError::InvalidTransition { .. }));
+    }
+
+    #[test]
+    fn task_cancel_from_in_progress_fails() {
+        let session_id = Uuid::new_v4();
+        let story_id = Uuid::new_v4();
+        let mut task = make_impl_task(story_id, session_id, "T1", 0);
+
+        task.task_start().unwrap();
+        let err = task.task_cancel().unwrap_err();
+        assert!(matches!(err, NflowError::InvalidTransition { .. }));
+    }
+
+    #[test]
+    fn task_skip_from_pending_fails() {
+        let session_id = Uuid::new_v4();
+        let story_id = Uuid::new_v4();
+        let mut task = make_impl_task(story_id, session_id, "T1", 0);
+
+        let err = task.task_skip().unwrap_err();
+        assert!(matches!(err, NflowError::InvalidTransition { .. }));
+    }
+
+    #[test]
+    fn task_skip_from_in_progress_fails() {
+        let session_id = Uuid::new_v4();
+        let story_id = Uuid::new_v4();
+        let mut task = make_impl_task(story_id, session_id, "T1", 0);
+
+        task.task_start().unwrap();
+        let err = task.task_skip().unwrap_err();
+        assert!(matches!(err, NflowError::InvalidTransition { .. }));
+    }
+
+    // --- Task methods on non-task types fail ---
+
+    #[test]
+    fn task_methods_on_story_fail() {
+        let session_id = Uuid::new_v4();
+        let epic = make_epic(session_id);
+        let mut story = make_story(epic.id, session_id);
+
+        assert!(matches!(
+            story.task_start().unwrap_err(),
+            NflowError::InvalidState(_)
+        ));
+        assert!(matches!(
+            story.task_complete(None).unwrap_err(),
+            NflowError::InvalidState(_)
+        ));
+        assert!(matches!(
+            story.task_fail().unwrap_err(),
+            NflowError::InvalidState(_)
+        ));
+        assert!(matches!(
+            story.task_cancel().unwrap_err(),
+            NflowError::InvalidState(_)
+        ));
+        assert!(matches!(
+            story.task_skip().unwrap_err(),
+            NflowError::InvalidState(_)
+        ));
+    }
+
+    #[test]
+    fn task_methods_on_epic_fail() {
+        let session_id = Uuid::new_v4();
+        let mut epic = make_epic(session_id);
+
+        assert!(matches!(
+            epic.task_start().unwrap_err(),
+            NflowError::InvalidState(_)
+        ));
+        assert!(matches!(
+            epic.task_complete(None).unwrap_err(),
+            NflowError::InvalidState(_)
+        ));
+        assert!(matches!(
+            epic.task_fail().unwrap_err(),
+            NflowError::InvalidState(_)
+        ));
+        assert!(matches!(
+            epic.task_cancel().unwrap_err(),
+            NflowError::InvalidState(_)
+        ));
+        assert!(matches!(
+            epic.task_skip().unwrap_err(),
+            NflowError::InvalidState(_)
+        ));
+    }
+
+    // --- auto_generate_verify_tasks ---
+
+    #[test]
+    fn auto_generate_verify_tasks_creates_verify_for_each_impl() {
+        let session_id = Uuid::new_v4();
+        let story_id = Uuid::new_v4();
+        let t1 = make_impl_task(story_id, session_id, "T1", 0);
+        let t2 = make_impl_task(story_id, session_id, "T2", 2);
+
+        let verify_tasks = auto_generate_verify_tasks(&[t1.clone(), t2.clone()]);
+
+        assert_eq!(verify_tasks.len(), 2);
+
+        assert_eq!(verify_tasks[0].kind, Some(TaskKind::Verify));
+        assert_eq!(verify_tasks[0].short_id, "T1v");
+        assert_eq!(verify_tasks[0].sort_order, 1);
+        assert_eq!(verify_tasks[0].parent_id, Some(story_id));
+
+        assert_eq!(verify_tasks[1].kind, Some(TaskKind::Verify));
+        assert_eq!(verify_tasks[1].short_id, "T2v");
+        assert_eq!(verify_tasks[1].sort_order, 3);
+        assert_eq!(verify_tasks[1].parent_id, Some(story_id));
+    }
+
+    #[test]
+    fn auto_generate_verify_tasks_skips_non_impl() {
+        let session_id = Uuid::new_v4();
+        let story_id = Uuid::new_v4();
+
+        // Create a story (not a task) — should be ignored
+        let story = make_story(story_id, session_id);
+        let verify_tasks = auto_generate_verify_tasks(&[story]);
+
+        assert!(verify_tasks.is_empty());
+    }
+
+    #[test]
+    fn auto_generate_verify_tasks_empty_input() {
+        let verify_tasks = auto_generate_verify_tasks(&[]);
+        assert!(verify_tasks.is_empty());
+    }
+
+    // --- find_paired_verify ---
+
+    #[test]
+    fn find_paired_verify_finds_correct_task() {
+        let session_id = Uuid::new_v4();
+        let story_id = Uuid::new_v4();
+        let impl_task = make_impl_task(story_id, session_id, "T1", 0);
+        let verify_tasks = auto_generate_verify_tasks(&[impl_task.clone()]);
+
+        let found = find_paired_verify(&impl_task, &verify_tasks);
+        assert!(found.is_some());
+        assert_eq!(found.unwrap().short_id, "T1v");
+    }
+
+    #[test]
+    fn find_paired_verify_returns_none_when_missing() {
+        let session_id = Uuid::new_v4();
+        let story_id = Uuid::new_v4();
+        let impl_task = make_impl_task(story_id, session_id, "T1", 0);
+
+        let found = find_paired_verify(&impl_task, &[]);
+        assert!(found.is_none());
+    }
+
+    // --- find_paired_impl ---
+
+    #[test]
+    fn find_paired_impl_finds_correct_task() {
+        let session_id = Uuid::new_v4();
+        let story_id = Uuid::new_v4();
+        let impl_task = make_impl_task(story_id, session_id, "T1", 0);
+        let verify_tasks = auto_generate_verify_tasks(&[impl_task.clone()]);
+
+        let all_tasks = vec![impl_task.clone()];
+        let found = find_paired_impl(&verify_tasks[0], &all_tasks);
+        assert!(found.is_some());
+        assert_eq!(found.unwrap().short_id, "T1");
+    }
+
+    #[test]
+    fn find_paired_impl_returns_none_when_missing() {
+        let session_id = Uuid::new_v4();
+        let story_id = Uuid::new_v4();
+        let impl_task = make_impl_task(story_id, session_id, "T1", 0);
+        let verify_tasks = auto_generate_verify_tasks(&[impl_task]);
+
+        let found = find_paired_impl(&verify_tasks[0], &[]);
+        assert!(found.is_none());
+    }
+
+    // --- get_next_pending_task ---
+
+    #[test]
+    fn get_next_pending_task_returns_lowest_sort_order() {
+        let session_id = Uuid::new_v4();
+        let story_id = Uuid::new_v4();
+        let t1 = make_impl_task(story_id, session_id, "T1", 0);
+        let t2 = make_impl_task(story_id, session_id, "T2", 2);
+        let t3 = make_impl_task(story_id, session_id, "T3", 4);
+
+        let tasks = vec![t1, t2, t3];
+        let next = get_next_pending_task(story_id, &tasks);
+        assert!(next.is_some());
+        assert_eq!(next.unwrap().short_id, "T1");
+    }
+
+    #[test]
+    fn get_next_pending_task_skips_non_pending() {
+        let session_id = Uuid::new_v4();
+        let story_id = Uuid::new_v4();
+        let mut t1 = make_impl_task(story_id, session_id, "T1", 0);
+        let t2 = make_impl_task(story_id, session_id, "T2", 2);
+
+        t1.task_start().unwrap();
+        t1.task_complete(None).unwrap();
+
+        let tasks = vec![t1, t2];
+        let next = get_next_pending_task(story_id, &tasks);
+        assert!(next.is_some());
+        assert_eq!(next.unwrap().short_id, "T2");
+    }
+
+    #[test]
+    fn get_next_pending_task_returns_none_when_all_done() {
+        let session_id = Uuid::new_v4();
+        let story_id = Uuid::new_v4();
+        let mut t1 = make_impl_task(story_id, session_id, "T1", 0);
+
+        t1.task_start().unwrap();
+        t1.task_complete(None).unwrap();
+
+        let tasks = vec![t1];
+        let next = get_next_pending_task(story_id, &tasks);
+        assert!(next.is_none());
+    }
+
+    #[test]
+    fn get_next_pending_task_filters_by_story() {
+        let session_id = Uuid::new_v4();
+        let story1 = Uuid::new_v4();
+        let story2 = Uuid::new_v4();
+        let t1 = make_impl_task(story1, session_id, "T1", 0);
+        let t2 = make_impl_task(story2, session_id, "T2", 0);
+
+        let tasks = vec![t1, t2];
+        let next = get_next_pending_task(story1, &tasks);
+        assert!(next.is_some());
+        assert_eq!(next.unwrap().short_id, "T1");
+    }
+
+    // --- skip_task with paired verify ---
+
+    #[test]
+    fn skip_task_skips_impl_and_cancels_pending_verify() {
+        let session_id = Uuid::new_v4();
+        let story_id = Uuid::new_v4();
+        let mut impl_task = make_impl_task(story_id, session_id, "T1", 0);
+        let mut verify_tasks = auto_generate_verify_tasks(&[impl_task.clone()]);
+
+        // Impl must be failed first to skip
+        impl_task.task_start().unwrap();
+        impl_task.task_fail().unwrap();
+
+        skip_task(&mut impl_task, &mut verify_tasks).unwrap();
+
+        assert_eq!(impl_task.status, WorkItemStatus::Done);
+        assert_eq!(verify_tasks[0].status, WorkItemStatus::Cancelled);
+    }
+
+    #[test]
+    fn skip_task_skips_impl_and_skips_failed_verify() {
+        let session_id = Uuid::new_v4();
+        let story_id = Uuid::new_v4();
+        let mut impl_task = make_impl_task(story_id, session_id, "T1", 0);
+        let mut verify_tasks = auto_generate_verify_tasks(&[impl_task.clone()]);
+
+        // Fail both tasks
+        impl_task.task_start().unwrap();
+        impl_task.task_fail().unwrap();
+        verify_tasks[0].task_start().unwrap();
+        verify_tasks[0].task_fail().unwrap();
+
+        skip_task(&mut impl_task, &mut verify_tasks).unwrap();
+
+        assert_eq!(impl_task.status, WorkItemStatus::Done);
+        assert_eq!(verify_tasks[0].status, WorkItemStatus::Done);
+    }
+
+    // --- Task timestamp updates ---
+
+    #[test]
+    fn task_transitions_update_timestamp() {
+        let session_id = Uuid::new_v4();
+        let story_id = Uuid::new_v4();
+        let mut task = make_impl_task(story_id, session_id, "T1", 0);
+
+        let t0 = task.updated_at;
+        task.task_start().unwrap();
+        assert!(task.updated_at >= t0);
+
+        let t1 = task.updated_at;
+        task.task_complete(Some("hash".into())).unwrap();
+        assert!(task.updated_at >= t1);
     }
 }
