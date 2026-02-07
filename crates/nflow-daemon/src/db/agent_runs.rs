@@ -190,6 +190,23 @@ pub fn count_agent_runs_for_task(conn: &Connection, work_item_id: &Uuid) -> Resu
     Ok(count)
 }
 
+/// Find the most recent agent run for a given task (by started_at descending).
+pub fn find_latest_agent_run_for_task(
+    conn: &Connection,
+    work_item_id: &Uuid,
+) -> Result<Option<AgentRun>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, work_item_id, pid, session_id, pid_start_time, status, exit_code, log_path, error_message, started_at, finished_at
+         FROM agent_runs WHERE work_item_id = ?1 ORDER BY started_at DESC LIMIT 1",
+    )?;
+    let mut rows = stmt.query_map(params![work_item_id.to_string()], row_to_agent_run)?;
+    match rows.next() {
+        Some(Ok(run)) => Ok(Some(run)),
+        Some(Err(e)) => Err(e.into()),
+        None => Ok(None),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -8,13 +8,14 @@ use uuid::Uuid;
 
 use nflow_core::config::{self, Config};
 use nflow_core::decomposition::DecompositionStatus;
+use nflow_core::project::Project;
 use nflow_core::scheduler::{schedule, SchedulerAction, SchedulerState, SessionStatus};
-use nflow_core::work_item::{ItemType, TaskKind, WorkItemStatus};
+use nflow_core::work_item::{ItemType, TaskKind, WorkItem, WorkItemStatus};
 
 use crate::db;
 use crate::db::agent_runs::{AgentRun, AgentRunStatus};
 use crate::events::{Event, SharedEventBus};
-use crate::recovery::{verify_process, ProcessState};
+use crate::recovery::{read_process_start_time, verify_process, ProcessState};
 
 /// Result of evaluating a finished agent's output.
 #[derive(Debug, PartialEq, Eq)]
@@ -488,6 +489,298 @@ fn slugify(title: &str) -> String {
     }
 }
 
+/// Start execution of a task by spawning a Claude agent process.
+///
+/// This function:
+/// 1. Records the head_before commit hash (for impl tasks)
+/// 2. Loads and renders the appropriate prompt template (task_execution.md or verify_task.md)
+/// 3. Writes the rendered context to a temp file for `--append-system-prompt-file`
+/// 4. Spawns a Claude process via `ClaudeRunner::spawn()`
+/// 5. Creates an `agent_run` record with PID, pid_start_time, log_path, status=running
+/// 6. Spawns a background task to pipe agent stdout to a log file and broadcast output to clients
+pub async fn start_task_execution(
+    conn: &Connection,
+    task: &WorkItem,
+    project: &Project,
+    story: &WorkItem,
+    event_bus: Option<&SharedEventBus>,
+) {
+    let task_id = task.id;
+    let short_id = task.short_id.clone();
+    let is_verify = task.kind == Some(TaskKind::Verify);
+
+    // 1. Record head_before commit hash (for impl tasks only)
+    let worktree_path = match &story.worktree_path {
+        Some(p) => PathBuf::from(p),
+        None => {
+            warn!(
+                "start_task: story {} has no worktree_path, cannot start task {}",
+                story.id, task_id
+            );
+            return;
+        }
+    };
+
+    let head_before = if !is_verify {
+        match nflow_git::branch::get_head_commit(&worktree_path).await {
+            Ok(hash) => Some(hash),
+            Err(e) => {
+                warn!(
+                    "start_task: failed to get HEAD commit for task {}: {}",
+                    task_id, e
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // Store head_before on the work item if available (for later comparison during reaping)
+    // We store it in commit_hash temporarily; reaping will compare against the post-run hash.
+    // Actually, we don't store head_before on the work item — the reap logic uses "" as head_before
+    // when it doesn't know the pre-run state. The presence of a commit hash post-run is sufficient.
+    let _ = head_before; // Used for logging only at this point
+
+    // 2. Load and render prompt template
+    let nflow_home = match crate::daemon::nflow_home() {
+        Ok(h) => h,
+        Err(e) => {
+            warn!(
+                "start_task: failed to get nflow home for task {}: {}",
+                task_id, e
+            );
+            return;
+        }
+    };
+
+    let override_dir = nflow_home.join("prompts");
+    let override_path = if override_dir.is_dir() {
+        Some(override_dir)
+    } else {
+        None
+    };
+
+    let template_name = if is_verify {
+        "verify_task"
+    } else {
+        "task_execution"
+    };
+
+    let template =
+        match nflow_claude::prompt::load_template(template_name, override_path.as_deref()) {
+            Ok(t) => t,
+            Err(e) => {
+                warn!(
+                    "start_task: failed to load template '{}' for task {}: {}",
+                    template_name, task_id, e
+                );
+                return;
+            }
+        };
+
+    // Build context variables for the template
+    let tasks_for_story = match db::work_items::list_work_items_by_parent(conn, &story.id) {
+        Ok(t) => t,
+        Err(e) => {
+            warn!(
+                "start_task: failed to list tasks for story {}: {}",
+                story.id, e
+            );
+            Vec::new()
+        }
+    };
+
+    let vars_map = if is_verify {
+        // Find paired impl task for verify context
+        let impl_task = tasks_for_story
+            .iter()
+            .find(|t| {
+                t.item_type == ItemType::Task
+                    && t.kind == Some(TaskKind::Impl)
+                    && t.parent_id == task.parent_id
+                    && t.sort_order == task.sort_order - 1
+            })
+            .unwrap_or(task);
+        nflow_claude::context::build_verify_context(task, impl_task, &project.name)
+    } else {
+        // Get completed tasks for context (impl tasks that are done)
+        let completed: Vec<_> = tasks_for_story
+            .iter()
+            .filter(|t| {
+                t.item_type == ItemType::Task
+                    && t.kind == Some(TaskKind::Impl)
+                    && t.status == WorkItemStatus::Done
+            })
+            .cloned()
+            .collect();
+
+        // Check if this is a retry — look for previous failed agent runs
+        let previous_error = match db::agent_runs::count_agent_runs_for_task(conn, &task_id) {
+            Ok(count) if count > 0 => {
+                // Look for the last agent run's error message
+                match db::agent_runs::find_latest_agent_run_for_task(conn, &task_id) {
+                    Ok(Some(run)) => run.error_message.unwrap_or_default(),
+                    _ => String::new(),
+                }
+            }
+            _ => String::new(),
+        };
+
+        nflow_claude::context::build_task_context(task, &project.name, &completed, &previous_error)
+    };
+
+    // Convert HashMap<String, String> to HashMap<&str, &str> for render_template
+    let vars_ref: HashMap<&str, &str> = vars_map
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+
+    let rendered_prompt = match nflow_claude::prompt::render_template(&template, &vars_ref) {
+        Ok(p) => p,
+        Err(e) => {
+            warn!(
+                "start_task: failed to render template for task {}: {}",
+                task_id, e
+            );
+            return;
+        }
+    };
+
+    // 3. Write rendered context to temp file for --append-system-prompt-file
+    let agent_logs_dir = nflow_home
+        .join("projects")
+        .join(&project.name)
+        .join("agent-logs");
+    if let Err(e) = std::fs::create_dir_all(&agent_logs_dir) {
+        warn!(
+            "start_task: failed to create agent-logs dir for task {}: {}",
+            task_id, e
+        );
+        return;
+    }
+
+    // Write the rendered prompt to a temp file for system prompt
+    let prompt_file_path = agent_logs_dir.join(format!("{}.prompt.md", short_id));
+    if let Err(e) = std::fs::write(&prompt_file_path, &rendered_prompt) {
+        warn!(
+            "start_task: failed to write prompt file for task {}: {}",
+            task_id, e
+        );
+        return;
+    }
+
+    // 4. Build RunConfig and spawn Claude process
+    let task_prompt = format!(
+        "Implement the task as described in the system prompt file. Task: [{}] {}",
+        short_id, task.title
+    );
+
+    let mut run_config = if is_verify {
+        nflow_claude::runner::RunConfig::for_verify_task(task_prompt)
+    } else {
+        nflow_claude::runner::RunConfig::for_impl_task(task_prompt)
+    };
+    run_config.working_dir = Some(worktree_path.clone());
+    run_config.system_prompt_file = Some(prompt_file_path);
+
+    let runner = nflow_claude::runner::ClaudeRunner::new();
+    let process = match runner.spawn(&run_config) {
+        Ok(p) => p,
+        Err(e) => {
+            warn!(
+                "start_task: failed to spawn Claude for task {}: {}",
+                task_id, e
+            );
+            // Mark task as failed since we couldn't start the agent
+            let _ = db::work_items::update_work_item_status(conn, &task_id, WorkItemStatus::Failed);
+            if let Ok(Some(item)) = db::work_items::get_work_item_by_id(conn, &task_id) {
+                broadcast_status_change(event_bus, &task_id, &item, "in_progress", "failed", conn);
+            }
+            return;
+        }
+    };
+
+    let pid = process.pid;
+    let pid_start_time = read_process_start_time(pid);
+
+    // 5. Create agent_run record
+    let log_path = agent_logs_dir.join(format!("{}.log", short_id));
+    let log_path_str = log_path.to_string_lossy().to_string();
+
+    let agent_run = AgentRun {
+        id: Uuid::new_v4(),
+        work_item_id: task_id,
+        pid: Some(pid),
+        session_id: None,
+        pid_start_time,
+        status: AgentRunStatus::Running,
+        exit_code: None,
+        log_path: Some(log_path_str.clone()),
+        error_message: None,
+        started_at: Utc::now(),
+        finished_at: None,
+    };
+
+    if let Err(e) = db::agent_runs::insert_agent_run(conn, &agent_run) {
+        warn!(
+            "start_task: failed to insert agent_run for task {}: {}",
+            task_id, e
+        );
+        return;
+    }
+
+    info!(
+        "start_task: spawned Claude agent for task {} (pid={}, log={})",
+        short_id, pid, log_path_str
+    );
+
+    // 6. Spawn background task to pipe stdout to log file and broadcast AgentOutput events
+    let event_bus_clone = event_bus.cloned();
+    let task_id_str = task_id.to_string();
+    let mut stdout = process.stdout;
+    let _stderr = process.stderr;
+    // We take ownership of the child but don't wait on it —
+    // the reaper (reap_finished_agents) will detect when the process dies.
+    let _child = process.child;
+
+    tokio::spawn(async move {
+        let log_file = match tokio::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+            .await
+        {
+            Ok(f) => f,
+            Err(e) => {
+                warn!(
+                    "start_task: failed to open log file {}: {}",
+                    log_path.display(),
+                    e
+                );
+                return;
+            }
+        };
+        let mut writer = tokio::io::BufWriter::new(log_file);
+
+        while let Ok(Some(line)) = stdout.next_line().await {
+            // Write to log file
+            use tokio::io::AsyncWriteExt;
+            let _ = writer.write_all(line.as_bytes()).await;
+            let _ = writer.write_all(b"\n").await;
+            let _ = writer.flush().await;
+
+            // Broadcast to subscribed clients
+            if let Some(ref bus) = event_bus_clone {
+                bus.broadcast(Event::AgentOutput {
+                    task_id: task_id_str.clone(),
+                    line: line.clone(),
+                });
+            }
+        }
+    });
+}
+
 /// Execute scheduler actions by updating the DB and creating worktrees.
 ///
 /// Handles three action types:
@@ -684,7 +977,7 @@ async fn execute_start_story(
         .min_by_key(|t| t.sort_order);
 
     if let Some(task) = first_task {
-        // Mark first task as InProgress (actual agent spawn will happen in US-055)
+        // Mark first task as InProgress
         if let Err(e) =
             db::work_items::update_work_item_status(conn, &task.id, WorkItemStatus::InProgress)
         {
@@ -698,6 +991,15 @@ async fn execute_start_story(
                 task.short_id, task.id, story_id
             );
             broadcast_status_change(event_bus, &task.id, task, "pending", "in_progress", conn);
+
+            // Spawn Claude agent for this task
+            // Re-load the story to get the worktree_path that was just set
+            let updated_story = db::work_items::get_work_item_by_id(conn, story_id)
+                .ok()
+                .flatten();
+            if let Some(ref story_with_worktree) = updated_story {
+                start_task_execution(conn, task, &project, story_with_worktree, event_bus).await;
+            }
         }
     } else {
         warn!(

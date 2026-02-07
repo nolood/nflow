@@ -53,7 +53,7 @@ pub fn is_process_alive(pid: u32) -> bool {
 ///
 /// Returns None if the process doesn't exist or the file can't be read.
 #[cfg(target_os = "linux")]
-fn read_process_start_time(pid: u32) -> Option<i64> {
+pub fn read_process_start_time(pid: u32) -> Option<i64> {
     let stat_path = format!("/proc/{}/stat", pid);
     let content = std::fs::read_to_string(&stat_path).ok()?;
 
@@ -76,7 +76,7 @@ fn read_process_start_time(pid: u32) -> Option<i64> {
 ///
 /// Returns None if the process doesn't exist or info can't be read.
 #[cfg(target_os = "macos")]
-fn read_process_start_time(pid: u32) -> Option<i64> {
+pub fn read_process_start_time(pid: u32) -> Option<i64> {
     use std::mem;
 
     // Use sysctl kern.proc.pid.{pid} to get process info
@@ -110,7 +110,7 @@ fn read_process_start_time(pid: u32) -> Option<i64> {
 
 /// Fallback for unsupported platforms — always returns None.
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn read_process_start_time(_pid: u32) -> Option<i64> {
+pub fn read_process_start_time(_pid: u32) -> Option<i64> {
     None
 }
 

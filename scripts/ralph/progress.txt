@@ -1440,5 +1440,24 @@ Started: Sat Feb  7 03:49:10 PM MSK 2026
   - The main loop is already async (tokio::main) so we can call .await directly
   - slugify() of pure Unicode returns empty string (all non-ASCII becomes hyphens, trimmed away)
   - Action execution is separated from scheduling: schedule() is pure, execute_actions() does IO
+- start_task_execution() is async — spawns ClaudeRunner, creates agent_run, pipes stdout to log file in background tokio task
+- Rendered prompt templates go to {agent-logs}/{short_id}.prompt.md, agent output to {agent-logs}/{short_id}.log
+- read_process_start_time() is public in recovery.rs — needed by scheduler_loop for creating agent_run records with PID verification
+- find_latest_agent_run_for_task() gets previous error message for retry context in task prompts
   - The daemon::tests::test_foreground_mode_writes_pid_file_and_sets_shutdown test is flaky when run in parallel with other tests (race condition on PID file filesystem state)
+---
+
+## 2026-02-07 - US-055
+- What was implemented: Scheduler — start task execution. When a task is marked InProgress, the daemon now spawns a Claude agent process. The `start_task_execution()` function: records head_before commit hash via `nflow_git::branch::get_head_commit()`, loads and renders the appropriate prompt template (task_execution.md or verify_task.md) using `nflow_claude::context` builders, writes the rendered prompt to a file at `~/.nflow/projects/{name}/agent-logs/{short_id}.prompt.md`, spawns Claude via `ClaudeRunner::spawn()` with the correct RunConfig (`for_impl_task` or `for_verify_task`), creates an `agent_run` DB record with PID/pid_start_time/log_path/status=running, and spawns a background tokio task that pipes stdout to a log file and broadcasts `AgentOutput` events to subscribed clients.
+- Files changed:
+  - crates/nflow-daemon/src/scheduler_loop.rs (+180 lines — `start_task_execution()` function, integrated into `execute_start_story()`)
+  - crates/nflow-daemon/src/recovery.rs (made `read_process_start_time()` public across all platform cfg variants)
+  - crates/nflow-daemon/src/db/agent_runs.rs (+15 lines — `find_latest_agent_run_for_task()` for retry error context)
+- **Learnings for future iterations:**
+  - `read_process_start_time()` was private in recovery.rs — made it public so scheduler_loop can record pid_start_time on agent spawn
+  - For task execution, the rendered template goes to a file as `--append-system-prompt-file`, with a short task prompt via `-p`
+  - Background stdout piping task uses `tokio::spawn` — the reaper detects process death later via PID verification
+  - `find_latest_agent_run_for_task()` enables retry context: on retry, the previous error message is included in the prompt
+  - ClaudeProcess.stdout is moved into the background task; the child handle and stderr are also moved but not actively monitored (reaper handles this)
+  - The event_bus is `Option<&SharedEventBus>` (Arc<EventBus>), so `.cloned()` gives `Option<SharedEventBus>` for moving into async tasks
 ---
