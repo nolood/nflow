@@ -1,4 +1,7 @@
 ## Codebase Patterns
+- nix crate needs features = ["signal", "process", "fs"] for dup2/setsid/signal handling in daemon
+- Tests sharing filesystem state (PID files) must be serialized in a single test to avoid parallel race conditions
+- NFLOW_DAEMON_MODE env var controls background vs foreground daemon behavior
 - Workspace root Cargo.toml uses `[workspace.package]` for shared version/edition/rust-version
 - Use `workspace = true` in crate Cargo.toml to inherit shared fields
 - nflow-core must NEVER have tokio, async, or IO deps — keep it pure logic
@@ -812,4 +815,29 @@ Started: Sat Feb  7 03:49:10 PM MSK 2026
   - Commit validation functions are thin wrappers around get_head_commit/get_commit_message — keep them simple
   - validate_commit_message checks for `[{prefix}]` with brackets — prefix without brackets is a validation failure
   - has_new_commit uses string comparison of full 40-char SHA hashes — no git operations beyond rev-parse
+---
+
+## 2026-02-07 - US-033
+- What was implemented: Daemon process spawning and daemonization in nflow-daemon
+  - daemon.rs module with full daemonization lifecycle
+  - nflow_home(), pid_file_path(), log_file_path(), socket_path() — path helpers for ~/.nflow/ layout
+  - ensure_nflow_home(), ensure_log_dir() — directory creation helpers
+  - daemonize() — full daemonization: ignore SIGHUP → setsid() → restore SIGHUP → redirect stdout/stderr to log file → write PID
+  - redirect_output() — uses nix::unistd::dup2 to redirect fd 1 (stdout) and fd 2 (stderr) to daemon.log
+  - write_pid_file(), read_pid_file(), remove_pid_file() — PID file management
+  - open_log_file() — opens/creates ~/.nflow/logs/daemon.log in append mode
+  - spawn_daemon(binary_path) — spawns daemon as detached child process with NFLOW_DAEMON_MODE=background env var
+  - is_daemon_running() — checks PID file + signal 0 probe (handles ESRCH/EPERM for dead/alive processes)
+  - main.rs updated to check NFLOW_DAEMON_MODE and call daemonize() for background mode
+  - 7 tests covering paths, log dir creation, PID file lifecycle, daemon running detection, spawn failure
+- Files changed:
+  - crates/nflow-daemon/Cargo.toml (added "fs" feature to nix crate for dup2)
+  - crates/nflow-daemon/src/daemon.rs (new — full daemon lifecycle module)
+  - crates/nflow-daemon/src/main.rs (updated to use daemon module, daemonize on background mode)
+- **Learnings for future iterations:**
+  - nix crate needs "fs" feature for dup2() — not included with just "signal" and "process"
+  - Tests sharing PID file must be serialized (single test function) to avoid parallel race conditions
+  - std::mem::forget(file) keeps the log file handle alive after dup2 — prevents fd from being closed when File drops
+  - Use signal 0 (`kill(pid, None)`) to check if a process is alive — ESRCH means dead, EPERM means alive but no permission
+  - NFLOW_DAEMON_MODE env var distinguishes background vs foreground — set by spawn_daemon, read in main
 ---
