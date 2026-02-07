@@ -4484,12 +4484,7 @@ fn handle_exec_cancel(req: Request, state: &HandlerState) -> Response {
 /// Send SIGTERM to an agent process (no wait, no escalation to SIGKILL).
 /// Used by exec.stop handler for immediate termination signal.
 fn terminate_agent_process_sigterm(pid: u32) {
-    let nix_pid = nix::unistd::Pid::from_raw(pid as i32);
-    match nix::sys::signal::kill(nix_pid, nix::sys::signal::Signal::SIGTERM) {
-        Ok(()) => {}
-        Err(nix::errno::Errno::ESRCH) => {} // already dead
-        Err(_) => {}
-    }
+    let _ = crate::platform::send_signal(pid, crate::platform::Signal::Sigterm);
 }
 
 /// Stop all running agents for a story, cancel the story, and cancel pending tasks.

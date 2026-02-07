@@ -4,14 +4,14 @@ use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
-use nix::sys::signal::{signal, SigHandler, Signal};
 use nix::unistd::setsid;
 use tracing::warn;
 
 use crate::error::{DaemonError, Result};
+use crate::platform;
 
 /// Returns the nflow home directory (~/.nflow/).
 pub fn nflow_home() -> Result<PathBuf> {
@@ -147,13 +147,8 @@ pub fn open_log_file() -> Result<File> {
 /// Uses unsafe for signal handling via nix crate (POSIX signals).
 pub fn daemonize() -> Result<()> {
     // Ignore SIGHUP before setsid so we don't get killed when detaching
-    // SAFETY: SigIgn is a valid signal handler for SIGHUP on POSIX systems
-    let prev_handler = unsafe { signal(Signal::SIGHUP, SigHandler::SigIgn) }.map_err(|e| {
-        DaemonError::Io(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!("failed to ignore SIGHUP: {}", e),
-        ))
-    })?;
+    let prev_handler =
+        platform::ignore_signal(platform::Signal::Sighup).map_err(DaemonError::Io)?;
 
     // Create a new session — detach from controlling terminal
     setsid().map_err(|e| {
@@ -164,13 +159,7 @@ pub fn daemonize() -> Result<()> {
     })?;
 
     // Restore previous SIGHUP handler
-    // SAFETY: Restoring the previous signal handler
-    unsafe { signal(Signal::SIGHUP, prev_handler) }.map_err(|e| {
-        DaemonError::Io(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!("failed to restore SIGHUP handler: {}", e),
-        ))
-    })?;
+    platform::restore_signal(platform::Signal::Sighup, prev_handler).map_err(DaemonError::Io)?;
 
     // Redirect stdout/stderr to log file
     redirect_output()?;
@@ -227,7 +216,7 @@ pub fn foreground_mode() -> Result<Arc<AtomicBool>> {
     write_pid_file()?;
 
     let shutdown = Arc::new(AtomicBool::new(false));
-    install_shutdown_handler(Arc::clone(&shutdown))?;
+    install_shutdown_handler()?;
 
     Ok(shutdown)
 }
@@ -235,75 +224,20 @@ pub fn foreground_mode() -> Result<Arc<AtomicBool>> {
 /// Installs SIGTERM and SIGINT handlers that set the shutdown flag.
 ///
 /// Both signals trigger the same graceful shutdown: they set the
-/// `shutting_down` atomic bool to `true`, allowing the main loop to
-/// detect and initiate an orderly shutdown.
-fn install_shutdown_handler(shutdown: Arc<AtomicBool>) -> Result<()> {
-    // SAFETY: signal_hook::flag::register is safe for AtomicBool operations.
-    // We use nix's signal to install a handler that sets our flag.
-    // Since Rust closures can't be signal handlers directly, we use
-    // signal_hook_registry or a static. Here we use a simple approach
-    // with nix's SigAction for each signal.
-    //
-    // However, to keep things simple and safe without adding new deps,
-    // we use ctrlc-style handling via a static AtomicBool.
-    SHUTDOWN_FLAG.store(false, Ordering::SeqCst);
+/// global shutdown flag to `true` via `platform::install_signal_handler`,
+/// allowing the main loop to detect and initiate an orderly shutdown.
+fn install_shutdown_handler() -> Result<()> {
+    platform::install_signal_handler(platform::Signal::Sigterm).map_err(DaemonError::Io)?;
 
-    // Leak the Arc into a raw pointer stored in SHUTDOWN_ARC so the
-    // signal handler can access it. This is intentionally leaked — the
-    // daemon runs for the entire process lifetime.
-    {
-        let ptr = Arc::into_raw(shutdown);
-        SHUTDOWN_ARC.store(ptr as *mut bool, Ordering::SeqCst);
-    }
-
-    // Install SIGTERM handler
-    // SAFETY: Our handler only writes to an AtomicBool (async-signal-safe)
-    unsafe {
-        signal(
-            Signal::SIGTERM,
-            SigHandler::Handler(shutdown_signal_handler),
-        )
-        .map_err(|e| {
-            DaemonError::Io(std::io::Error::other(format!(
-                "failed to install SIGTERM handler: {}",
-                e
-            )))
-        })?;
-    }
-
-    // Install SIGINT handler (Ctrl+C)
-    // SAFETY: Same handler — only writes to an AtomicBool
-    unsafe {
-        signal(Signal::SIGINT, SigHandler::Handler(shutdown_signal_handler)).map_err(|e| {
-            DaemonError::Io(std::io::Error::other(format!(
-                "failed to install SIGINT handler: {}",
-                e
-            )))
-        })?;
-    }
+    // Install SIGINT handler (Ctrl+C) — same shutdown behavior
+    platform::install_signal_handler(platform::Signal::Sigint).map_err(DaemonError::Io)?;
 
     Ok(())
 }
 
-/// Global shutdown flag for signal handler access.
-static SHUTDOWN_FLAG: AtomicBool = AtomicBool::new(false);
-
-/// Pointer to the Arc<AtomicBool> for the shutdown flag. This is set once
-/// in install_shutdown_handler and read by the signal handler.
-static SHUTDOWN_ARC: std::sync::atomic::AtomicPtr<bool> =
-    std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
-
-/// Signal handler for SIGTERM/SIGINT. Sets the global shutdown flag.
-///
-/// This function is called from signal context, so it must only perform
-/// async-signal-safe operations. Writing to an AtomicBool is safe.
-extern "C" fn shutdown_signal_handler(_sig: libc::c_int) {
-    SHUTDOWN_FLAG.store(true, Ordering::SeqCst);
-}
-
 /// Returns true if a shutdown signal has been received.
 pub fn is_shutting_down() -> bool {
-    SHUTDOWN_FLAG.load(Ordering::SeqCst)
+    platform::is_shutting_down()
 }
 
 /// Spawn the daemon as a background process.
@@ -364,6 +298,7 @@ pub fn is_daemon_running() -> Result<bool> {
 mod tests {
     use super::*;
     use std::env;
+    use std::sync::atomic::Ordering;
 
     #[test]
     fn test_nflow_home() {
@@ -509,35 +444,14 @@ mod tests {
         assert!(!shutdown.load(Ordering::SeqCst));
         assert!(!is_shutting_down());
 
-        // Simulate shutdown signal by setting the flag directly
-        SHUTDOWN_FLAG.store(true, Ordering::SeqCst);
-        assert!(is_shutting_down());
-
-        // Reset for other tests
-        SHUTDOWN_FLAG.store(false, Ordering::SeqCst);
-
         // Cleanup
+        platform::reset_shutdown_flag();
         remove_pid_file().unwrap();
     }
 
     #[test]
-    fn test_is_shutting_down_default_false() {
-        // Reset the flag
-        SHUTDOWN_FLAG.store(false, Ordering::SeqCst);
+    fn test_is_shutting_down_delegates_to_platform() {
+        platform::reset_shutdown_flag();
         assert!(!is_shutting_down());
-    }
-
-    #[test]
-    fn test_shutdown_signal_handler_sets_flag() {
-        // Reset the flag
-        SHUTDOWN_FLAG.store(false, Ordering::SeqCst);
-        assert!(!is_shutting_down());
-
-        // Call the signal handler directly (simulating a signal)
-        shutdown_signal_handler(libc::SIGTERM);
-        assert!(is_shutting_down());
-
-        // Reset for other tests
-        SHUTDOWN_FLAG.store(false, Ordering::SeqCst);
     }
 }

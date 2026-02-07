@@ -2,11 +2,11 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use chrono::Utc;
-use nix::sys::signal::{kill, Signal};
-use nix::unistd::Pid;
 use rusqlite::Connection;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
+
+use crate::platform::{self, SendSignalResult};
 
 use nflow_core::config::{self, Config};
 use nflow_core::decomposition::DecompositionStatus;
@@ -1625,19 +1625,17 @@ pub fn check_agent_timeouts(
 
 /// Terminate an agent process: SIGTERM, wait 10 seconds, then SIGKILL if still alive.
 fn terminate_agent_process(pid: u32) {
-    let nix_pid = Pid::from_raw(pid as i32);
-
     // Send SIGTERM
-    match kill(nix_pid, Signal::SIGTERM) {
-        Ok(()) => {
+    match platform::send_signal(pid, platform::Signal::Sigterm) {
+        SendSignalResult::Sent => {
             info!("timeout: sent SIGTERM to agent pid={}", pid);
         }
-        Err(nix::errno::Errno::ESRCH) => {
+        SendSignalResult::NoSuchProcess => {
             // Process already dead
             return;
         }
-        Err(e) => {
-            warn!("timeout: failed to send SIGTERM to pid={}: {}", pid, e);
+        SendSignalResult::PermissionDenied => {
+            warn!("timeout: permission denied sending SIGTERM to pid={}", pid);
             return;
         }
     }
@@ -1645,7 +1643,7 @@ fn terminate_agent_process(pid: u32) {
     // Wait up to 10 seconds for the process to exit
     for _ in 0..100 {
         std::thread::sleep(std::time::Duration::from_millis(100));
-        if !crate::platform::is_process_alive(pid) {
+        if !platform::is_process_alive(pid) {
             info!("timeout: agent pid={} exited after SIGTERM", pid);
             return;
         }
@@ -1656,15 +1654,15 @@ fn terminate_agent_process(pid: u32) {
         "timeout: agent pid={} still alive after 10s, sending SIGKILL",
         pid
     );
-    match kill(nix_pid, Signal::SIGKILL) {
-        Ok(()) => {
+    match platform::send_signal(pid, platform::Signal::Sigkill) {
+        SendSignalResult::Sent => {
             info!("timeout: sent SIGKILL to agent pid={}", pid);
         }
-        Err(nix::errno::Errno::ESRCH) => {
+        SendSignalResult::NoSuchProcess => {
             // Already dead
         }
-        Err(e) => {
-            warn!("timeout: failed to send SIGKILL to pid={}: {}", pid, e);
+        SendSignalResult::PermissionDenied => {
+            warn!("timeout: permission denied sending SIGKILL to pid={}", pid);
         }
     }
 }

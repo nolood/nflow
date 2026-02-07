@@ -1,4 +1,7 @@
 ## Codebase Patterns
+- platform::send_signal(pid, Signal) returns SendSignalResult {Sent, NoSuchProcess, PermissionDenied} — use instead of raw nix::sys::signal::kill()
+- platform::install_signal_handler(Signal) sets global SHUTDOWN_FLAG AtomicBool; platform::is_shutting_down() reads it — use instead of custom signal handler globals
+- platform::ignore_signal(Signal)/restore_signal(Signal, handler) for temporary signal disposition changes (e.g., daemonization)
 - format::init(no_color) sets global NO_COLOR AtomicBool; also checks NO_COLOR env var and libc::isatty() for pipe detection
 - format::print_response(data, command) dispatches by JSON shape (epics→tree, adjacency→DAG, waves→status); format::format_error() classifies by prefix (NOT_FOUND/ALREADY_EXISTS/INVALID_STATE/INVALID_PARAMS) and adds hint suggestions
 - SocketClient::connect_to(path) for tests; SocketClient::connect() uses socket_path() (supports NFLOW_SOCKET env override) for production
@@ -2187,4 +2190,25 @@ Started: Sat Feb  7 03:49:10 PM MSK 2026
   - The `read_process_start_time` → `get_pid_start_time` rename needed a thin wrapper alias for `recovery.rs` internal usage
   - `matches!()` macro is preferred over `match` for simple bool returns (clippy: `match_like_matches_macro` lint)
   - daemon.rs had inline signal-0 logic duplicating `is_process_alive()` — always check for duplicates before extraction
+---
+
+## 2026-02-08 - US-089
+- What was implemented: Cross-platform signal handling abstraction in platform.rs
+  - Added Signal enum (Sigterm, Sigkill, Sighup, Sigint) with to_nix() conversion
+  - Added send_signal(pid, Signal) -> SendSignalResult replacing raw nix::sys::signal::kill calls
+  - Added install_signal_handler(Signal) with global SHUTDOWN_FLAG AtomicBool
+  - Added ignore_signal(Signal)/restore_signal(Signal, handler) for daemonization
+  - Moved is_shutting_down() to platform module, daemon.rs delegates to it
+  - Refactored all signal consumers: shutdown.rs, scheduler_loop.rs, handlers.rs, daemon.rs
+- Files changed:
+  - `crates/nflow-daemon/src/platform.rs` — Added Signal enum, send_signal, install_signal_handler, ignore_signal, restore_signal, is_shutting_down + tests
+  - `crates/nflow-daemon/src/daemon.rs` — Removed SHUTDOWN_FLAG/SHUTDOWN_ARC globals, shutdown_signal_handler; now delegates to platform module
+  - `crates/nflow-daemon/src/shutdown.rs` — Replaced nix::sys::signal imports with platform::send_signal/is_process_alive
+  - `crates/nflow-daemon/src/scheduler_loop.rs` — Replaced nix::sys::signal imports with platform::send_signal
+  - `crates/nflow-daemon/src/handlers.rs` — Replaced inline nix signal call with platform::send_signal
+- **Learnings for future iterations:**
+  - Signal handler functions must be extern "C" fn(c_int) and async-signal-safe — only use AtomicBool stores
+  - When consolidating signal handling into one module, the global AtomicBool must live in that module (not distributed across files)
+  - test_config_set_validation_rejects_zero_max_parallel is a pre-existing flaky test (shared state in parallel execution) — not caused by signal changes
+  - SIGINT needed for foreground daemon Ctrl+C handling even though AC only specified SIGTERM/SIGKILL/SIGHUP — keep the enum extensible
 ---

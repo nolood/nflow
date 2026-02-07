@@ -1,12 +1,10 @@
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use nix::sys::signal::{kill, Signal};
-use nix::unistd::Pid;
 use tracing::info;
 
 use crate::db::agent_runs::{find_running_agent_runs, AgentRun};
-use crate::platform::is_process_alive;
+use crate::platform::{self, SendSignalResult};
 
 /// Default grace period for agents to finish naturally after shutdown signal.
 const AGENT_GRACE_PERIOD: Duration = Duration::from_secs(60);
@@ -60,7 +58,7 @@ pub fn wait_for_agents(pids: &[(uuid::Uuid, u32)], timeout: Duration) -> (u32, V
 
     while !alive.is_empty() && start.elapsed() < timeout {
         alive.retain(|&pid| {
-            if is_process_alive(pid) {
+            if platform::is_process_alive(pid) {
                 true
             } else {
                 finished += 1;
@@ -81,17 +79,16 @@ pub fn wait_for_agents(pids: &[(uuid::Uuid, u32)], timeout: Duration) -> (u32, V
 pub fn sigterm_agents(pids: &[u32]) -> u32 {
     let mut signaled = 0u32;
     for &pid in pids {
-        let nix_pid = Pid::from_raw(pid as i32);
-        match kill(nix_pid, Signal::SIGTERM) {
-            Ok(()) => {
+        match platform::send_signal(pid, platform::Signal::Sigterm) {
+            SendSignalResult::Sent => {
                 info!(pid, "sent SIGTERM to agent process");
                 signaled += 1;
             }
-            Err(nix::errno::Errno::ESRCH) => {
+            SendSignalResult::NoSuchProcess => {
                 // Process already dead — that's fine
             }
-            Err(e) => {
-                info!(pid, error = %e, "failed to send SIGTERM to agent process");
+            SendSignalResult::PermissionDenied => {
+                info!(pid, "permission denied sending SIGTERM to agent process");
             }
         }
     }
@@ -104,17 +101,16 @@ pub fn sigterm_agents(pids: &[u32]) -> u32 {
 pub fn sigkill_agents(pids: &[u32]) -> u32 {
     let mut killed = 0u32;
     for &pid in pids {
-        let nix_pid = Pid::from_raw(pid as i32);
-        match kill(nix_pid, Signal::SIGKILL) {
-            Ok(()) => {
+        match platform::send_signal(pid, platform::Signal::Sigkill) {
+            SendSignalResult::Sent => {
                 info!(pid, "sent SIGKILL to agent process");
                 killed += 1;
             }
-            Err(nix::errno::Errno::ESRCH) => {
+            SendSignalResult::NoSuchProcess => {
                 // Process already dead
             }
-            Err(e) => {
-                info!(pid, error = %e, "failed to send SIGKILL to agent process");
+            SendSignalResult::PermissionDenied => {
+                info!(pid, "permission denied sending SIGKILL to agent process");
             }
         }
     }
@@ -241,7 +237,7 @@ fn wait_for_agents_by_pid(pids: &[u32], timeout: Duration) -> (u32, Vec<u32>) {
 
     while !alive.is_empty() && start.elapsed() < timeout {
         alive.retain(|&pid| {
-            if is_process_alive(pid) {
+            if platform::is_process_alive(pid) {
                 true
             } else {
                 finished += 1;
@@ -435,7 +431,7 @@ mod tests {
         sigterm_agents(&[pid]);
         std::thread::sleep(Duration::from_secs(1));
         // Process should still be alive (trap catches TERM)
-        assert!(is_process_alive(pid));
+        assert!(platform::is_process_alive(pid));
 
         // SIGKILL will kill it
         sigkill_agents(&[pid]);
