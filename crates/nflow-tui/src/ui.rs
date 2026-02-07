@@ -23,7 +23,7 @@ pub fn render(app: &App, frame: &mut Frame) {
 
     // Render overlay on top if active
     if let Some(overlay) = &app.overlay {
-        render_overlay(overlay, app.current_view, frame, frame.area());
+        render_overlay(overlay, app, frame, frame.area());
     }
 
     // Render plan sub-views on top
@@ -1125,10 +1125,10 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
 }
 
 /// Render an overlay popup on top of the current view.
-fn render_overlay(overlay: &Overlay, current_view: View, frame: &mut Frame, area: Rect) {
+fn render_overlay(overlay: &Overlay, app: &App, frame: &mut Frame, area: Rect) {
     match overlay {
-        Overlay::Help => render_help_overlay(current_view, frame, area),
-        Overlay::ProjectSwitcher => render_project_switcher_overlay(frame, area),
+        Overlay::Help => render_help_overlay(app.current_view, frame, area),
+        Overlay::ProjectSwitcher => render_project_switcher_overlay(app, frame, area),
         Overlay::Filter => render_filter_overlay(frame, area),
     }
 }
@@ -1251,14 +1251,14 @@ fn render_help_overlay(current_view: View, frame: &mut Frame, area: Rect) {
     frame.render_widget(paragraph, popup_area);
 }
 
-/// Render the project switcher overlay (placeholder for future implementation).
-fn render_project_switcher_overlay(frame: &mut Frame, area: Rect) {
-    let popup_area = centered_rect(50, 40, area);
+/// Render the project switcher overlay with project list.
+fn render_project_switcher_overlay(app: &App, frame: &mut Frame, area: Rect) {
+    let popup_area = centered_rect(50, 50, area);
     frame.render_widget(Clear, popup_area);
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .title("Project Switcher")
+        .title(" Project Switcher — j/k:nav Enter:select Esc:cancel ")
         .title_style(
             Style::default()
                 .fg(Color::Magenta)
@@ -1266,21 +1266,72 @@ fn render_project_switcher_overlay(frame: &mut Frame, area: Rect) {
         )
         .border_style(Style::default().fg(Color::Magenta));
 
-    let content = Paragraph::new(vec![
-        Line::from(""),
-        Line::from(Span::styled(
-            "  No projects loaded yet.",
-            Style::default().fg(Color::DarkGray),
-        )),
-        Line::from(""),
-        Line::from(Span::styled(
-            "  Press Esc to close.",
-            Style::default().fg(Color::DarkGray),
-        )),
-    ])
-    .block(block);
+    let switcher = match &app.project_switcher {
+        Some(s) => s,
+        None => {
+            let content = Paragraph::new(vec![
+                Line::from(""),
+                Line::from(Span::styled(
+                    "  Loading projects...",
+                    Style::default().fg(Color::DarkGray),
+                )),
+            ])
+            .block(block);
+            frame.render_widget(content, popup_area);
+            return;
+        }
+    };
 
-    frame.render_widget(content, popup_area);
+    let mut lines = Vec::new();
+    lines.push(Line::from(""));
+
+    if switcher.projects.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  No projects found.",
+            Style::default().fg(Color::DarkGray),
+        )));
+    } else {
+        for (i, project) in switcher.projects.iter().enumerate() {
+            let is_selected = i == switcher.selected;
+            let is_current = project.name == app.project;
+
+            let marker = if is_current { "▸ " } else { "  " };
+            let agents = if project.active_agent_count > 0 {
+                format!(" ({} agents)", project.active_agent_count)
+            } else {
+                String::new()
+            };
+            let text = format!("{}{}{}", marker, project.name, agents);
+
+            let style = if is_selected {
+                Style::default().bg(Color::DarkGray).fg(Color::White)
+            } else if is_current {
+                Style::default().fg(Color::Cyan)
+            } else {
+                Style::default().fg(Color::White)
+            };
+
+            lines.push(Line::from(Span::styled(format!("  {}", text), style)));
+
+            // Show path on the line below in dimmed style
+            let path_style = if is_selected {
+                Style::default().bg(Color::DarkGray).fg(Color::Gray)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+            lines.push(Line::from(Span::styled(
+                format!("    {}", project.path),
+                path_style,
+            )));
+        }
+    }
+
+    lines.push(Line::from(""));
+
+    let paragraph = Paragraph::new(lines)
+        .block(block)
+        .wrap(Wrap { trim: false });
+    frame.render_widget(paragraph, popup_area);
 }
 
 /// Render the plan generate dialog (select specs + with_codebase checkbox).

@@ -1424,6 +1424,46 @@ fn format_single_entry(entry: &LogEntry) -> String {
     }
 }
 
+/// A single project entry for display in the project switcher.
+#[derive(Debug, Clone)]
+pub struct ProjectItem {
+    pub name: String,
+    pub path: String,
+    pub active_agent_count: u32,
+}
+
+/// State for the project switcher overlay.
+#[derive(Debug)]
+pub struct ProjectSwitcherState {
+    pub projects: Vec<ProjectItem>,
+    pub selected: usize,
+}
+
+impl ProjectSwitcherState {
+    pub fn new(projects: Vec<ProjectItem>) -> Self {
+        Self {
+            selected: 0,
+            projects,
+        }
+    }
+
+    pub fn select_prev(&mut self) {
+        if self.selected > 0 {
+            self.selected -= 1;
+        }
+    }
+
+    pub fn select_next(&mut self) {
+        if !self.projects.is_empty() && self.selected < self.projects.len() - 1 {
+            self.selected += 1;
+        }
+    }
+
+    pub fn selected_project(&self) -> Option<&ProjectItem> {
+        self.projects.get(self.selected)
+    }
+}
+
 /// Overlay that can be displayed on top of the current view.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Overlay {
@@ -1507,6 +1547,8 @@ pub struct App {
     pub status_message: String,
     /// Currently active overlay (if any).
     pub overlay: Option<Overlay>,
+    /// Project switcher state (populated when overlay is open).
+    pub project_switcher: Option<ProjectSwitcherState>,
     /// Current wave number (from daemon status).
     pub current_wave: Option<u32>,
     /// Number of active agents (from daemon status).
@@ -1549,6 +1591,7 @@ impl App {
             should_quit: false,
             status_message: String::new(),
             overlay: None,
+            project_switcher: None,
             current_wave: None,
             active_agent_count: 0,
             specs_list: SpecsListState::new(),
@@ -1614,12 +1657,95 @@ impl App {
 
     /// Close any open overlay.
     pub fn close_overlay(&mut self) {
+        if self.overlay == Some(Overlay::ProjectSwitcher) {
+            self.project_switcher = None;
+        }
         self.overlay = None;
     }
 
     /// Returns true if any overlay is currently shown.
     pub fn has_overlay(&self) -> bool {
         self.overlay.is_some()
+    }
+
+    /// Open the project switcher overlay with the given project list.
+    pub fn open_project_switcher(&mut self, projects: Vec<ProjectItem>) {
+        // Pre-select the current project in the list
+        let selected = projects
+            .iter()
+            .position(|p| p.name == self.project)
+            .unwrap_or(0);
+        let mut state = ProjectSwitcherState::new(projects);
+        state.selected = selected;
+        self.project_switcher = Some(state);
+        self.overlay = Some(Overlay::ProjectSwitcher);
+    }
+
+    /// Switch to a different project, resetting all view state.
+    pub async fn switch_project(&mut self, name: String, client: &mut SocketClient) {
+        self.project = name;
+        // Reset all view state
+        self.specs_list = SpecsListState::new();
+        self.spec_dialogue = None;
+        self.spec_pager = None;
+        self.plan_tree = PlanTreeState::new();
+        self.plan_generate = None;
+        self.plan_feedback = None;
+        self.plan_confirm = None;
+        self.plan_detail = None;
+        self.execute_tree = ExecuteTreeState::new();
+        self.execute_output = ExecuteOutputState::new();
+        self.execute_confirm = None;
+        self.logs_view = LogsViewState::new();
+        self.current_wave = None;
+        self.active_agent_count = 0;
+        // Close overlay
+        self.project_switcher = None;
+        self.overlay = None;
+        // Reload data for the new project
+        self.connect(client).await.ok();
+        self.fetch_plan(client).await.ok();
+        self.fetch_execute(client).await.ok();
+        self.status_message = format!("Switched to project: {}", self.project);
+    }
+
+    /// Fetch the project list from the daemon.
+    pub async fn fetch_projects(&mut self, client: &mut SocketClient) -> Result<Vec<ProjectItem>> {
+        let resp = client
+            .send_command("project.list", serde_json::json!({}))
+            .await?;
+
+        if resp.status == ResponseStatus::Ok {
+            let projects = resp
+                .data
+                .get("projects")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .map(|p| ProjectItem {
+                            name: p
+                                .get("name")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string(),
+                            path: p
+                                .get("path")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string(),
+                            active_agent_count: p
+                                .get("active_agent_count")
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(0)
+                                as u32,
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            Ok(projects)
+        } else {
+            Ok(Vec::new())
+        }
     }
 
     /// Returns true if a spec dialogue is active.

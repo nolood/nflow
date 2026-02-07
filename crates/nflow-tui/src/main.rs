@@ -208,6 +208,12 @@ async fn event_loop(
                 event::ViewAction::LogsExit => {
                     app.exit_logs_view();
                 }
+                event::ViewAction::ProjectSwitcherOpen => {
+                    handle_project_switcher_open(app, client).await;
+                }
+                event::ViewAction::ProjectSelect(name) => {
+                    app.switch_project(name, client).await;
+                }
                 _ => {}
             }
 
@@ -222,6 +228,18 @@ async fn event_loop(
     }
 
     Ok(())
+}
+
+/// Handle opening the project switcher: fetch projects then open overlay.
+async fn handle_project_switcher_open(app: &mut App, client: &mut SocketClient) {
+    match app.fetch_projects(client).await {
+        Ok(projects) => {
+            app.open_project_switcher(projects);
+        }
+        Err(e) => {
+            app.status_message = format!("Failed to load projects: {}", e);
+        }
+    }
 }
 
 /// Poll for streaming data from the daemon (non-blocking).

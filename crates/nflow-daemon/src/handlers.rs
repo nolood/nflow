@@ -187,7 +187,7 @@ fn handle_project_init(req: Request, state: &HandlerState) -> Response {
 
 /// Handle "project.list" command.
 ///
-/// Returns all projects with: name, path, base_branch, git_provider, execution_enabled, spec_count, story_count
+/// Returns all projects with: name, path, base_branch, git_provider, execution_enabled, spec_count, story_count, active_agent_count
 fn handle_project_list(req: Request, state: &HandlerState) -> Response {
     let id = req.id.clone();
 
@@ -208,6 +208,10 @@ fn handle_project_list(req: Request, state: &HandlerState) -> Response {
     for project in &projects {
         let spec_count = db::specs::count_specs_by_project(&conn, &project.id).unwrap_or(0);
         let story_count = db::work_items::count_stories_by_project(&conn, &project.id).unwrap_or(0);
+        let active_agent_count =
+            db::agent_runs::find_running_agent_runs_by_project(&conn, &project.id)
+                .map(|runs| runs.len() as u32)
+                .unwrap_or(0);
 
         project_list.push(serde_json::json!({
             "name": project.name,
@@ -217,6 +221,7 @@ fn handle_project_list(req: Request, state: &HandlerState) -> Response {
             "execution_enabled": project.execution_enabled,
             "spec_count": spec_count,
             "story_count": story_count,
+            "active_agent_count": active_agent_count,
         }));
     }
 

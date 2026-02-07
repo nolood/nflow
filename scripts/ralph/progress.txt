@@ -32,6 +32,7 @@
 - TUI terminal setup/restore pattern: setup() enters raw mode + alternate screen, restore() undoes both — always call restore on exit
 - nix crate for TUI needs features = ["signal", "process", "fs"] (fs for Flock/FlockArg)
 - TUI overlay pattern: Overlay enum + App.toggle_overlay()/close_overlay()/has_overlay(); Esc closes any overlay; navigation keys guarded with `if !app.has_overlay()`
+- TUI async overlay pattern: overlays requiring daemon data (e.g., ProjectSwitcher) return a ViewAction (e.g., ProjectSwitcherOpen) from handle_key_event instead of toggling directly, so main loop can fetch data async then open the overlay via a dedicated open_*() method
 - TUI view-specific keys: handle_key_event returns (bool, ViewAction); handle_view_key dispatches by current_view to per-view handler (handle_specs_key etc.)
 - TUI sub-view pattern: App.spec_dialogue: Option<SpecDialogueState> — presence indicates sub-view active; handle_key_event checks in_dialogue() before global keys; dialogue keys handled exclusively in handle_dialogue_key()
 - TUI streaming in event loop: try_read_streaming_line(10ms timeout) polls non-blocking in main loop; streaming state controls whether poll happens; input disabled during Streaming state
@@ -2118,4 +2119,30 @@ Started: Sat Feb  7 03:49:10 PM MSK 2026
   - cell.set_style() overwrites the cell's style — use DarkGray foreground for dimming
   - Help overlay "any key dismiss" check must come after Esc handler (Esc already handled) and before the main match block
   - When changing overlay dismiss behavior, update dependent tests that assumed keys were blocked while overlay was open
+---
+
+## 2026-02-08 - US-086
+- Implemented TUI project switcher overlay
+- What was implemented:
+  - ProjectSwitcherState struct with project list, cursor, navigation methods
+  - ProjectItem struct with name, path, active_agent_count
+  - fetch_projects() async method on App (calls project.list daemon command)
+  - open_project_switcher() method pre-selects current project
+  - switch_project() resets all view state and reloads data for new project
+  - handle_project_switcher_key() for j/k/Enter navigation in overlay
+  - ProjectSwitcherOpen and ProjectSelect ViewAction variants
+  - Full overlay rendering with current project marker (▸), path display, agent count
+  - Added active_agent_count to project.list daemon handler response
+- Files changed:
+  - crates/nflow-daemon/src/handlers.rs (added active_agent_count to project.list response)
+  - crates/nflow-tui/src/app.rs (ProjectItem, ProjectSwitcherState, fetch_projects, open_project_switcher, switch_project)
+  - crates/nflow-tui/src/event.rs (ProjectSwitcherOpen/ProjectSelect actions, handle_project_switcher_key, updated test)
+  - crates/nflow-tui/src/ui.rs (render_project_switcher_overlay rewrite, render_overlay signature update)
+  - crates/nflow-tui/src/main.rs (handle_project_switcher_open, ProjectSelect handler)
+- **Learnings for future iterations:**
+  - Overlays needing async data must use two-step pattern: ViewAction triggers fetch, then open overlay after data arrives
+  - close_overlay() must clean up overlay-specific state (e.g., project_switcher = None)
+  - render_overlay signature needed app reference instead of just current_view when overlays need app state
+  - project.list returns name, path, base_branch, git_provider, execution_enabled, spec_count, story_count, active_agent_count
+  - Pre-existing flaky test: test_config_set_validation_rejects_zero_max_parallel fails in parallel but passes in isolation
 ---

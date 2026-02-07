@@ -68,6 +68,10 @@ pub enum ViewAction {
     LogsSelectTask(String),
     /// User exited the full-screen logs view back to Execute.
     LogsExit,
+    /// Request to open the project switcher (fetch projects from daemon).
+    ProjectSwitcherOpen,
+    /// User selected a project in the switcher.
+    ProjectSelect(String),
 }
 
 /// Handle a key event, returning true if the app should continue, false to quit.
@@ -121,6 +125,12 @@ pub fn handle_key_event(app: &mut App, key: KeyEvent) -> (bool, ViewAction) {
         return (true, ViewAction::None);
     }
 
+    // Project switcher overlay: handle navigation and selection
+    if app.overlay == Some(Overlay::ProjectSwitcher) {
+        let action = handle_project_switcher_key(app, key);
+        return (true, action);
+    }
+
     match key.code {
         // Quit (only when no overlay is open)
         KeyCode::Char('q') if !app.has_overlay() => {
@@ -133,10 +143,7 @@ pub fn handle_key_event(app: &mut App, key: KeyEvent) -> (bool, ViewAction) {
             app.toggle_overlay(Overlay::Help);
             (true, ViewAction::None)
         }
-        KeyCode::Char('p') if !app.has_overlay() => {
-            app.toggle_overlay(Overlay::ProjectSwitcher);
-            (true, ViewAction::None)
-        }
+        KeyCode::Char('p') if !app.has_overlay() => (true, ViewAction::ProjectSwitcherOpen),
         KeyCode::Char('/') if !app.has_overlay() => {
             app.toggle_overlay(Overlay::Filter);
             (true, ViewAction::None)
@@ -181,6 +188,34 @@ pub fn handle_key_event(app: &mut App, key: KeyEvent) -> (bool, ViewAction) {
         }
 
         _ => (true, ViewAction::None),
+    }
+}
+
+/// Handle key events in the project switcher overlay.
+fn handle_project_switcher_key(app: &mut App, key: KeyEvent) -> ViewAction {
+    let switcher = match &mut app.project_switcher {
+        Some(s) => s,
+        None => return ViewAction::None,
+    };
+
+    match key.code {
+        KeyCode::Char('j') | KeyCode::Down => {
+            switcher.select_next();
+            ViewAction::None
+        }
+        KeyCode::Char('k') | KeyCode::Up => {
+            switcher.select_prev();
+            ViewAction::None
+        }
+        KeyCode::Enter => {
+            if let Some(project) = switcher.selected_project() {
+                let name = project.name.clone();
+                ViewAction::ProjectSelect(name)
+            } else {
+                ViewAction::None
+            }
+        }
+        _ => ViewAction::None,
     }
 }
 
@@ -807,8 +842,9 @@ mod tests {
     #[test]
     fn test_p_opens_project_switcher() {
         let mut app = App::new("test".to_string());
-        handle_key_event(&mut app, make_key(KeyCode::Char('p')));
-        assert_eq!(app.overlay, Some(Overlay::ProjectSwitcher));
+        let (cont, action) = handle_key_event(&mut app, make_key(KeyCode::Char('p')));
+        assert!(cont);
+        assert_eq!(action, ViewAction::ProjectSwitcherOpen);
     }
 
     #[test]
