@@ -450,9 +450,16 @@ Started: Sat Feb  7 03:49:10 PM MSK 2026
   - DaemonError uses #[from] for NflowError, rusqlite::Error, std::io::Error — automatic conversion with ?
   - CliError uses String for Db since CLI doesn't directly use rusqlite (communicates via socket)
 - SessionTracker is in-memory (HashMap<Uuid, String>) — daemon loads from DB, persists back after Claude invocations
+- Prompt templates live in `prompts/` at workspace root, embedded via `include_str!("../../../prompts/{name}.md")` from nflow-claude/src/
+- load_template checks override_dir first (user's ~/.nflow/prompts/), falls back to embedded
+- render_template uses char-by-char parser: `{lowercase_digits_underscores}` = variable, anything else in braces = literal
+- ClaudeError has TemplateNotFound and UnresolvedVariable variants for template errors
+- tempfile crate is a dev-dependency of nflow-claude for testing file overrides
 - nflow-claude needs tokio features: process, io-util, fs, macros, rt-multi-thread (macros+rt for #[tokio::test])
 - ClaudeError is nflow-claude's error type (BinaryNotFound, SpawnFailed, ProcessExited, Io) — in crate::error
 - Use `echo` as a test stand-in for claude binary — validates arg passing via piped stdout
+- Context builders return HashMap<String, String> — caller converts to &str refs for render_template
+- build_verify_context uses impl_task's title/description/AC, not verify_task's auto-generated ones
 - tokio::process::Command + Stdio::piped for stdout/stderr + Stdio::null for stdin
 - Lines<BufReader<ChildStdout>> for line-by-line async streaming from spawned process
 ---
@@ -562,4 +569,57 @@ Started: Sat Feb  7 03:49:10 PM MSK 2026
   - start_session() is read-only (&self) — it just returns the existing session ID for the --resume flag
   - uuid crate needs to be added to nflow-claude's own Cargo.toml (it's not transitively available from nflow-core)
   - cargo fmt expands assert_eq! with Some("long-string".into()) to multi-line format
+---
+
+## 2026-02-07 - US-022
+- What was implemented: Prompt template loader and renderer in nflow-claude
+  - 5 prompt template files in prompts/: spec_session.md, decompose.md, task_execution.md, verify_task.md, mr_body.md
+  - Templates embedded via include_str! at compile time
+  - load_template(name, override_dir) — checks override dir first, falls back to embedded, errors on unknown names
+  - render_template(template, vars) — char-by-char parser substituting {variable} placeholders
+  - Variable pattern: {lowercase_letters_digits_underscores} — anything else in braces is treated as literal
+  - Errors on unresolved variables (missing from vars map), ignores non-variable brace content
+  - Added TemplateNotFound and UnresolvedVariable variants to ClaudeError
+  - Added tempfile as dev-dependency for file override tests
+  - 28 new tests (438 total) covering all acceptance criteria
+- Files changed:
+  - prompts/spec_session.md (new — spec session template)
+  - prompts/decompose.md (new — decomposition template)
+  - prompts/task_execution.md (new — task execution template)
+  - prompts/verify_task.md (new — verify task template)
+  - prompts/mr_body.md (new — merge request body template)
+  - crates/nflow-claude/Cargo.toml (added tempfile dev-dependency)
+  - crates/nflow-claude/src/error.rs (added TemplateNotFound, UnresolvedVariable variants)
+  - crates/nflow-claude/src/prompt.rs (full prompt template loader and renderer with tests)
+- **Learnings for future iterations:**
+  - include_str! path from crates/nflow-claude/src/ to workspace root prompts/ is "../../../prompts/"
+  - Empty braces {} need special handling in the parser (found_close=true but var_name empty → output as-is)
+  - Variable name pattern [a-z0-9_]+ means uppercase, spaces, special chars in braces are treated as literals
+  - tempfile crate is only needed as dev-dependency for testing file-based override functionality
+  - cargo fmt collapses render_template signature to single line when args fit
+---
+
+## 2026-02-07 - US-023
+- What was implemented: Prompt context generation in nflow-claude
+  - build_task_context(task, project_name, completed_tasks, previous_error) -> HashMap for task_execution.md
+  - build_verify_context(verify_task, impl_task, project_name) -> HashMap for verify_task.md
+  - build_mr_context(story, tasks, project) -> HashMap for mr_body.md
+  - build_spec_context(spec, project) -> HashMap for spec_session.md
+  - build_decompose_prompt(specs) -> String concatenates spec file contents with name headers and separators
+  - format_completed_tasks: `- [{short_id}] {title}: {commit_hash}` (filters impl+done only)
+  - format_tasks_list: `- {commit_hash} {title}` or `- [SKIPPED] {title}` (filters impl tasks only)
+  - previous_error included only on retry (formatted as "## Previous Error" section)
+  - completed_tasks appended to task_description as "## Completed Tasks" section
+  - 23 new tests (461 total) covering all acceptance criteria
+- Files changed:
+  - crates/nflow-claude/Cargo.toml (added chrono dev-dependency)
+  - crates/nflow-claude/src/lib.rs (added context module)
+  - crates/nflow-claude/src/context.rs (new — full prompt context generation with tests)
+- **Learnings for future iterations:**
+  - chrono is needed as a dev-dependency for constructing Project structs in tests (timestamps)
+  - Context builders return HashMap<String, String> (owned) — caller converts to HashMap<&str, &str> for render_template
+  - build_verify_context uses impl_task's title/description/AC (not verify_task's) since verify checks the impl
+  - format_tasks_list and format_completed_tasks filter for TaskKind::Impl only — verify tasks are excluded from display
+  - build_decompose_prompt takes &[(Spec, String)] — caller is responsible for reading spec files from disk
+  - cargo fmt collapses single-arg Spec::new to single line but expands 3-arg to multi-line
 ---
