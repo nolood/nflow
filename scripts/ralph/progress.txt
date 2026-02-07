@@ -72,6 +72,8 @@
 - CliError wraps: Core(NflowError), Io, Db(String), Git, Claude, Socket — in nflow-cli/src/error.rs
 - RunConfig presets use `..Self::base(prompt)` struct update syntax for DRY construction
 - for_decompose takes working_dir as param (caller decides project root vs specs dir based on with_codebase)
+- StreamEvent uses flat union pattern: one RawEvent struct with all-optional fields, dispatch on `type` field
+- Use `printf` in async tokio tests for piping multi-line content to child stdout (echo doesn't handle \n in args)
 
 # Ralph Progress Log
 Started: Sat Feb  7 03:49:10 PM MSK 2026
@@ -494,4 +496,25 @@ Started: Sat Feb  7 03:49:10 PM MSK 2026
   - cargo fmt collapses short vec![] with 3 items to single line (e.g., Read, Glob, Grep) — don't fight it
   - for_decompose takes working_dir as parameter since caller decides project root vs specs dir
   - Verify task explicitly excludes Write/Edit — test for absence of these tools validates the security boundary
+---
+
+## 2026-02-07 - US-019
+- What was implemented: Stream-JSON parser in nflow-claude
+  - StreamEvent enum with 6 variants: TextDelta, ToolUse, ToolResult, Result, Error, ParseError
+  - parse_line() function: parses a single JSON line into a typed StreamEvent
+  - StreamParser struct: async line-by-line reader from ChildStdout, tracks last session_id
+  - StreamParser::next_event() reads lines one at a time, no memory buffering
+  - AskUserQuestion detection via StreamEvent::is_ask_user_question() method
+  - Session ID extraction via StreamEvent::session_id() and StreamParser::session_id()
+  - Handles malformed JSON gracefully (emits ParseError, does not crash)
+  - Handles empty/whitespace-only lines, unknown event types, missing fields
+  - 27 new tests (391 total) covering all event types, edge cases, and async integration
+- Files changed:
+  - crates/nflow-claude/src/stream.rs (full stream-json parser with tests)
+- **Learnings for future iterations:**
+  - AsyncBufReadExt import needed only in test module (for `.lines()` on BufReader) — keep out of main code to avoid clippy warning
+  - Use `printf` (not `echo`) to pipe multi-line JSON in async tests — printf handles embedded newlines correctly
+  - RawEvent struct with all-optional fields + serde handles the flat JSON union type pattern cleanly
+  - serde_json::Value for tool_use input preserves arbitrary JSON without schema knowledge
+  - ToolResult content can be String or arbitrary JSON — match on Value::String vs stringify others
 ---
