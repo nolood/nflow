@@ -58,6 +58,8 @@ fn dispatch(req: Request, state: &HandlerState) -> HandlerResult {
         "exec.retry" => HandlerResult::Single(handle_exec_retry(req, state)),
         "exec.skip" => HandlerResult::Single(handle_exec_skip(req, state)),
         "exec.continue" => HandlerResult::Single(handle_exec_continue(req, state)),
+        "exec.stop" => HandlerResult::Single(handle_exec_stop(req, state)),
+        "exec.cancel" => HandlerResult::Single(handle_exec_cancel(req, state)),
         _ => HandlerResult::Single(Response::error(
             req.id,
             &format!("unknown command: {}", req.command),
@@ -4104,6 +4106,430 @@ fn handle_continue_cancelled_story(
                 "resumed": false,
             }),
         )
+    }
+}
+
+/// Handle "exec.stop" command.
+///
+/// Stops running stories by sending SIGTERM to their agent processes.
+///
+/// Params:
+///   - story_id (optional): wave-prefixed short ID like "W1-S1" to stop a single story
+///   - wave (optional): wave number to stop all running stories in that wave
+///   - project_name (optional): required when no story_id or wave is given; stops all agents in that project
+///   - all (optional bool): stop all running agents across all projects
+fn handle_exec_stop(req: Request, state: &HandlerState) -> Response {
+    let id = req.id.clone();
+
+    let story_id_str: Option<String> = req
+        .params
+        .get("story_id")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    let wave_filter: Option<u32> = req
+        .params
+        .get("wave")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as u32);
+
+    let project_name: Option<String> = req
+        .params
+        .get("project_name")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    let stop_all = req
+        .params
+        .get("all")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    let conn = match db::open_connection(&state.db_path) {
+        Ok(c) => c,
+        Err(e) => return Response::error(id, &format!("database error: {}", e)),
+    };
+
+    // Case 1: --all flag — stop all running agents across all projects
+    if stop_all {
+        let running = match db::agent_runs::find_running_agent_runs(&conn) {
+            Ok(r) => r,
+            Err(e) => return Response::error(id, &format!("database error: {}", e)),
+        };
+
+        let mut stopped_count = 0u32;
+        let mut story_ids_stopped = std::collections::HashSet::new();
+
+        for run in &running {
+            // Send SIGTERM to the agent process
+            if let Some(pid) = run.pid {
+                terminate_agent_process_sigterm(pid);
+            }
+            // Mark agent run as cancelled in DB
+            let _ = db::agent_runs::update_agent_run_status(
+                &conn,
+                &run.id,
+                db::agent_runs::AgentRunStatus::Cancelled,
+                None,
+                Some("stopped by user"),
+                Some(chrono::Utc::now()),
+            );
+            // Mark the task as failed
+            let _ = db::work_items::update_work_item_status(
+                &conn,
+                &run.work_item_id,
+                WorkItemStatus::Failed,
+            );
+            stopped_count += 1;
+
+            // Find parent story to cancel
+            if let Ok(Some(task)) = db::work_items::get_work_item_by_id(&conn, &run.work_item_id) {
+                if let Some(parent_id) = task.parent_id {
+                    story_ids_stopped.insert(parent_id);
+                }
+            }
+        }
+
+        // Cancel all stories that had running agents
+        for story_id in &story_ids_stopped {
+            let _ =
+                db::work_items::update_work_item_status(&conn, story_id, WorkItemStatus::Cancelled);
+            // Cancel pending tasks in those stories
+            cancel_pending_tasks_in_story(&conn, story_id);
+        }
+
+        return Response::ok(
+            id,
+            serde_json::json!({
+                "agents_stopped": stopped_count,
+                "stories_cancelled": story_ids_stopped.len(),
+            }),
+        );
+    }
+
+    // Case 2: Single story by story_id
+    if let Some(ref story_id_str) = story_id_str {
+        let story = match db::work_items::find_work_item_by_wave_short_id(&conn, story_id_str) {
+            Ok(Some(s)) => s,
+            Ok(None) => {
+                return Response::error(
+                    id,
+                    &format!("NOT_FOUND: story '{}' not found", story_id_str),
+                )
+            }
+            Err(e) => return Response::error(id, &format!("database error: {}", e)),
+        };
+
+        if story.item_type != ItemType::Story {
+            return Response::error(
+                id,
+                &format!("INVALID_PARAMS: '{}' is not a story", story_id_str),
+            );
+        }
+
+        if story.status != WorkItemStatus::InProgress && story.status != WorkItemStatus::Ready {
+            return Response::error(
+                id,
+                &format!(
+                    "INVALID_STATE: story '{}' is in '{}' state, expected 'in_progress' or 'ready'",
+                    story_id_str, story.status
+                ),
+            );
+        }
+
+        let stopped = stop_story_agents(&conn, &story);
+
+        return Response::ok(
+            id,
+            serde_json::json!({
+                "story_id": story_id_str,
+                "agents_stopped": stopped,
+            }),
+        );
+    }
+
+    // Case 3: Wave-level stop — requires project_name
+    if let Some(wave) = wave_filter {
+        let project_name = match project_name {
+            Some(n) => n,
+            None => {
+                return Response::error(
+                    id,
+                    "missing required parameter: project_name (required with --wave)",
+                )
+            }
+        };
+
+        let project = match db::projects::get_project_by_name(&conn, &project_name) {
+            Ok(Some(p)) => p,
+            Ok(None) => {
+                return Response::error(
+                    id,
+                    &format!("NOT_FOUND: project '{}' not found", project_name),
+                )
+            }
+            Err(e) => return Response::error(id, &format!("database error: {}", e)),
+        };
+
+        let session =
+            match db::decomposition_sessions::get_session_by_wave(&conn, &project.id, wave) {
+                Ok(Some(s)) => s,
+                Ok(None) => {
+                    return Response::error(id, &format!("NOT_FOUND: wave W{} not found", wave))
+                }
+                Err(e) => return Response::error(id, &format!("database error: {}", e)),
+            };
+
+        let stories = match db::work_items::list_stories_by_session(&conn, &session.id) {
+            Ok(s) => s,
+            Err(e) => return Response::error(id, &format!("database error: {}", e)),
+        };
+
+        let mut total_stopped = 0u32;
+        let mut stories_cancelled = 0u32;
+
+        for story in &stories {
+            if story.status == WorkItemStatus::InProgress {
+                let stopped = stop_story_agents(&conn, story);
+                total_stopped += stopped;
+                stories_cancelled += 1;
+            }
+        }
+
+        return Response::ok(
+            id,
+            serde_json::json!({
+                "wave": wave,
+                "agents_stopped": total_stopped,
+                "stories_cancelled": stories_cancelled,
+            }),
+        );
+    }
+
+    // Case 4: Project-level stop — all running agents in a single project
+    let project_name =
+        match project_name {
+            Some(n) => n,
+            None => return Response::error(
+                id,
+                "missing required parameter: project_name (or provide story_id, --wave, or --all)",
+            ),
+        };
+
+    let project = match db::projects::get_project_by_name(&conn, &project_name) {
+        Ok(Some(p)) => p,
+        Ok(None) => {
+            return Response::error(
+                id,
+                &format!("NOT_FOUND: project '{}' not found", project_name),
+            )
+        }
+        Err(e) => return Response::error(id, &format!("database error: {}", e)),
+    };
+
+    let running = match db::agent_runs::find_running_agent_runs_by_project(&conn, &project.id) {
+        Ok(r) => r,
+        Err(e) => return Response::error(id, &format!("database error: {}", e)),
+    };
+
+    let mut stopped_count = 0u32;
+    let mut story_ids_stopped = std::collections::HashSet::new();
+
+    for run in &running {
+        if let Some(pid) = run.pid {
+            terminate_agent_process_sigterm(pid);
+        }
+        let _ = db::agent_runs::update_agent_run_status(
+            &conn,
+            &run.id,
+            db::agent_runs::AgentRunStatus::Cancelled,
+            None,
+            Some("stopped by user"),
+            Some(chrono::Utc::now()),
+        );
+        let _ = db::work_items::update_work_item_status(
+            &conn,
+            &run.work_item_id,
+            WorkItemStatus::Failed,
+        );
+        stopped_count += 1;
+
+        if let Ok(Some(task)) = db::work_items::get_work_item_by_id(&conn, &run.work_item_id) {
+            if let Some(parent_id) = task.parent_id {
+                story_ids_stopped.insert(parent_id);
+            }
+        }
+    }
+
+    for story_id in &story_ids_stopped {
+        let _ = db::work_items::update_work_item_status(&conn, story_id, WorkItemStatus::Cancelled);
+        cancel_pending_tasks_in_story(&conn, story_id);
+    }
+
+    Response::ok(
+        id,
+        serde_json::json!({
+            "agents_stopped": stopped_count,
+            "stories_cancelled": story_ids_stopped.len(),
+        }),
+    )
+}
+
+/// Handle "exec.cancel" command.
+///
+/// Cancels a pending or ready story (no process termination needed).
+/// Warns if the cancelled story has dependents that will be blocked.
+///
+/// Params: story_id (required, wave-prefixed like "W1-S1")
+fn handle_exec_cancel(req: Request, state: &HandlerState) -> Response {
+    let id = req.id.clone();
+
+    let story_id_str = match req.params.get("story_id").and_then(|v| v.as_str()) {
+        Some(s) => s.to_string(),
+        None => return Response::error(id, "missing required parameter: story_id"),
+    };
+
+    let conn = match db::open_connection(&state.db_path) {
+        Ok(c) => c,
+        Err(e) => return Response::error(id, &format!("database error: {}", e)),
+    };
+
+    // 1. Find the story by wave-prefixed short ID
+    let story = match db::work_items::find_work_item_by_wave_short_id(&conn, &story_id_str) {
+        Ok(Some(s)) => s,
+        Ok(None) => {
+            return Response::error(
+                id,
+                &format!("NOT_FOUND: story '{}' not found", story_id_str),
+            )
+        }
+        Err(e) => return Response::error(id, &format!("database error: {}", e)),
+    };
+
+    // Validate it's a story
+    if story.item_type != ItemType::Story {
+        return Response::error(
+            id,
+            &format!("INVALID_PARAMS: '{}' is not a story", story_id_str),
+        );
+    }
+
+    // 2. Validate story is in pending or ready state
+    if story.status != WorkItemStatus::Pending && story.status != WorkItemStatus::Ready {
+        return Response::error(
+            id,
+            &format!(
+                "INVALID_STATE: story '{}' is in '{}' state, expected 'pending' or 'ready'",
+                story_id_str, story.status
+            ),
+        );
+    }
+
+    // 3. Check for dependents and warn
+    let dependents = match db::work_items::list_dependents_of_story(&conn, &story.id) {
+        Ok(d) => d,
+        Err(e) => return Response::error(id, &format!("database error: {}", e)),
+    };
+
+    let has_dependents = !dependents.is_empty();
+
+    // 4. Cancel the story
+    if let Err(e) =
+        db::work_items::update_work_item_status(&conn, &story.id, WorkItemStatus::Cancelled)
+    {
+        return Response::error(id, &format!("database error: {}", e));
+    }
+
+    // Cancel all pending tasks in the story
+    cancel_pending_tasks_in_story(&conn, &story.id);
+
+    let mut data = serde_json::json!({
+        "story_id": story_id_str,
+        "cancelled": true,
+    });
+
+    if has_dependents {
+        let dependent_ids: Vec<String> = dependents
+            .iter()
+            .filter_map(|dep| {
+                db::work_items::get_work_item_by_id(&conn, &dep.blocked_id)
+                    .ok()
+                    .flatten()
+                    .map(|w| w.short_id)
+            })
+            .collect();
+        data["warning"] = serde_json::json!(format!(
+            "story has {} dependent(s) that will be blocked: {}",
+            dependents.len(),
+            dependent_ids.join(", ")
+        ));
+        data["blocked_dependents"] = serde_json::json!(dependent_ids);
+    }
+
+    Response::ok(id, data)
+}
+
+/// Send SIGTERM to an agent process (no wait, no escalation to SIGKILL).
+/// Used by exec.stop handler for immediate termination signal.
+fn terminate_agent_process_sigterm(pid: u32) {
+    let nix_pid = nix::unistd::Pid::from_raw(pid as i32);
+    match nix::sys::signal::kill(nix_pid, nix::sys::signal::Signal::SIGTERM) {
+        Ok(()) => {}
+        Err(nix::errno::Errno::ESRCH) => {} // already dead
+        Err(_) => {}
+    }
+}
+
+/// Stop all running agents for a story, cancel the story, and cancel pending tasks.
+/// Returns the number of agents that were stopped.
+fn stop_story_agents(conn: &rusqlite::Connection, story: &WorkItem) -> u32 {
+    let running = match db::agent_runs::find_running_agent_runs_for_story(conn, &story.id) {
+        Ok(r) => r,
+        Err(_) => return 0,
+    };
+
+    let mut stopped = 0u32;
+    for run in &running {
+        if let Some(pid) = run.pid {
+            terminate_agent_process_sigterm(pid);
+        }
+        let _ = db::agent_runs::update_agent_run_status(
+            conn,
+            &run.id,
+            db::agent_runs::AgentRunStatus::Cancelled,
+            None,
+            Some("stopped by user"),
+            Some(chrono::Utc::now()),
+        );
+        let _ = db::work_items::update_work_item_status(
+            conn,
+            &run.work_item_id,
+            WorkItemStatus::Failed,
+        );
+        stopped += 1;
+    }
+
+    // Cancel the story
+    let _ = db::work_items::update_work_item_status(conn, &story.id, WorkItemStatus::Cancelled);
+
+    // Cancel pending tasks in the story
+    cancel_pending_tasks_in_story(conn, &story.id);
+
+    stopped
+}
+
+/// Cancel all pending tasks in a story.
+fn cancel_pending_tasks_in_story(conn: &rusqlite::Connection, story_id: &uuid::Uuid) {
+    if let Ok(tasks) = db::work_items::list_work_items_by_parent(conn, story_id) {
+        for task in &tasks {
+            if task.item_type == ItemType::Task && task.status == WorkItemStatus::Pending {
+                let _ = db::work_items::update_work_item_status(
+                    conn,
+                    &task.id,
+                    WorkItemStatus::Cancelled,
+                );
+            }
+        }
     }
 }
 

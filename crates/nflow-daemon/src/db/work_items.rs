@@ -412,6 +412,20 @@ fn parse_wave_prefix(wave_short_id: &str) -> Option<(u32, &str)> {
     Some((wave_number, short_id))
 }
 
+/// List all stories in a specific session (wave).
+pub fn list_stories_by_session(conn: &Connection, session_id: &Uuid) -> Result<Vec<WorkItem>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, parent_id, decomposition_session_id, item_type, kind, title, description, acceptance_criteria, status, short_id, sort_order, branch_name, worktree_path, mr_url, commit_hash, created_at, updated_at
+         FROM work_items WHERE decomposition_session_id = ?1 AND item_type = 'story' ORDER BY sort_order",
+    )?;
+    let rows = stmt.query_map(params![session_id.to_string()], row_to_work_item)?;
+    let mut items = Vec::new();
+    for row in rows {
+        items.push(row?);
+    }
+    Ok(items)
+}
+
 /// Cancel all in-progress work items for a project.
 /// Returns the number of items cancelled.
 pub fn cancel_in_progress_items_by_project(conn: &Connection, project_id: &Uuid) -> Result<u64> {
