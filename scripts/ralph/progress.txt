@@ -36,6 +36,9 @@
 - DecompositionStatus is separate from scheduler::SessionStatus — scheduler uses its own lightweight enum
 - discard_session() is a free function that orchestrates session.discard() + work item collection + spec freeing
 - next_wave_number() takes &[u32] slice of existing wave numbers — pure computation
+- Config uses PartialConfig (all-optional) for layered merging: defaults → global toml → per-project toml → env vars
+- partial_config_from_env() takes &[(&str, &str)] to keep nflow-core IO-free — caller reads actual env vars
+- render_branch_template() supports {project}, {story_id}, {story_slug} variable substitution
 
 # Ralph Progress Log
 Started: Sat Feb  7 03:49:10 PM MSK 2026
@@ -226,4 +229,25 @@ Started: Sat Feb  7 03:49:10 PM MSK 2026
   - discard_session() is a free function, not a method — it needs mutable access to session, work_items, and specs simultaneously
   - next_wave_number() takes a slice of existing wave numbers — caller is responsible for querying storage
   - cargo fmt collapses short multi-arg constructor calls (WorkItem::new_epic) to single lines
+---
+
+## 2026-02-07 - US-010
+- What was implemented: Config model and layered merging in nflow-core
+  - Config struct with 10 fields: max_parallel, git_provider, base_branch, cleanup_worktrees, max_turns_per_task, auto_execute, max_time_per_task, log_level, branch_template, worktree_dir
+  - Default trait impl with all specified default values
+  - PartialConfig struct with all-optional fields for overlay merging
+  - merge(base, overlay) function — overlay fields override base when present
+  - resolve(global, project, env) function — chains merges: defaults → global → per-project → env vars
+  - partial_config_from_env(vars) — pure env var mapping (NFLOW_MAX_PARALLEL, NFLOW_LOG_LEVEL), takes &[(&str, &str)] to avoid IO
+  - validate(config) — checks max_parallel > 0, max_time_per_task > 0, git_provider in ['github', 'gitlab']
+  - render_branch_template() — substitutes {project}, {story_id}, {story_slug} variables
+  - 22 new tests (244 total) covering all acceptance criteria
+- Files changed:
+  - crates/nflow-core/src/config.rs (full config module with merging, validation, template rendering, tests)
+- **Learnings for future iterations:**
+  - Config uses String for git_provider (not enum) since validation is separate from data model
+  - PartialConfig derives Default for easy `..Default::default()` in tests
+  - partial_config_from_env takes &[(&str, &str)] slice to keep nflow-core IO-free — caller reads actual env vars
+  - cargo fmt breaks long unwrap_or chains to multi-line for max_turns_per_task (field name too long)
+  - resolve() is the main entry point for full config resolution — compose all layers in one call
 ---
