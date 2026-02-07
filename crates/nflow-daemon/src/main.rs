@@ -74,15 +74,12 @@ async fn main() {
                     Err(_) => continue,
                 };
 
-                // Run scheduler tick (synchronous — serialized on main task)
-                let actions = scheduler_loop::scheduler_tick(&conn);
+                // Run scheduler tick with reaping (synchronous — serialized on main task)
+                let actions = scheduler_loop::scheduler_tick(&conn, None);
 
                 if !actions.is_empty() {
                     debug!("scheduler: {} actions produced this tick", actions.len());
                 }
-
-                // Action execution will be implemented in future stories (US-053+).
-                // For now, the scheduler only logs actions at DEBUG level.
             }
 
             eprintln!("nflow-daemon shutting down gracefully...");

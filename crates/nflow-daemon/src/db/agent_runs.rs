@@ -172,6 +172,15 @@ pub fn cancel_running_agent_runs_by_project(conn: &Connection, project_id: &Uuid
     Ok(changed as u64)
 }
 
+/// Update the Claude session_id on an agent run (stored after parsing stream output).
+pub fn update_agent_run_session_id(conn: &Connection, id: &Uuid, session_id: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE agent_runs SET session_id = ?1 WHERE id = ?2",
+        params![session_id, id.to_string()],
+    )?;
+    Ok(())
+}
+
 pub fn count_agent_runs_for_task(conn: &Connection, work_item_id: &Uuid) -> Result<u32> {
     let count: u32 = conn.query_row(
         "SELECT COUNT(*) FROM agent_runs WHERE work_item_id = ?1",
