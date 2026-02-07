@@ -31,6 +31,8 @@
 - TUI uses crossterm::event::poll() for non-blocking input (16ms timeout ≈ 60fps), not tokio async events
 - TUI terminal setup/restore pattern: setup() enters raw mode + alternate screen, restore() undoes both — always call restore on exit
 - nix crate for TUI needs features = ["signal", "process", "fs"] (fs for Flock/FlockArg)
+- TUI overlay pattern: Overlay enum + App.toggle_overlay()/close_overlay()/has_overlay(); Esc closes any overlay; navigation keys guarded with `if !app.has_overlay()`
+- centered_rect(percent_x, percent_y, area) computes a centered Rect for popup overlays; use Clear widget before rendering popup
 - Story completion lifecycle: rebase → push → MR creation → DB update → worktree cleanup → event broadcast (all in execute_complete_story)
 - On any failure during story completion (rebase/push/MR), story is rolled back to Failed status via fail_story_on_completion_error()
 - Wall-clock timeout: check_agent_timeouts() runs as Phase 0.5 in scheduler_tick (after reaping, before scheduling). Uses nix SIGTERM→sleep(10s)→SIGKILL pattern.
@@ -1898,4 +1900,30 @@ Started: Sat Feb  7 03:49:10 PM MSK 2026
   - crossterm::event::poll() is synchronous/blocking for the given duration — use short timeout (16ms) in async event loop
   - ratatui 0.29 uses Tabs::new(Vec<Line>) — each tab title is a Line of styled Spans
   - Terminal restore must happen even on error — structure with setup → result = event_loop → restore → result pattern
+---
+
+## 2026-02-08 - US-075
+- What was implemented: TUI global navigation with overlays and enhanced status bar
+  - Overlay system: `Overlay` enum (Help, ProjectSwitcher, Filter) with toggle/close semantics
+  - Key handlers: `?` toggles help overlay, `p` opens project switcher, `/` opens filter
+  - Escape key closes any active overlay
+  - Navigation keys (1-4, Tab, q) blocked when overlay is open (except `?` which always toggles help)
+  - Status bar enhanced: current wave number (cyan), active agent count (green when >0, gray when 0)
+  - Status bar keyboard hints updated: "q:quit ?:help p:project /:filter Tab:next"
+  - Help overlay: centered popup with full keybinding reference
+  - Project switcher and filter overlays: placeholders for future implementation
+  - `centered_rect()` utility for rendering centered popup areas
+  - App state extended: `overlay`, `current_wave`, `active_agent_count` fields
+  - `connect()` method now parses `current_wave` and `active_agents` from daemon status response
+  - 10 new tests (24 total): overlay toggle/switch/close, key blocking with overlay, escape handling
+- Files changed:
+  - crates/nflow-tui/src/app.rs (Overlay enum, new App fields, toggle/close methods, enhanced connect, tests)
+  - crates/nflow-tui/src/event.rs (?, p, / key handlers, Esc closes overlay, overlay-aware navigation blocking, tests)
+  - crates/nflow-tui/src/ui.rs (enhanced status bar with wave/agents, overlay rendering, centered_rect helper)
+- **Learnings for future iterations:**
+  - Use `if !app.has_overlay()` guards on match arms to block navigation when overlays are open
+  - ratatui `Clear` widget erases area before rendering overlay popup — prevents background bleed-through
+  - `Wrap { trim: false }` needed for help overlay text to not trim leading whitespace
+  - Overlay toggle pattern: same overlay → close, different overlay → switch to new one
+  - `?` key works even with overlay open (always toggles help), but `p` and `/` are blocked by overlays
 ---

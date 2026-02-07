@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 
-use crate::app::{App, View};
+use crate::app::{App, Overlay, View};
 
 /// Poll for a crossterm event with the given timeout.
 ///
@@ -23,33 +23,53 @@ pub fn handle_key_event(app: &mut App, key: KeyEvent) -> bool {
         return false;
     }
 
+    // Escape closes any open overlay
+    if key.code == KeyCode::Esc && app.has_overlay() {
+        app.close_overlay();
+        return true;
+    }
+
     match key.code {
-        // Quit
-        KeyCode::Char('q') => {
+        // Quit (only when no overlay is open)
+        KeyCode::Char('q') if !app.has_overlay() => {
             app.should_quit = true;
             false
         }
 
-        // View switching by number
-        KeyCode::Char('1') => {
+        // Overlay toggles (global — work from anywhere)
+        KeyCode::Char('?') => {
+            app.toggle_overlay(Overlay::Help);
+            true
+        }
+        KeyCode::Char('p') if !app.has_overlay() => {
+            app.toggle_overlay(Overlay::ProjectSwitcher);
+            true
+        }
+        KeyCode::Char('/') if !app.has_overlay() => {
+            app.toggle_overlay(Overlay::Filter);
+            true
+        }
+
+        // View switching by number (only when no overlay)
+        KeyCode::Char('1') if !app.has_overlay() => {
             app.switch_view(View::Specs);
             true
         }
-        KeyCode::Char('2') => {
+        KeyCode::Char('2') if !app.has_overlay() => {
             app.switch_view(View::Plan);
             true
         }
-        KeyCode::Char('3') => {
+        KeyCode::Char('3') if !app.has_overlay() => {
             app.switch_view(View::Execute);
             true
         }
-        KeyCode::Char('4') => {
+        KeyCode::Char('4') if !app.has_overlay() => {
             app.switch_view(View::Logs);
             true
         }
 
-        // Tab/Shift+Tab for view cycling
-        KeyCode::Tab => {
+        // Tab/Shift+Tab for view cycling (only when no overlay)
+        KeyCode::Tab if !app.has_overlay() => {
             if key.modifiers.contains(KeyModifiers::SHIFT) {
                 app.prev_view();
             } else {
@@ -57,7 +77,7 @@ pub fn handle_key_event(app: &mut App, key: KeyEvent) -> bool {
             }
             true
         }
-        KeyCode::BackTab => {
+        KeyCode::BackTab if !app.has_overlay() => {
             app.prev_view();
             true
         }
@@ -141,5 +161,62 @@ mod tests {
         let cont = handle_key_event(&mut app, make_key(KeyCode::Char('x')));
         assert!(cont);
         assert!(!app.should_quit);
+    }
+
+    #[test]
+    fn test_question_mark_toggles_help() {
+        let mut app = App::new("test".to_string());
+        assert_eq!(app.overlay, None);
+
+        handle_key_event(&mut app, make_key(KeyCode::Char('?')));
+        assert_eq!(app.overlay, Some(Overlay::Help));
+
+        handle_key_event(&mut app, make_key(KeyCode::Char('?')));
+        assert_eq!(app.overlay, None);
+    }
+
+    #[test]
+    fn test_p_opens_project_switcher() {
+        let mut app = App::new("test".to_string());
+        handle_key_event(&mut app, make_key(KeyCode::Char('p')));
+        assert_eq!(app.overlay, Some(Overlay::ProjectSwitcher));
+    }
+
+    #[test]
+    fn test_slash_opens_filter() {
+        let mut app = App::new("test".to_string());
+        handle_key_event(&mut app, make_key(KeyCode::Char('/')));
+        assert_eq!(app.overlay, Some(Overlay::Filter));
+    }
+
+    #[test]
+    fn test_escape_closes_overlay() {
+        let mut app = App::new("test".to_string());
+        app.toggle_overlay(Overlay::Help);
+        assert!(app.has_overlay());
+
+        let cont = handle_key_event(&mut app, make_key(KeyCode::Esc));
+        assert!(cont);
+        assert!(!app.has_overlay());
+    }
+
+    #[test]
+    fn test_q_does_not_quit_with_overlay() {
+        let mut app = App::new("test".to_string());
+        app.toggle_overlay(Overlay::Help);
+
+        let cont = handle_key_event(&mut app, make_key(KeyCode::Char('q')));
+        assert!(cont);
+        assert!(!app.should_quit);
+    }
+
+    #[test]
+    fn test_number_keys_blocked_with_overlay() {
+        let mut app = App::new("test".to_string());
+        app.toggle_overlay(Overlay::Help);
+
+        handle_key_event(&mut app, make_key(KeyCode::Char('2')));
+        // View should not change when overlay is open
+        assert_eq!(app.current_view, View::Specs);
     }
 }

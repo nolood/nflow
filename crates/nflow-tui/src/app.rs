@@ -1,6 +1,14 @@
 use crate::error::Result;
 use crate::socket_client::{ResponseStatus, SocketClient};
 
+/// Overlay that can be displayed on top of the current view.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Overlay {
+    Help,
+    ProjectSwitcher,
+    Filter,
+}
+
 /// The active view in the TUI.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum View {
@@ -74,6 +82,12 @@ pub struct App {
     pub should_quit: bool,
     /// Status message for the status bar.
     pub status_message: String,
+    /// Currently active overlay (if any).
+    pub overlay: Option<Overlay>,
+    /// Current wave number (from daemon status).
+    pub current_wave: Option<u32>,
+    /// Number of active agents (from daemon status).
+    pub active_agent_count: u32,
 }
 
 impl App {
@@ -85,6 +99,9 @@ impl App {
             daemon_state: DaemonState::Disconnected,
             should_quit: false,
             status_message: String::new(),
+            overlay: None,
+            current_wave: None,
+            active_agent_count: 0,
         }
     }
 
@@ -123,6 +140,26 @@ impl App {
         self.status_message = message.to_string();
     }
 
+    /// Toggle an overlay. If the same overlay is already open, close it.
+    /// If a different overlay is open, switch to the new one.
+    pub fn toggle_overlay(&mut self, overlay: Overlay) {
+        if self.overlay == Some(overlay) {
+            self.overlay = None;
+        } else {
+            self.overlay = Some(overlay);
+        }
+    }
+
+    /// Close any open overlay.
+    pub fn close_overlay(&mut self) {
+        self.overlay = None;
+    }
+
+    /// Returns true if any overlay is currently shown.
+    pub fn has_overlay(&self) -> bool {
+        self.overlay.is_some()
+    }
+
     /// Attempt to connect to the daemon and fetch initial state.
     pub async fn connect(&mut self, client: &mut SocketClient) -> Result<()> {
         self.daemon_state = DaemonState::Connecting;
@@ -138,6 +175,13 @@ impl App {
         match resp {
             Ok(r) if r.status == ResponseStatus::Ok => {
                 self.set_connected();
+                // Parse wave and agent count from status response
+                if let Some(wave) = r.data.get("current_wave").and_then(|v| v.as_u64()) {
+                    self.current_wave = Some(wave as u32);
+                }
+                if let Some(count) = r.data.get("active_agents").and_then(|v| v.as_u64()) {
+                    self.active_agent_count = count as u32;
+                }
             }
             Ok(r) => {
                 // Connected but command failed — still connected to daemon
@@ -229,5 +273,47 @@ mod tests {
         assert_eq!(DaemonState::Connected.label(), "Connected");
         assert_eq!(DaemonState::Disconnected.label(), "Disconnected");
         assert_eq!(DaemonState::Connecting.label(), "Connecting...");
+    }
+
+    #[test]
+    fn test_toggle_overlay() {
+        let mut app = App::new("test".to_string());
+        assert_eq!(app.overlay, None);
+
+        app.toggle_overlay(Overlay::Help);
+        assert_eq!(app.overlay, Some(Overlay::Help));
+
+        // Toggle same overlay closes it
+        app.toggle_overlay(Overlay::Help);
+        assert_eq!(app.overlay, None);
+    }
+
+    #[test]
+    fn test_toggle_overlay_switches() {
+        let mut app = App::new("test".to_string());
+        app.toggle_overlay(Overlay::Help);
+        assert_eq!(app.overlay, Some(Overlay::Help));
+
+        // Toggle different overlay switches to it
+        app.toggle_overlay(Overlay::ProjectSwitcher);
+        assert_eq!(app.overlay, Some(Overlay::ProjectSwitcher));
+    }
+
+    #[test]
+    fn test_close_overlay() {
+        let mut app = App::new("test".to_string());
+        app.toggle_overlay(Overlay::Filter);
+        assert!(app.has_overlay());
+
+        app.close_overlay();
+        assert!(!app.has_overlay());
+        assert_eq!(app.overlay, None);
+    }
+
+    #[test]
+    fn test_initial_wave_and_agents() {
+        let app = App::new("test".to_string());
+        assert_eq!(app.current_wave, None);
+        assert_eq!(app.active_agent_count, 0);
     }
 }
