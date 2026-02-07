@@ -37,6 +37,11 @@ pub fn socket_path() -> Result<PathBuf> {
     Ok(nflow_home()?.join("nflow.sock"))
 }
 
+/// Returns the path to the database file (~/.nflow/nflow.db).
+pub fn db_path() -> Result<PathBuf> {
+    Ok(nflow_home()?.join("nflow.db"))
+}
+
 /// Ensures the ~/.nflow/logs/ directory exists.
 pub fn ensure_log_dir() -> Result<()> {
     let log_dir = nflow_home()?.join("logs");

@@ -47,6 +47,8 @@
 - partial_config_from_env() takes &[(&str, &str)] to keep nflow-core IO-free — caller reads actual env vars
 - render_branch_template() supports {project}, {story_id}, {story_slug} variable substitution
 - DB schema lives in nflow-daemon (not nflow-core) since it does IO via rusqlite
+- Signaled child processes become zombies — use `child.wait()`/`child.try_wait()` to reap them in tests (kill(pid, 0) returns true for zombies)
+- is_process_alive() is public in recovery.rs — reusable for shutdown module's agent polling
 - Migration files go in `crates/nflow-daemon/migrations/` and are embedded via `include_str!`
 - MIGRATIONS const is &[(u32, &str)] — version number paired with SQL string
 - Use `unchecked_transaction()` for rusqlite transactions (doesn't require &mut Connection)
@@ -980,4 +982,31 @@ Started: Sat Feb  7 03:49:10 PM MSK 2026
   - cleanup_stale_pid_file reads file content atomically and checks both PID match and process liveness
   - RecoveryReport uses named struct init instead of Default + field assignment (clippy field_reassign_with_default)
   - replace_all in Edit tool is dangerous — it replaces ALL occurrences including import paths (uuid::Uuid → Uuid)
+---
+
+## 2026-02-07 - US-039
+- What was implemented: Graceful shutdown module for nflow-daemon
+  - Created `crates/nflow-daemon/src/shutdown.rs` with full graceful shutdown sequence
+  - `collect_running_agent_pids()` queries DB for running agent processes
+  - `wait_for_agents()` polls PIDs with 500ms interval until timeout
+  - `sigterm_agents()` sends SIGTERM to remaining agent processes
+  - `sigkill_agents()` sends SIGKILL to survivors after SIGTERM+wait
+  - `remove_socket_file()` and `remove_pid_file()` clean up daemon files
+  - `graceful_shutdown()` orchestrates: 60s grace → SIGTERM → 10s → SIGKILL → file cleanup
+  - `ShutdownReport` tracks counts of agents finished naturally, sigtermed, sigkilled
+  - Updated `main.rs` to call graceful shutdown on SIGTERM instead of just removing PID file
+  - Added `db_path()` helper to `daemon.rs`
+  - Made `is_process_alive()` public in `recovery.rs` for reuse
+  - 19 tests covering all shutdown scenarios including signal escalation
+- Files changed:
+  - crates/nflow-daemon/src/shutdown.rs (new - shutdown module with tests)
+  - crates/nflow-daemon/src/main.rs (integrated graceful shutdown, consolidated foreground/default modes)
+  - crates/nflow-daemon/src/daemon.rs (added db_path() helper)
+  - crates/nflow-daemon/src/recovery.rs (made is_process_alive() public)
+- **Learnings for future iterations:**
+  - Signaled child processes become zombies until reaped — `kill(pid, 0)` succeeds for zombies so `is_process_alive()` returns true; must use `waitpid()` or `Child::wait()`/`Child::try_wait()` in tests
+  - For tests spawning processes: use `Child` handle for cleanup, don't rely on `is_process_alive()` after signaling
+  - `trap '' TERM; sleep 300` creates a SIGTERM-resistant process for testing SIGKILL escalation
+  - `Command::new("true")` is the fastest way to spawn a short-lived process in tests
+  - Consolidated duplicate match arms (`"foreground" | _`) reduces code duplication in main.rs
 ---

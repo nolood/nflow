@@ -37,7 +37,7 @@ pub enum ProcessState {
 }
 
 /// Check if a process is alive by sending signal 0.
-fn is_process_alive(pid: u32) -> bool {
+pub fn is_process_alive(pid: u32) -> bool {
     let nix_pid = nix::unistd::Pid::from_raw(pid as i32);
     match nix::sys::signal::kill(nix_pid, None) {
         Ok(()) => true,
