@@ -39,7 +39,7 @@ pub fn build_dag(stories: &[WorkItem], dependencies: &[Dependency]) -> Result<Da
             None => session_id = Some(story.decomposition_session_id),
             Some(sid) => {
                 if story.decomposition_session_id != sid {
-                    return Err(NflowError::Validation(
+                    return Err(NflowError::ValidationError(
                         "all stories must belong to the same decomposition session".into(),
                     ));
                 }
@@ -61,13 +61,13 @@ pub fn build_dag(stories: &[WorkItem], dependencies: &[Dependency]) -> Result<Da
     for dep in dependencies {
         // Validate references exist
         if !nodes.contains(&dep.blocker_id) {
-            return Err(NflowError::Validation(format!(
+            return Err(NflowError::ValidationError(format!(
                 "dependency blocker {} not found in story set",
                 dep.blocker_id
             )));
         }
         if !nodes.contains(&dep.blocked_id) {
-            return Err(NflowError::Validation(format!(
+            return Err(NflowError::ValidationError(format!(
                 "dependency blocked {} not found in story set",
                 dep.blocked_id
             )));
@@ -383,7 +383,7 @@ mod tests {
         let dep = Dependency::new(phantom_id, s1.id);
 
         let err = build_dag(&[s1], &[dep]).unwrap_err();
-        assert!(matches!(err, NflowError::Validation(_)));
+        assert!(matches!(err, NflowError::ValidationError(_)));
     }
 
     #[test]
@@ -394,7 +394,7 @@ mod tests {
         let dep = Dependency::new(s1.id, phantom_id);
 
         let err = build_dag(&[s1], &[dep]).unwrap_err();
-        assert!(matches!(err, NflowError::Validation(_)));
+        assert!(matches!(err, NflowError::ValidationError(_)));
     }
 
     #[test]
@@ -405,7 +405,7 @@ mod tests {
         let s2 = make_story(session2, "S2");
 
         let err = build_dag(&[s1, s2], &[]).unwrap_err();
-        assert!(matches!(err, NflowError::Validation(_)));
+        assert!(matches!(err, NflowError::ValidationError(_)));
     }
 
     // --- build_dag: cycle detection ---

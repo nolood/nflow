@@ -102,17 +102,17 @@ pub fn merge(base: Config, overlay: PartialConfig) -> Config {
 /// Validate a resolved config. Returns an error if any field has an invalid value.
 pub fn validate(config: &Config) -> Result<()> {
     if config.max_parallel == 0 {
-        return Err(NflowError::Validation(
+        return Err(NflowError::ValidationError(
             "max_parallel must be greater than 0".into(),
         ));
     }
     if config.max_time_per_task == 0 {
-        return Err(NflowError::Validation(
+        return Err(NflowError::ValidationError(
             "max_time_per_task must be greater than 0".into(),
         ));
     }
     if config.git_provider != "github" && config.git_provider != "gitlab" {
-        return Err(NflowError::Validation(format!(
+        return Err(NflowError::ValidationError(format!(
             "git_provider must be 'github' or 'gitlab', got '{}'",
             config.git_provider
         )));
@@ -254,7 +254,7 @@ mod tests {
         let mut config = Config::default();
         config.max_parallel = 0;
         let err = validate(&config).unwrap_err();
-        assert!(matches!(err, NflowError::Validation(_)));
+        assert!(matches!(err, NflowError::ValidationError(_)));
     }
 
     #[test]
@@ -262,7 +262,7 @@ mod tests {
         let mut config = Config::default();
         config.max_time_per_task = 0;
         let err = validate(&config).unwrap_err();
-        assert!(matches!(err, NflowError::Validation(_)));
+        assert!(matches!(err, NflowError::ValidationError(_)));
     }
 
     #[test]
@@ -270,7 +270,7 @@ mod tests {
         let mut config = Config::default();
         config.git_provider = "bitbucket".into();
         let err = validate(&config).unwrap_err();
-        assert!(matches!(err, NflowError::Validation(_)));
+        assert!(matches!(err, NflowError::ValidationError(_)));
     }
 
     #[test]

@@ -160,7 +160,7 @@ impl ShortIdRegistry {
             1 => Ok(matches[0].1),
             _ => {
                 let wave_list: Vec<String> = matches.iter().map(|(w, _)| format!("W{w}")).collect();
-                Err(NflowError::Conflict(format!(
+                Err(NflowError::InvalidParams(format!(
                     "short ID '{input}' is ambiguous — found in waves: {}. Use wave prefix (e.g., W{}-{input})",
                     wave_list.join(", "),
                     matches[0].0,
@@ -566,7 +566,7 @@ mod tests {
         reg.register(2, "S1", Uuid::new_v4());
 
         let err = reg.resolve("S1", None).unwrap_err();
-        assert!(matches!(err, NflowError::Conflict(_)));
+        assert!(matches!(err, NflowError::InvalidParams(_)));
         let msg = err.to_string();
         assert!(msg.contains("ambiguous"));
         assert!(msg.contains("W1"));

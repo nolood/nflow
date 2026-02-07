@@ -53,7 +53,7 @@ impl DecompositionSession {
         max_wave_number: u32,
     ) -> Result<Self> {
         if has_in_progress(project_id) {
-            return Err(NflowError::Conflict(
+            return Err(NflowError::AlreadyExists(
                 "project already has an in-progress decomposition session".into(),
             ));
         }
@@ -201,7 +201,7 @@ mod tests {
     fn new_session_fails_when_project_has_in_progress() {
         let project_id = Uuid::new_v4();
         let err = DecompositionSession::new(project_id, has_in_progress, 0).unwrap_err();
-        assert!(matches!(err, NflowError::Conflict(_)));
+        assert!(matches!(err, NflowError::AlreadyExists(_)));
     }
 
     // --- State machine: approve ---

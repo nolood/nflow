@@ -62,14 +62,14 @@ impl ProjectService {
         // Validate name is non-empty
         let name = params.name.trim().to_string();
         if name.is_empty() {
-            return Err(NflowError::Validation(
+            return Err(NflowError::ValidationError(
                 "project name must not be empty".into(),
             ));
         }
 
         // Validate name is unique
         if name_exists(&name) {
-            return Err(NflowError::Conflict(format!(
+            return Err(NflowError::AlreadyExists(format!(
                 "project with name '{}' already exists",
                 name
             )));
@@ -78,7 +78,7 @@ impl ProjectService {
         // Validate path is non-empty
         let path = params.path.trim().to_string();
         if path.is_empty() {
-            return Err(NflowError::Validation(
+            return Err(NflowError::ValidationError(
                 "project path must not be empty".into(),
             ));
         }
@@ -88,13 +88,13 @@ impl ProjectService {
             provider
         } else if let Some(ref url) = params.remote_url {
             GitProvider::detect_from_remote(url).ok_or_else(|| {
-                NflowError::Validation(format!(
+                NflowError::ValidationError(format!(
                     "cannot detect git provider from remote URL '{}'; provide an explicit override",
                     url
                 ))
             })?
         } else {
-            return Err(NflowError::Validation(
+            return Err(NflowError::ValidationError(
                 "either remote_url or git_provider_override must be provided".into(),
             ));
         };
@@ -126,7 +126,7 @@ impl ProjectService {
     pub fn delete(project_id: Uuid, running_agent_count: impl Fn(Uuid) -> usize) -> Result<()> {
         let count = running_agent_count(project_id);
         if count > 0 {
-            return Err(NflowError::Conflict(format!(
+            return Err(NflowError::InvalidState(format!(
                 "cannot delete project: {} agent(s) still running",
                 count
             )));
@@ -213,7 +213,7 @@ mod tests {
         };
 
         let err = ProjectService::create(params, no_existing_names).unwrap_err();
-        assert!(matches!(err, NflowError::Validation(_)));
+        assert!(matches!(err, NflowError::ValidationError(_)));
     }
 
     #[test]
@@ -227,7 +227,7 @@ mod tests {
         };
 
         let err = ProjectService::create(params, name_already_exists).unwrap_err();
-        assert!(matches!(err, NflowError::Conflict(_)));
+        assert!(matches!(err, NflowError::AlreadyExists(_)));
     }
 
     #[test]
@@ -241,7 +241,7 @@ mod tests {
         };
 
         let err = ProjectService::create(params, no_existing_names).unwrap_err();
-        assert!(matches!(err, NflowError::Validation(_)));
+        assert!(matches!(err, NflowError::ValidationError(_)));
     }
 
     #[test]
@@ -255,7 +255,7 @@ mod tests {
         };
 
         let err = ProjectService::create(params, no_existing_names).unwrap_err();
-        assert!(matches!(err, NflowError::Validation(_)));
+        assert!(matches!(err, NflowError::ValidationError(_)));
     }
 
     #[test]
@@ -269,7 +269,7 @@ mod tests {
         };
 
         let err = ProjectService::create(params, no_existing_names).unwrap_err();
-        assert!(matches!(err, NflowError::Validation(_)));
+        assert!(matches!(err, NflowError::ValidationError(_)));
     }
 
     #[test]
@@ -310,7 +310,7 @@ mod tests {
     fn delete_project_with_running_agents_fails() {
         let id = Uuid::new_v4();
         let err = ProjectService::delete(id, has_running_agents).unwrap_err();
-        assert!(matches!(err, NflowError::Conflict(_)));
+        assert!(matches!(err, NflowError::InvalidState(_)));
     }
 
     #[test]

@@ -2,26 +2,26 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum NflowError {
-    #[error("Validation error: {0}")]
-    Validation(String),
+    #[error("Invalid transition from {from} to {to}")]
+    InvalidTransition { from: String, to: String },
+
+    #[error("Cyclic dependency detected: {cycle:?}")]
+    CyclicDependency { cycle: Vec<uuid::Uuid> },
 
     #[error("Not found: {0}")]
     NotFound(String),
 
-    #[error("Conflict: {0}")]
-    Conflict(String),
+    #[error("Already exists: {0}")]
+    AlreadyExists(String),
 
     #[error("Invalid state: {0}")]
     InvalidState(String),
 
-    #[error("Invalid transition from {from} to {to}")]
-    InvalidTransition { from: String, to: String },
+    #[error("Invalid params: {0}")]
+    InvalidParams(String),
 
-    #[error("Serialization error: {0}")]
-    Serialization(String),
-
-    #[error("Cyclic dependency detected: {cycle:?}")]
-    CyclicDependency { cycle: Vec<uuid::Uuid> },
+    #[error("Validation error: {0}")]
+    ValidationError(String),
 }
 
 pub type Result<T> = std::result::Result<T, NflowError>;

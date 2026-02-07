@@ -67,6 +67,9 @@
 - Decomposition session CRUD uses nflow-core's DecompositionSession/DecompositionSpec structs directly
 - next_wave_number DB implementation: SELECT MAX(wave_number) + 1, scoped by project_id
 - find_draft_session returns the most recent in_progress session (ORDER BY created_at DESC LIMIT 1)
+- NflowError variants: InvalidTransition, CyclicDependency, NotFound, AlreadyExists, InvalidState, InvalidParams, ValidationError
+- DaemonError wraps: Core(NflowError), Io, Db(rusqlite), Git, Claude, Socket — in nflow-daemon/src/error.rs
+- CliError wraps: Core(NflowError), Io, Db(String), Git, Claude, Socket — in nflow-cli/src/error.rs
 
 # Ralph Progress Log
 Started: Sat Feb  7 03:49:10 PM MSK 2026
@@ -412,4 +415,34 @@ Started: Sat Feb  7 03:49:10 PM MSK 2026
   - find_draft_session uses ORDER BY created_at DESC LIMIT 1 to get most recent in_progress session
   - next_wave_number uses SELECT MAX(wave_number) with project_id filter — returns Option<u32> from rusqlite, unwrap_or(0) + 1
   - cargo fmt collapses short WorkItem::new_epic calls to single lines and reformats query_row closures — follow its lead
+---
+
+## 2026-02-07 - US-016
+- What was implemented: NflowError type system across all crates
+  - Refactored NflowError enum in nflow-core: renamed Validation→ValidationError, Conflict→AlreadyExists, removed unused Serialization, added InvalidParams
+  - Final variants: InvalidTransition, CyclicDependency, NotFound, AlreadyExists, InvalidState, InvalidParams, ValidationError
+  - All variants carry context strings for meaningful error messages
+  - impl Display (via thiserror) and impl std::error::Error for NflowError
+  - Created DaemonError in nflow-daemon with IO/system wrappers: Core (from NflowError), Io, Db (from rusqlite), Git, Claude, Socket
+  - Created CliError in nflow-cli with IO/system wrappers: Core (from NflowError), Io, Db, Git, Claude, Socket
+  - Updated all 55+ usages across 7 nflow-core modules (project, spec, work_item, dag, short_id, decomposition, config)
+  - Semantic accuracy: running-agents deletion guard uses InvalidState (not AlreadyExists), ambiguous short ID uses InvalidParams (not AlreadyExists)
+  - All 346 tests pass, clippy clean, fmt clean
+- Files changed:
+  - crates/nflow-core/src/error.rs (refactored variants)
+  - crates/nflow-core/src/project.rs (Validation→ValidationError, Conflict→AlreadyExists/InvalidState)
+  - crates/nflow-core/src/dag.rs (Validation→ValidationError)
+  - crates/nflow-core/src/config.rs (Validation→ValidationError)
+  - crates/nflow-core/src/short_id.rs (Conflict→InvalidParams for ambiguous IDs)
+  - crates/nflow-core/src/decomposition.rs (Conflict→AlreadyExists)
+  - crates/nflow-daemon/src/error.rs (new — DaemonError with IO/system wrappers)
+  - crates/nflow-daemon/src/main.rs (added error module)
+  - crates/nflow-cli/src/error.rs (new — CliError with IO/system wrappers)
+  - crates/nflow-cli/src/main.rs (added error module)
+  - crates/nflow-cli/Cargo.toml (added thiserror dependency)
+- **Learnings for future iterations:**
+  - When renaming enum variants, use replace_all to catch both constructor calls and matches! patterns in tests
+  - Map error variants to semantically correct types: "already exists" → AlreadyExists, "can't do X while Y" → InvalidState, "ambiguous input" → InvalidParams
+  - DaemonError uses #[from] for NflowError, rusqlite::Error, std::io::Error — automatic conversion with ?
+  - CliError uses String for Db since CLI doesn't directly use rusqlite (communicates via socket)
 ---
