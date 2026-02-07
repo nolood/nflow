@@ -2168,4 +2168,23 @@ Started: Sat Feb  7 03:49:10 PM MSK 2026
   - visible_nodes_filtered("") is backward-compatible with visible_nodes() — delegate for zero breakage
   - Filter state is global on App (not per-view) — simpler than per-view filter state
   - Removing an enum variant (Overlay::Filter) requires updating all match arms and test assertions referencing it
+- Platform PID functions live in `platform.rs` module: `is_process_alive()`, `get_pid_start_time()`, `verify_process()`, `ProcessState` — recovery.rs re-exports for compat
+---
+
+## 2026-02-08 - US-088
+- What was implemented: Extracted PID detection functions into a dedicated `platform.rs` module in nflow-daemon, providing cross-platform process liveness checking, start time reading, and process identity verification.
+- Files changed:
+  - `crates/nflow-daemon/src/platform.rs` (new) — Platform abstraction module with `is_process_alive()`, `get_pid_start_time()`, `verify_process()`, `ProcessState`
+  - `crates/nflow-daemon/src/main.rs` — Added `pub mod platform` declaration
+  - `crates/nflow-daemon/src/recovery.rs` — Removed extracted functions, added re-exports and `read_process_start_time` alias for backwards compat, removed duplicated tests
+  - `crates/nflow-daemon/src/shutdown.rs` — Updated import from `recovery` to `platform`
+  - `crates/nflow-daemon/src/scheduler_loop.rs` — Updated imports to use `platform::get_pid_start_time` and `platform::verify_process`
+  - `crates/nflow-daemon/src/handlers.rs` — Updated 3 call sites from `recovery::read_process_start_time` to `platform::get_pid_start_time`
+  - `crates/nflow-daemon/src/daemon.rs` — Replaced inline signal-0 logic with `platform::is_process_alive()`
+- **Learnings for future iterations:**
+  - Platform-specific code uses `#[cfg(target_os)]` for compile-time selection — functions share the same signature across platforms
+  - When extracting a module, provide re-exports (`pub use`) for backwards compatibility to avoid breaking all consumers at once
+  - The `read_process_start_time` → `get_pid_start_time` rename needed a thin wrapper alias for `recovery.rs` internal usage
+  - `matches!()` macro is preferred over `match` for simple bool returns (clippy: `match_like_matches_macro` lint)
+  - daemon.rs had inline signal-0 logic duplicating `is_process_alive()` — always check for duplicates before extraction
 ---
