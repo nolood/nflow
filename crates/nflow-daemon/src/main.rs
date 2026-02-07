@@ -79,6 +79,8 @@ async fn main() {
 
                 if !actions.is_empty() {
                     debug!("scheduler: {} actions produced this tick", actions.len());
+                    // Execute actions: update DB, create worktrees, start tasks
+                    scheduler_loop::execute_actions(&conn, &actions, None).await;
                 }
             }
 

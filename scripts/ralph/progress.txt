@@ -130,6 +130,10 @@
 - extract_commit_info() parses git branch/commit output format: "[branch hash] message" → (hash, message)
 - broadcast_status_change() sends Event::StatusChange via event_bus when work_item status transitions happen during reaping
 - update_agent_run_session_id() is a lightweight DB helper for storing session_id parsed from stream output
+- execute_actions() is async because nflow-git::create_worktree() is async — called from the main async loop in main.rs
+- slugify() converts story titles to URL-safe branch name slugs: lowercase, non-alphanumeric→hyphen, collapse, trim, truncate to 50 chars
+- Action execution pattern: scheduler_tick() returns actions (pure), then execute_actions() performs IO (DB writes, git ops)
+- StartStory flow: load project → load story → render branch name → create worktree → update DB (worktree_path, branch_name, status) → mark first task InProgress
 
 # Ralph Progress Log
 Started: Sat Feb  7 03:49:10 PM MSK 2026
@@ -1424,4 +1428,17 @@ Started: Sat Feb  7 03:49:10 PM MSK 2026
   - For evaluate_impl_result head_before/head_after: use "" vs commit_hash to signal whether a commit was produced
   - parse_log_file reads line-by-line (not full JSON parse) — efficient for large log files
   - Tests use tempdir for log file tests to avoid filesystem pollution
+---
+
+## 2026-02-07 - US-054
+- What was implemented: Scheduler — start story execution. When the scheduler selects a ready story, the daemon now executes the action: creates a git worktree, formats a branch name from the template, stores worktree_path/branch_name on the story, sets story status to InProgress, and marks the first pending task as InProgress. If worktree creation fails, the story is set to Failed. Also implemented MarkStoryReady and UpdateEpicStatus action execution, plus a `slugify()` helper for generating branch name slugs from story titles.
+- Files changed:
+  - crates/nflow-daemon/src/scheduler_loop.rs (+416 lines — execute_actions(), execute_start_story(), slugify(), 10 new tests)
+  - crates/nflow-daemon/src/main.rs (+2 lines — call execute_actions after scheduler_tick)
+- **Learnings for future iterations:**
+  - execute_actions() must be async because nflow-git::create_worktree() uses tokio async subprocess
+  - The main loop is already async (tokio::main) so we can call .await directly
+  - slugify() of pure Unicode returns empty string (all non-ASCII becomes hyphens, trimmed away)
+  - Action execution is separated from scheduling: schedule() is pure, execute_actions() does IO
+  - The daemon::tests::test_foreground_mode_writes_pid_file_and_sets_shutdown test is flaky when run in parallel with other tests (race condition on PID file filesystem state)
 ---

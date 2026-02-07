@@ -1,10 +1,12 @@
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 use chrono::Utc;
 use rusqlite::Connection;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
+use nflow_core::config::{self, Config};
 use nflow_core::decomposition::DecompositionStatus;
 use nflow_core::scheduler::{schedule, SchedulerAction, SchedulerState, SessionStatus};
 use nflow_core::work_item::{ItemType, TaskKind, WorkItemStatus};
@@ -448,6 +450,261 @@ fn find_project_id_for_item(
         db::decomposition_sessions::get_decomposition_session(conn, &item.decomposition_session_id)
             .ok()??;
     Some(session.project_id)
+}
+
+/// Convert a story title to a URL-safe slug for use in branch names.
+///
+/// Lowercases, replaces non-alphanumeric characters with hyphens,
+/// collapses consecutive hyphens, and trims leading/trailing hyphens.
+/// Truncates to 50 characters to keep branch names reasonable.
+fn slugify(title: &str) -> String {
+    let slug: String = title
+        .to_lowercase()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+
+    // Collapse consecutive hyphens
+    let mut result = String::with_capacity(slug.len());
+    let mut prev_hyphen = false;
+    for c in slug.chars() {
+        if c == '-' {
+            if !prev_hyphen {
+                result.push('-');
+            }
+            prev_hyphen = true;
+        } else {
+            result.push(c);
+            prev_hyphen = false;
+        }
+    }
+
+    // Trim hyphens and truncate
+    let trimmed = result.trim_matches('-');
+    if trimmed.len() > 50 {
+        trimmed[..50].trim_end_matches('-').to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// Execute scheduler actions by updating the DB and creating worktrees.
+///
+/// Handles three action types:
+/// - `MarkStoryReady`: Sets story status to Ready in DB
+/// - `UpdateEpicStatus`: Sets epic status in DB
+/// - `StartStory`: Creates git worktree, sets story to InProgress,
+///   stores branch_name/worktree_path, and marks the first pending task as InProgress
+///
+/// The `StartStory` action requires async git operations (worktree creation).
+/// If worktree creation fails, the story is set to Failed.
+pub async fn execute_actions(
+    conn: &Connection,
+    actions: &[(Uuid, SchedulerAction)],
+    event_bus: Option<&SharedEventBus>,
+) {
+    for (project_id, action) in actions {
+        match action {
+            SchedulerAction::MarkStoryReady { story_id } => {
+                if let Err(e) =
+                    db::work_items::update_work_item_status(conn, story_id, WorkItemStatus::Ready)
+                {
+                    warn!("execute: failed to mark story {} as ready: {}", story_id, e);
+                    continue;
+                }
+                info!("execute: story {} marked as ready", story_id);
+
+                if let Ok(Some(item)) = db::work_items::get_work_item_by_id(conn, story_id) {
+                    broadcast_status_change(event_bus, story_id, &item, "pending", "ready", conn);
+                }
+            }
+
+            SchedulerAction::UpdateEpicStatus {
+                epic_id,
+                new_status,
+            } => {
+                let old_status = db::work_items::get_work_item_by_id(conn, epic_id)
+                    .ok()
+                    .flatten()
+                    .map(|i| i.status.to_string())
+                    .unwrap_or_default();
+
+                if let Err(e) = db::work_items::update_work_item_status(conn, epic_id, *new_status)
+                {
+                    warn!("execute: failed to update epic {} status: {}", epic_id, e);
+                    continue;
+                }
+                info!(
+                    "execute: epic {} status updated to {:?}",
+                    epic_id, new_status
+                );
+
+                if let Ok(Some(item)) = db::work_items::get_work_item_by_id(conn, epic_id) {
+                    let new_str = match new_status {
+                        WorkItemStatus::Pending => "pending",
+                        WorkItemStatus::Ready => "ready",
+                        WorkItemStatus::InProgress => "in_progress",
+                        WorkItemStatus::Done => "done",
+                        WorkItemStatus::Failed => "failed",
+                        WorkItemStatus::Cancelled => "cancelled",
+                    };
+                    broadcast_status_change(event_bus, epic_id, &item, &old_status, new_str, conn);
+                }
+            }
+
+            SchedulerAction::StartStory { story_id } => {
+                execute_start_story(conn, project_id, story_id, event_bus).await;
+            }
+        }
+    }
+}
+
+/// Execute the StartStory action: create worktree, update story, find first task.
+async fn execute_start_story(
+    conn: &Connection,
+    project_id: &Uuid,
+    story_id: &Uuid,
+    event_bus: Option<&SharedEventBus>,
+) {
+    // 1. Load the project
+    let project = match db::projects::get_project_by_id(conn, project_id) {
+        Ok(Some(p)) => p,
+        Ok(None) => {
+            warn!(
+                "execute: project {} not found for story {}",
+                project_id, story_id
+            );
+            return;
+        }
+        Err(e) => {
+            warn!("execute: failed to load project {}: {}", project_id, e);
+            return;
+        }
+    };
+
+    // 2. Load the story
+    let story = match db::work_items::get_work_item_by_id(conn, story_id) {
+        Ok(Some(s)) => s,
+        Ok(None) => {
+            warn!("execute: story {} not found", story_id);
+            return;
+        }
+        Err(e) => {
+            warn!("execute: failed to load story {}: {}", story_id, e);
+            return;
+        }
+    };
+
+    // 3. Generate branch name from template
+    let cfg = Config::default();
+    let story_slug = slugify(&story.title);
+    let branch_name = config::render_branch_template(
+        &cfg.branch_template,
+        &project.name,
+        &story.short_id,
+        &story_slug,
+    );
+
+    // 4. Construct worktree path: {project_path}/{worktree_dir}/{branch_name}
+    let repo_path = Path::new(&project.path);
+    let worktree_path: PathBuf = repo_path.join(&cfg.worktree_dir).join(&branch_name);
+
+    // 5. Create worktree (async git operation)
+    info!(
+        "execute: starting story {} — creating worktree at {}",
+        story_id,
+        worktree_path.display()
+    );
+
+    if let Err(e) =
+        nflow_git::worktree::create_worktree(repo_path, &worktree_path, &project.base_branch).await
+    {
+        warn!(
+            "execute: worktree creation failed for story {}: {}",
+            story_id, e
+        );
+        // Set story to failed
+        let _ = db::work_items::update_work_item_status(conn, story_id, WorkItemStatus::Failed);
+        if let Ok(Some(item)) = db::work_items::get_work_item_by_id(conn, story_id) {
+            broadcast_status_change(event_bus, story_id, &item, "ready", "failed", conn);
+        }
+        return;
+    }
+
+    // 6. Store worktree_path and branch_name on story
+    if let Err(e) = db::work_items::update_story_worktree(
+        conn,
+        story_id,
+        &branch_name,
+        &worktree_path.to_string_lossy(),
+    ) {
+        warn!(
+            "execute: failed to store worktree info for story {}: {}",
+            story_id, e
+        );
+        return;
+    }
+
+    // 7. Set story status to InProgress
+    if let Err(e) =
+        db::work_items::update_work_item_status(conn, story_id, WorkItemStatus::InProgress)
+    {
+        warn!(
+            "execute: failed to set story {} to in_progress: {}",
+            story_id, e
+        );
+        return;
+    }
+    info!(
+        "execute: story {} started — branch={}, worktree={}",
+        story_id,
+        branch_name,
+        worktree_path.display()
+    );
+
+    if let Ok(Some(item)) = db::work_items::get_work_item_by_id(conn, story_id) {
+        broadcast_status_change(event_bus, story_id, &item, "ready", "in_progress", conn);
+    }
+
+    // 8. Find the first pending task (lowest sort_order)
+    let tasks = match db::work_items::list_work_items_by_parent(conn, story_id) {
+        Ok(t) => t,
+        Err(e) => {
+            warn!(
+                "execute: failed to list tasks for story {}: {}",
+                story_id, e
+            );
+            return;
+        }
+    };
+
+    let first_task = tasks
+        .iter()
+        .filter(|t| t.item_type == ItemType::Task && t.status == WorkItemStatus::Pending)
+        .min_by_key(|t| t.sort_order);
+
+    if let Some(task) = first_task {
+        // Mark first task as InProgress (actual agent spawn will happen in US-055)
+        if let Err(e) =
+            db::work_items::update_work_item_status(conn, &task.id, WorkItemStatus::InProgress)
+        {
+            warn!(
+                "execute: failed to set task {} to in_progress: {}",
+                task.id, e
+            );
+        } else {
+            info!(
+                "execute: task {} ({}) marked in_progress for story {}",
+                task.short_id, task.id, story_id
+            );
+            broadcast_status_change(event_bus, &task.id, task, "pending", "in_progress", conn);
+        }
+    } else {
+        warn!(
+            "execute: no pending tasks found for story {} — story may already be complete",
+            story_id
+        );
+    }
 }
 
 /// Runs a single scheduler tick for all projects.
@@ -1131,5 +1388,164 @@ mod tests {
         assert_eq!(result.session_id, Some("v1".to_string()));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- slugify tests ---
+
+    #[test]
+    fn slugify_simple_title() {
+        assert_eq!(
+            slugify("Add user authentication"),
+            "add-user-authentication"
+        );
+    }
+
+    #[test]
+    fn slugify_special_chars() {
+        assert_eq!(slugify("Fix bug: login/signup"), "fix-bug-login-signup");
+    }
+
+    #[test]
+    fn slugify_collapses_hyphens() {
+        assert_eq!(slugify("hello   world---test"), "hello-world-test");
+    }
+
+    #[test]
+    fn slugify_trims_hyphens() {
+        assert_eq!(slugify("--hello--"), "hello");
+    }
+
+    #[test]
+    fn slugify_truncates_long_titles() {
+        let long_title = "a".repeat(100);
+        let slug = slugify(&long_title);
+        assert!(slug.len() <= 50);
+    }
+
+    #[test]
+    fn slugify_empty_string() {
+        assert_eq!(slugify(""), "");
+    }
+
+    #[test]
+    fn slugify_unicode() {
+        // All non-ASCII chars become hyphens, which collapse and get trimmed to empty
+        assert_eq!(slugify("Добавить фичу"), "");
+    }
+
+    // --- execute_actions tests ---
+
+    #[tokio::test]
+    async fn execute_mark_story_ready() {
+        let conn = test_conn();
+        let project = make_project("proj", true);
+        db::projects::insert_project(&conn, &project).unwrap();
+
+        let session = make_approved_session(project.id, 1);
+        db::decomposition_sessions::insert_decomposition_session(&conn, &session).unwrap();
+
+        let epic = WorkItem::new_epic(session.id, "E".into(), "D".into(), "E1".into(), 0);
+        db::work_items::insert_work_item(&conn, &epic).unwrap();
+
+        let story = WorkItem::new_story(
+            epic.id,
+            session.id,
+            "S".into(),
+            "D".into(),
+            "AC".into(),
+            "S1".into(),
+            1,
+        );
+        db::work_items::insert_work_item(&conn, &story).unwrap();
+
+        let actions = vec![(
+            project.id,
+            SchedulerAction::MarkStoryReady { story_id: story.id },
+        )];
+
+        execute_actions(&conn, &actions, None).await;
+
+        let updated = db::work_items::get_work_item_by_id(&conn, &story.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated.status, WorkItemStatus::Ready);
+    }
+
+    #[tokio::test]
+    async fn execute_update_epic_status() {
+        let conn = test_conn();
+        let project = make_project("proj", true);
+        db::projects::insert_project(&conn, &project).unwrap();
+
+        let session = make_approved_session(project.id, 1);
+        db::decomposition_sessions::insert_decomposition_session(&conn, &session).unwrap();
+
+        let epic = WorkItem::new_epic(session.id, "E".into(), "D".into(), "E1".into(), 0);
+        db::work_items::insert_work_item(&conn, &epic).unwrap();
+
+        let actions = vec![(
+            project.id,
+            SchedulerAction::UpdateEpicStatus {
+                epic_id: epic.id,
+                new_status: WorkItemStatus::InProgress,
+            },
+        )];
+
+        execute_actions(&conn, &actions, None).await;
+
+        let updated = db::work_items::get_work_item_by_id(&conn, &epic.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated.status, WorkItemStatus::InProgress);
+    }
+
+    #[tokio::test]
+    async fn execute_mark_ready_broadcasts_event() {
+        let conn = test_conn();
+        let project = make_project("proj", true);
+        db::projects::insert_project(&conn, &project).unwrap();
+
+        let session = make_approved_session(project.id, 1);
+        db::decomposition_sessions::insert_decomposition_session(&conn, &session).unwrap();
+
+        let epic = WorkItem::new_epic(session.id, "E".into(), "D".into(), "E1".into(), 0);
+        db::work_items::insert_work_item(&conn, &epic).unwrap();
+
+        let story = WorkItem::new_story(
+            epic.id,
+            session.id,
+            "S".into(),
+            "D".into(),
+            "AC".into(),
+            "S1".into(),
+            1,
+        );
+        db::work_items::insert_work_item(&conn, &story).unwrap();
+
+        let bus = crate::events::new_event_bus(16);
+        let client = crate::events::ClientId::new();
+        let mut rx = bus.subscribe(client);
+
+        let actions = vec![(
+            project.id,
+            SchedulerAction::MarkStoryReady { story_id: story.id },
+        )];
+
+        execute_actions(&conn, &actions, Some(&bus)).await;
+
+        let event = rx.try_recv().unwrap();
+        match event {
+            Event::StatusChange {
+                item_id,
+                new_status,
+                old_status,
+                ..
+            } => {
+                assert_eq!(item_id, story.id.to_string());
+                assert_eq!(old_status, "pending");
+                assert_eq!(new_status, "ready");
+            }
+            _ => panic!("expected StatusChange event"),
+        }
     }
 }
