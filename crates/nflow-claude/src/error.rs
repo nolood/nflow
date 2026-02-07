@@ -22,4 +22,10 @@ pub enum ClaudeError {
 
     #[error("Unresolved template variable '{variable}'")]
     UnresolvedVariable { variable: String },
+
+    #[error("Failed to send signal to process {pid}: {source}")]
+    SignalFailed { pid: u32, source: nix::Error },
+
+    #[error("Process {pid} did not exit within the timeout")]
+    TerminationTimeout { pid: u32 },
 }

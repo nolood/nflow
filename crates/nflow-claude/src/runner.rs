@@ -1,6 +1,9 @@
 use std::path::PathBuf;
-use std::process::Stdio;
+use std::process::{ExitStatus, Stdio};
+use std::time::Duration;
 
+use nix::sys::signal::{self, Signal};
+use nix::unistd::Pid;
 use tokio::io::{BufReader, Lines};
 use tokio::process::{Child, ChildStderr, ChildStdout};
 
@@ -146,6 +149,91 @@ pub struct ClaudeProcess {
     pub stdout: Lines<BufReader<ChildStdout>>,
     /// Line-buffered reader for stderr.
     pub stderr: Lines<BufReader<ChildStderr>>,
+}
+
+impl ClaudeProcess {
+    /// Gracefully terminate the process: sends SIGTERM, waits 10 seconds, then SIGKILL if still alive.
+    ///
+    /// Returns the exit status and any final stderr output.
+    pub async fn terminate(&mut self) -> Result<(ExitStatus, String), ClaudeError> {
+        self.terminate_with_timeout(Duration::from_secs(10)).await
+    }
+
+    /// Gracefully terminate with a custom timeout before escalating to SIGKILL.
+    pub async fn terminate_with_timeout(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<(ExitStatus, String), ClaudeError> {
+        let pid = self.pid;
+
+        // Send SIGTERM
+        signal::kill(Pid::from_raw(pid as i32), Signal::SIGTERM)
+            .map_err(|e| ClaudeError::SignalFailed { pid, source: e })?;
+
+        // Wait for the process to exit within timeout
+        match self.wait_with_timeout(timeout).await? {
+            Some(status) => {
+                let stderr = self.collect_stderr().await;
+                Ok((status, stderr))
+            }
+            None => {
+                // Timeout — escalate to SIGKILL
+                self.kill_inner()?;
+                // After SIGKILL, wait for the process to be reaped
+                let status = self.child.wait().await.map_err(ClaudeError::Io)?;
+                let stderr = self.collect_stderr().await;
+                Ok((status, stderr))
+            }
+        }
+    }
+
+    /// Immediately kill the process with SIGKILL.
+    ///
+    /// Returns the exit status and any final stderr output.
+    pub async fn kill(&mut self) -> Result<(ExitStatus, String), ClaudeError> {
+        self.kill_inner()?;
+        let status = self.child.wait().await.map_err(ClaudeError::Io)?;
+        let stderr = self.collect_stderr().await;
+        Ok((status, stderr))
+    }
+
+    /// Wait for the process to exit within the given duration.
+    ///
+    /// Returns `Some(ExitStatus)` if the process exits in time, `None` on timeout.
+    pub async fn wait_with_timeout(
+        &mut self,
+        duration: Duration,
+    ) -> Result<Option<ExitStatus>, ClaudeError> {
+        match tokio::time::timeout(duration, self.child.wait()).await {
+            Ok(result) => {
+                let status = result.map_err(ClaudeError::Io)?;
+                Ok(Some(status))
+            }
+            Err(_) => Ok(None),
+        }
+    }
+
+    /// Send SIGKILL to the process.
+    fn kill_inner(&self) -> Result<(), ClaudeError> {
+        signal::kill(Pid::from_raw(self.pid as i32), Signal::SIGKILL).map_err(|e| {
+            ClaudeError::SignalFailed {
+                pid: self.pid,
+                source: e,
+            }
+        })
+    }
+
+    /// Collect any remaining stderr output.
+    async fn collect_stderr(&mut self) -> String {
+        let mut output = String::new();
+        while let Ok(Some(line)) = self.stderr.next_line().await {
+            if !output.is_empty() {
+                output.push('\n');
+            }
+            output.push_str(&line);
+        }
+        output
+    }
 }
 
 /// Spawns Claude CLI processes.
@@ -523,5 +611,161 @@ mod tests {
         assert!(output.contains("30"));
         assert!(!output.contains("Write"));
         assert!(!output.contains("Edit"));
+    }
+
+    // --- Termination tests ---
+
+    /// Helper to spawn a long-running sleep process directly (bypassing ClaudeRunner
+    /// which adds args that `sleep` doesn't understand).
+    fn spawn_sleep_process(seconds: u32) -> ClaudeProcess {
+        let mut cmd = tokio::process::Command::new("sleep");
+        cmd.arg(seconds.to_string())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .stdin(Stdio::null());
+
+        let mut child = cmd.spawn().expect("sleep should spawn");
+        let pid = child.id().expect("should have pid");
+        let stdout = child.stdout.take().expect("stdout piped");
+        let stderr = child.stderr.take().expect("stderr piped");
+        let stdout_lines = tokio::io::AsyncBufReadExt::lines(BufReader::new(stdout));
+        let stderr_lines = tokio::io::AsyncBufReadExt::lines(BufReader::new(stderr));
+
+        ClaudeProcess {
+            child,
+            pid,
+            stdout: stdout_lines,
+            stderr: stderr_lines,
+        }
+    }
+
+    #[tokio::test]
+    async fn terminate_sends_sigterm_then_exits() {
+        let mut process = spawn_sleep_process(60);
+        assert!(process.pid > 0);
+
+        let (status, _stderr) = process.terminate().await.expect("terminate should succeed");
+        // Process should have been terminated by SIGTERM (signal 15)
+        assert!(!status.success());
+    }
+
+    #[tokio::test]
+    async fn kill_sends_sigkill() {
+        let mut process = spawn_sleep_process(60);
+        assert!(process.pid > 0);
+
+        let (status, _stderr) = process.kill().await.expect("kill should succeed");
+        // Process should have been killed
+        assert!(!status.success());
+    }
+
+    #[tokio::test]
+    async fn wait_with_timeout_returns_some_on_fast_exit() {
+        // echo exits immediately
+        let runner = ClaudeRunner::with_binary("echo".to_string());
+        let config = default_config();
+        let mut process = runner.spawn(&config).expect("echo should spawn");
+
+        let result = process
+            .wait_with_timeout(Duration::from_secs(5))
+            .await
+            .expect("wait should not error");
+        assert!(result.is_some());
+        assert!(result.unwrap().success());
+    }
+
+    #[tokio::test]
+    async fn wait_with_timeout_returns_none_on_timeout() {
+        let mut process = spawn_sleep_process(60);
+
+        let result = process
+            .wait_with_timeout(Duration::from_millis(100))
+            .await
+            .expect("wait should not error");
+        assert!(result.is_none());
+
+        // Clean up the process
+        process.kill().await.expect("cleanup kill should succeed");
+    }
+
+    #[tokio::test]
+    async fn terminate_with_custom_timeout() {
+        let mut process = spawn_sleep_process(60);
+
+        let (status, _stderr) = process
+            .terminate_with_timeout(Duration::from_secs(5))
+            .await
+            .expect("terminate should succeed");
+        assert!(!status.success());
+    }
+
+    #[tokio::test]
+    async fn kill_captures_stderr_output() {
+        // Use bash -c to write to stderr before sleeping
+        let mut cmd = tokio::process::Command::new("bash");
+        cmd.arg("-c")
+            .arg("echo 'test error output' >&2 && sleep 60")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .stdin(Stdio::null());
+
+        let mut child = cmd.spawn().expect("bash should spawn");
+        let pid = child.id().expect("should have pid");
+        let stdout = child.stdout.take().expect("stdout piped");
+        let stderr = child.stderr.take().expect("stderr piped");
+        let stdout_lines = tokio::io::AsyncBufReadExt::lines(BufReader::new(stdout));
+        let stderr_lines = tokio::io::AsyncBufReadExt::lines(BufReader::new(stderr));
+
+        let mut process = ClaudeProcess {
+            child,
+            pid,
+            stdout: stdout_lines,
+            stderr: stderr_lines,
+        };
+
+        // Give the process a moment to write to stderr
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let (status, stderr_output) = process.kill().await.expect("kill should succeed");
+        assert!(!status.success());
+        assert!(
+            stderr_output.contains("test error output"),
+            "stderr should be captured, got: {stderr_output}"
+        );
+    }
+
+    #[tokio::test]
+    async fn terminate_escalates_to_sigkill_on_trap() {
+        // Use a process that traps SIGTERM and ignores it
+        let mut cmd = tokio::process::Command::new("bash");
+        cmd.arg("-c")
+            .arg("trap '' TERM; sleep 60")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .stdin(Stdio::null());
+
+        let mut child = cmd.spawn().expect("bash should spawn");
+        let pid = child.id().expect("should have pid");
+        let stdout = child.stdout.take().expect("stdout piped");
+        let stderr = child.stderr.take().expect("stderr piped");
+        let stdout_lines = tokio::io::AsyncBufReadExt::lines(BufReader::new(stdout));
+        let stderr_lines = tokio::io::AsyncBufReadExt::lines(BufReader::new(stderr));
+
+        let mut process = ClaudeProcess {
+            child,
+            pid,
+            stdout: stdout_lines,
+            stderr: stderr_lines,
+        };
+
+        // Give the process a moment to set up the trap
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Use a short timeout so SIGTERM will time out and escalate to SIGKILL
+        let (status, _stderr) = process
+            .terminate_with_timeout(Duration::from_millis(500))
+            .await
+            .expect("terminate should succeed via SIGKILL escalation");
+        assert!(!status.success());
     }
 }
