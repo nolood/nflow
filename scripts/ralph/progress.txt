@@ -449,6 +449,7 @@ Started: Sat Feb  7 03:49:10 PM MSK 2026
   - Map error variants to semantically correct types: "already exists" → AlreadyExists, "can't do X while Y" → InvalidState, "ambiguous input" → InvalidParams
   - DaemonError uses #[from] for NflowError, rusqlite::Error, std::io::Error — automatic conversion with ?
   - CliError uses String for Db since CLI doesn't directly use rusqlite (communicates via socket)
+- SessionTracker is in-memory (HashMap<Uuid, String>) — daemon loads from DB, persists back after Claude invocations
 - nflow-claude needs tokio features: process, io-util, fs, macros, rt-multi-thread (macros+rt for #[tokio::test])
 - ClaudeError is nflow-claude's error type (BinaryNotFound, SpawnFailed, ProcessExited, Io) — in crate::error
 - Use `echo` as a test stand-in for claude binary — validates arg passing via piped stdout
@@ -539,4 +540,26 @@ Started: Sat Feb  7 03:49:10 PM MSK 2026
   - VERIFICATION PASSED takes priority over VERIFICATION FAILED if both present (checked first)
   - Marker matching is case-sensitive by design
   - cargo fmt collapses short evaluate_impl_result calls to 2-line let bindings and expands long ones to multi-line
+---
+
+## 2026-02-07 - US-021
+- What was implemented: Session tracker in nflow-claude
+  - SessionTracker struct with HashMap<Uuid, String> for entity_id → claude_session_id mapping
+  - start_session(entity_id) returns Option<String> — None for first invocation, Some(id) for resume
+  - update_session(entity_id, session_id) stores new session ID after Claude result
+  - get_resume_id(entity_id) returns Option<&str> for populating RunConfig.resume_session
+  - load_session(entity_id, session_id) for daemon to populate from DB on startup
+  - remove_session(entity_id) for cleanup on entity deletion/discard
+  - has_session(entity_id) for existence check
+  - Works for both specs (multi-turn Q&A) and decomposition sessions (feedback loop)
+  - 19 new tests (428 total) covering all acceptance criteria including full workflow scenarios
+- Files changed:
+  - crates/nflow-claude/Cargo.toml (added uuid dependency)
+  - crates/nflow-claude/src/session.rs (full SessionTracker implementation with tests)
+- **Learnings for future iterations:**
+  - SessionTracker is a pure in-memory HashMap wrapper — no IO, no async, no DB
+  - The daemon is responsible for loading session IDs from DB into the tracker and persisting updates back
+  - start_session() is read-only (&self) — it just returns the existing session ID for the --resume flag
+  - uuid crate needs to be added to nflow-claude's own Cargo.toml (it's not transitively available from nflow-core)
+  - cargo fmt expands assert_eq! with Some("long-string".into()) to multi-line format
 ---
