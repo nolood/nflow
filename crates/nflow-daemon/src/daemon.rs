@@ -1,6 +1,7 @@
 use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -8,6 +9,7 @@ use std::sync::Arc;
 
 use nix::sys::signal::{signal, SigHandler, Signal};
 use nix::unistd::setsid;
+use tracing::warn;
 
 use crate::error::{DaemonError, Result};
 
@@ -42,17 +44,46 @@ pub fn db_path() -> Result<PathBuf> {
     Ok(nflow_home()?.join("nflow.db"))
 }
 
-/// Ensures the ~/.nflow/logs/ directory exists.
+/// Ensures the ~/.nflow/logs/ directory exists with secure permissions (0700).
 pub fn ensure_log_dir() -> Result<()> {
     let log_dir = nflow_home()?.join("logs");
-    fs::create_dir_all(&log_dir)?;
+    if !log_dir.exists() {
+        fs::create_dir_all(&log_dir)?;
+        fs::set_permissions(&log_dir, fs::Permissions::from_mode(0o700))?;
+    }
     Ok(())
 }
 
-/// Ensures the ~/.nflow/ directory exists.
+/// Ensures the ~/.nflow/ directory exists with secure permissions (0700).
+///
+/// If the directory exists but has permissions more open than 0700,
+/// the permissions are tightened and a warning is logged.
 pub fn ensure_nflow_home() -> Result<()> {
     let home = nflow_home()?;
-    fs::create_dir_all(&home)?;
+    if home.exists() {
+        enforce_dir_permissions(&home)?;
+    } else {
+        fs::create_dir_all(&home)?;
+        fs::set_permissions(&home, fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+/// Checks and enforces that a directory has mode 0700 (owner-only).
+///
+/// If the directory's group or other bits are set (mode & 0o077 != 0),
+/// this function fixes the permissions to 0700 and logs a warning.
+fn enforce_dir_permissions(path: &Path) -> Result<()> {
+    let meta = fs::metadata(path)?;
+    let mode = meta.permissions().mode() & 0o777;
+    if mode & 0o077 != 0 {
+        warn!(
+            path = %path.display(),
+            current_mode = format!("{:04o}", mode),
+            "nflow home directory has too-open permissions, fixing to 0700"
+        );
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    }
     Ok(())
 }
 
@@ -387,6 +418,50 @@ mod tests {
         assert!(result.is_ok());
         let log_path = log_file_path().unwrap();
         assert!(log_path.exists());
+    }
+
+    #[test]
+    fn test_enforce_dir_permissions_fixes_too_open() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("test_perms");
+        fs::create_dir(&dir).unwrap();
+
+        // Set permissions to 0755 (too open — group/other have read+execute)
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+        let mode = fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o755);
+
+        // enforce_dir_permissions should fix to 0700
+        enforce_dir_permissions(&dir).unwrap();
+
+        let mode = fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700);
+    }
+
+    #[test]
+    fn test_enforce_dir_permissions_leaves_correct_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("test_correct");
+        fs::create_dir(&dir).unwrap();
+
+        // Set permissions to 0700 (correct)
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+
+        // enforce_dir_permissions should not change anything
+        enforce_dir_permissions(&dir).unwrap();
+
+        let mode = fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700);
+    }
+
+    #[test]
+    fn test_ensure_nflow_home_creates_with_secure_permissions() {
+        // ensure_nflow_home creates ~/.nflow/ — on this system it should exist with 0700
+        ensure_nflow_home().unwrap();
+        let home = nflow_home().unwrap();
+        assert!(home.exists());
+        let mode = fs::metadata(&home).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, ".nflow dir should be 0700");
     }
 
     /// Tests PID file and is_daemon_running in a single sequential test

@@ -1,4 +1,5 @@
 ## Codebase Patterns
+- Filesystem security: ~/.nflow/ created with 0700, enforce_dir_permissions() checks & fixes too-open dirs, socket 0600, DB inherits from dir
 - Config files: global at ~/.nflow/config.toml, per-project at ~/.nflow/projects/{name}/config.toml — both use TOML format with PartialConfig struct
 - KNOWN_CONFIG_KEYS constant maps key names to expected types (integer/string/boolean) for validation
 - Tests modifying HOME env var must be consolidated into a single sequential test to avoid parallel race conditions
@@ -1737,4 +1738,25 @@ Started: Sat Feb  7 03:49:10 PM MSK 2026
   - toml::to_string_pretty produces human-readable output suitable for config files
   - Config layer detection: check env→project→global→default order (highest to lowest priority)
   - Use std::io::Error::other() not std::io::Error::new(ErrorKind::Other, ...) per clippy io_other_error lint
+---
+
+## 2026-02-07 - US-068
+- What was implemented: Filesystem security enforcement for nflow home directory
+  - ensure_nflow_home() now creates ~/.nflow/ with mode 0700 (owner-only rwx)
+  - enforce_dir_permissions() checks existing directory and fixes permissions if group/other bits are set (mode & 0o077 != 0)
+  - Logs a warning via tracing::warn! when fixing too-open permissions
+  - ensure_log_dir() creates ~/.nflow/logs/ with mode 0700
+  - Socket file already created with mode 0600 (verified in bind_socket)
+  - Database file permissions inherited from directory (0700 directory means only owner can access files within)
+  - Works on both Linux and macOS (uses std::os::unix::fs::PermissionsExt, POSIX-standard)
+  - Added tempfile as dev-dependency to nflow-daemon for tests
+  - 5 new tests (3 new: enforce_dir_permissions fixes/leaves, ensure_nflow_home secure; + 2 pre-existing updated)
+- Files changed:
+  - crates/nflow-daemon/Cargo.toml (added tempfile dev-dependency)
+  - crates/nflow-daemon/src/daemon.rs (ensure_nflow_home, enforce_dir_permissions, ensure_log_dir with secure permissions + 3 new tests)
+- **Learnings for future iterations:**
+  - enforce_dir_permissions uses mode & 0o077 to check if group/other bits are set — any non-zero means too open
+  - Don't modify HOME env var in tests — causes race conditions with parallel tests that use nflow_home()
+  - Database file permissions are inherited from the parent directory's 0700 mode — no explicit chmod needed on the DB file
+  - std::os::unix::fs::PermissionsExt works identically on Linux and macOS (both POSIX)
 ---
