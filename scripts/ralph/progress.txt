@@ -518,3 +518,25 @@ Started: Sat Feb  7 03:49:10 PM MSK 2026
   - serde_json::Value for tool_use input preserves arbitrary JSON without schema knowledge
   - ToolResult content can be String or arbitrary JSON — match on Value::String vs stringify others
 ---
+
+## 2026-02-07 - US-020
+- What was implemented: Stream-JSON success criteria evaluation in nflow-claude
+  - TaskResult enum: Success, Failed { reason: String }
+  - evaluate_impl_result(exit_code, head_before, head_after, commit_message, short_id) -> TaskResult
+  - Impl success: exit_code == 0 AND head_after != head_before AND commit_message contains [{short_id}]
+  - Failure reasons: non-zero exit code, no new commit produced, missing short_id tag in commit message
+  - evaluate_verify_result(exit_code, result_text) -> TaskResult
+  - Verify success: exit_code == 0 AND result_text contains "VERIFICATION PASSED"
+  - Verify failure: "VERIFICATION FAILED" found, or neither marker (ambiguous = failure), or non-zero exit
+  - Pure logic, no IO — all functions take primitive args and return TaskResult
+  - 20 new tests (411 total) covering all acceptance criteria
+- Files changed:
+  - crates/nflow-claude/src/evaluate.rs (new — TaskResult enum + evaluate_impl_result + evaluate_verify_result + tests)
+  - crates/nflow-claude/src/lib.rs (added evaluate module)
+- **Learnings for future iterations:**
+  - evaluate_impl_result takes short_id as a parameter — caller provides the expected tag format
+  - Exit code check comes first in both evaluation functions — fail-fast pattern
+  - VERIFICATION PASSED takes priority over VERIFICATION FAILED if both present (checked first)
+  - Marker matching is case-sensitive by design
+  - cargo fmt collapses short evaluate_impl_result calls to 2-line let bindings and expands long ones to multi-line
+---
