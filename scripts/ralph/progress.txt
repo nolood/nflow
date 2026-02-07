@@ -24,6 +24,7 @@
 - exec.continue handler pattern: story-level (not task-level), handles both Failed and Cancelled stories differently. Failed→skip failed task + resume. Cancelled with worktree→InProgress + restore cancelled tasks to Pending. Cancelled without worktree→Ready/Pending based on blockers.
 - spawn_agent_for_task() is a reusable helper for spawning Claude agents — extracted from common pattern in exec.skip/exec.continue/exec.retry
 - list_dependents_of_story() finds stories blocked by a given story (WHERE blocker_id = X), complementary to list_blockers_for_story() (WHERE blocked_id = X)
+- ExitCode::from(u8) is NOT const in Rust — use u8 constants with a runtime conversion function for exit code modules
 - exec.stop vs exec.cancel: stop sends SIGTERM to running agents (InProgress stories), cancel sets Pending/Ready stories to Cancelled (no process termination)
 - terminate_agent_process_sigterm() sends SIGTERM only (no wait), vs scheduler_loop::terminate_agent_process() which does SIGTERM→wait 10s→SIGKILL
 - Story completion lifecycle: rebase → push → MR creation → DB update → worktree cleanup → event broadcast (all in execute_complete_story)
@@ -1848,4 +1849,22 @@ Started: Sat Feb  7 03:49:10 PM MSK 2026
   - Static AtomicBool for global color flag avoids threading issues and is zero-cost when color is enabled
   - JSON shape detection (epics+wave_number→tree, adjacency→DAG, waves→status) lets format module dispatch correctly without knowing the command name
   - Error prefix patterns from daemon (NOT_FOUND:, ALREADY_EXISTS:, etc.) are stable API for client-side classification
+---
+
+## 2026-02-08 - US-073
+- Implemented semantic CLI exit codes: 0 (success), 1 (general error), 2 (daemon not running), 3 (not found), 4 (invalid args), 5 (invalid state)
+- Added `exit_code` module in error.rs with u8 constants and ExitCode conversion
+- Added `exit_code()` and `exit_code_raw()` methods on CliError
+- Classification works for both nflow-core NflowError variants and daemon error message prefixes (NOT_FOUND:, INVALID_STATE:, etc.)
+- Daemon-not-running detection via substring match ("daemon" + "not running")
+- Exit codes documented in --help via clap's `after_long_help` attribute
+- 12 unit tests covering all exit code paths
+- Files changed:
+  - crates/nflow-cli/src/error.rs (exit_code module, CliError methods, classify functions, tests)
+  - crates/nflow-cli/src/main.rs (ExitCode::FAILURE → e.exit_code())
+  - crates/nflow-cli/src/cli.rs (after_long_help with exit code docs)
+- **Learnings for future iterations:**
+  - ExitCode::from() is not const in Rust — use u8 constants with a conversion function instead
+  - Daemon error messages use string prefixes (NOT_FOUND:, INVALID_PARAMS:, etc.) — classify_error_message() maps these to exit codes
+  - clap's `after_long_help` attribute only shows in `--help` (long help), not `-h` (short help) — good for detailed reference info
 ---
