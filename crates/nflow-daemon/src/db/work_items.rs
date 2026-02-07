@@ -314,6 +314,19 @@ pub fn count_stories_by_project(conn: &Connection, project_id: &Uuid) -> Result<
     Ok(count)
 }
 
+/// Count stories with pending or ready status for a project (schedulable but not yet started).
+pub fn count_pending_stories_by_project(conn: &Connection, project_id: &Uuid) -> Result<u32> {
+    let count: u32 = conn.query_row(
+        "SELECT COUNT(*) FROM work_items w
+         JOIN decomposition_sessions ds ON w.decomposition_session_id = ds.id
+         WHERE ds.project_id = ?1 AND w.item_type = 'story'
+         AND w.status IN ('pending', 'ready')",
+        params![project_id.to_string()],
+        |row| row.get(0),
+    )?;
+    Ok(count)
+}
+
 /// List worktree paths for all stories in a project.
 pub fn list_worktree_paths_by_project(conn: &Connection, project_id: &Uuid) -> Result<Vec<String>> {
     let mut stmt = conn.prepare(
@@ -937,6 +950,75 @@ mod tests {
             Some("https://example.com/pr/1".to_string())
         );
         assert_eq!(retrieved.commit_hash, Some("deadbeef".to_string()));
+    }
+
+    // --- count pending stories ---
+
+    #[test]
+    fn test_count_pending_stories_by_project() {
+        let conn = test_conn();
+        let pid = make_project(&conn);
+        let sid = make_session(&conn, pid);
+        let epic = make_epic(sid);
+        insert_work_item(&conn, &epic).unwrap();
+
+        // No stories yet
+        assert_eq!(count_pending_stories_by_project(&conn, &pid).unwrap(), 0);
+
+        // Add a pending story
+        let s1 = WorkItem::new_story(
+            epic.id,
+            sid,
+            "Story 1".to_string(),
+            "desc".to_string(),
+            "ac".to_string(),
+            "S1".to_string(),
+            0,
+        );
+        insert_work_item(&conn, &s1).unwrap();
+        assert_eq!(count_pending_stories_by_project(&conn, &pid).unwrap(), 1);
+
+        // Add a ready story
+        let mut s2 = WorkItem::new_story(
+            epic.id,
+            sid,
+            "Story 2".to_string(),
+            "desc".to_string(),
+            "ac".to_string(),
+            "S2".to_string(),
+            1,
+        );
+        s2.status = WorkItemStatus::Ready;
+        insert_work_item(&conn, &s2).unwrap();
+        assert_eq!(count_pending_stories_by_project(&conn, &pid).unwrap(), 2);
+
+        // Add an in_progress story — should NOT be counted
+        let mut s3 = WorkItem::new_story(
+            epic.id,
+            sid,
+            "Story 3".to_string(),
+            "desc".to_string(),
+            "ac".to_string(),
+            "S3".to_string(),
+            2,
+        );
+        s3.status = WorkItemStatus::InProgress;
+        insert_work_item(&conn, &s3).unwrap();
+        assert_eq!(count_pending_stories_by_project(&conn, &pid).unwrap(), 2);
+
+        // Add a done story — should NOT be counted
+        let mut s4 = WorkItem::new_story(
+            epic.id,
+            sid,
+            "Story 4".to_string(),
+            "desc".to_string(),
+            "ac".to_string(),
+            "S4".to_string(),
+            3,
+        );
+        s4.status = WorkItemStatus::Done;
+        insert_work_item(&conn, &s4).unwrap();
+        assert_eq!(count_pending_stories_by_project(&conn, &pid).unwrap(), 2);
     }
 
     // --- parameterized queries (SQL injection resistance) ---

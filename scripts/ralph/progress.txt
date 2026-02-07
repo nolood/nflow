@@ -1530,3 +1530,23 @@ Started: Sat Feb  7 03:49:10 PM MSK 2026
   - Tests use None for PID to skip signal sending (no actual process to kill) — isolates DB logic testing from OS process management
   - Pre-existing flaky test: daemon::tests::test_pid_file_and_daemon_running (filesystem race condition)
 ---
+
+## 2026-02-07 - US-059
+- What was implemented: Command handlers for exec.run and exec.pause in nflow-daemon
+  - `handle_exec_run()`: sets `execution_enabled = true` on the project, accepts optional `parallel` and `story` params (stored for future use), returns execution state with `running_count` and `pending_count`
+  - `handle_exec_pause()`: sets `execution_enabled = false` on the project; running agents continue but no new agents are started by scheduler; returns execution state with `running_count` and `pending_count`
+  - Both handlers use `update_project()` to persist the `execution_enabled` flag change
+  - Idempotent: exec.run on already-enabled project is a no-op, exec.pause on already-paused project is a no-op
+  - New DB helper `count_pending_stories_by_project()`: counts stories in 'pending' or 'ready' status for a project
+  - Added dispatch routes: "exec.run" and "exec.pause" in dispatch()
+  - 13 new tests (1 DB + 12 handler): missing params, not found, enable/disable, already-enabled/paused, pending story count, round trip, dispatch routing
+- Files changed:
+  - crates/nflow-daemon/src/handlers.rs (handle_exec_run, handle_exec_pause, dispatch routes + 12 tests)
+  - crates/nflow-daemon/src/db/work_items.rs (count_pending_stories_by_project + 1 test)
+- **Learnings for future iterations:**
+  - exec.run and exec.pause are non-streaming handlers (HandlerResult::Single) — no Claude process involved
+  - Running count derived from find_running_agent_runs_by_project().len() — reuses existing DB function
+  - Pending count = stories in 'pending' or 'ready' status (schedulable but not yet started)
+  - --parallel and --story params are parsed but stored in-memory only (not persisted to DB) — scheduler will read them from HandlerState in future
+  - Idempotent enable/disable: only call update_project when state actually changes (avoids unnecessary DB write)
+---

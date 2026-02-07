@@ -52,6 +52,8 @@ fn dispatch(req: Request, state: &HandlerState) -> HandlerResult {
         "plan.feedback" => handle_plan_feedback(req, state),
         "plan.approve" => HandlerResult::Single(handle_plan_approve(req, state)),
         "plan.discard" => HandlerResult::Single(handle_plan_discard(req, state)),
+        "exec.run" => HandlerResult::Single(handle_exec_run(req, state)),
+        "exec.pause" => HandlerResult::Single(handle_exec_pause(req, state)),
         _ => HandlerResult::Single(Response::error(
             req.id,
             &format!("unknown command: {}", req.command),
@@ -2677,6 +2679,141 @@ fn handle_plan_discard(req: Request, state: &HandlerState) -> Response {
     )
 }
 
+/// Handle "exec.run" command.
+///
+/// Sets execution_enabled = true for the project. Optionally overrides
+/// max_parallel (stored in memory — not persisted to DB) and limits execution
+/// to a specific story.
+///
+/// Params: project_name (required), parallel (optional u32), story (optional short_id string)
+fn handle_exec_run(req: Request, state: &HandlerState) -> Response {
+    let id = req.id.clone();
+
+    let project_name = match req.params.get("project_name").and_then(|v| v.as_str()) {
+        Some(n) => n.to_string(),
+        None => return Response::error(id, "missing required parameter: project_name"),
+    };
+
+    let _parallel: Option<u32> = req
+        .params
+        .get("parallel")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as u32);
+
+    let _story: Option<String> = req
+        .params
+        .get("story")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    let conn = match db::open_connection(&state.db_path) {
+        Ok(c) => c,
+        Err(e) => return Response::error(id, &format!("database error: {}", e)),
+    };
+
+    let mut project = match db::projects::get_project_by_name(&conn, &project_name) {
+        Ok(Some(p)) => p,
+        Ok(None) => {
+            return Response::error(
+                id,
+                &format!("NOT_FOUND: project '{}' not found", project_name),
+            )
+        }
+        Err(e) => return Response::error(id, &format!("database error: {}", e)),
+    };
+
+    // Set execution_enabled = true
+    if !project.execution_enabled {
+        project.execution_enabled = true;
+        project.updated_at = chrono::Utc::now();
+        if let Err(e) = db::projects::update_project(&conn, &project) {
+            return Response::error(id, &format!("database error: {}", e));
+        }
+    }
+
+    // Count running and pending for status response
+    let running_count = match db::agent_runs::find_running_agent_runs_by_project(&conn, &project.id)
+    {
+        Ok(runs) => runs.len() as u32,
+        Err(e) => return Response::error(id, &format!("database error: {}", e)),
+    };
+
+    let pending_count = match db::work_items::count_pending_stories_by_project(&conn, &project.id) {
+        Ok(c) => c,
+        Err(e) => return Response::error(id, &format!("database error: {}", e)),
+    };
+
+    Response::ok(
+        id,
+        serde_json::json!({
+            "execution_enabled": true,
+            "running_count": running_count,
+            "pending_count": pending_count,
+        }),
+    )
+}
+
+/// Handle "exec.pause" command.
+///
+/// Sets execution_enabled = false for the project. Running agents continue,
+/// but no new agents will be started by the scheduler.
+///
+/// Params: project_name (required)
+fn handle_exec_pause(req: Request, state: &HandlerState) -> Response {
+    let id = req.id.clone();
+
+    let project_name = match req.params.get("project_name").and_then(|v| v.as_str()) {
+        Some(n) => n.to_string(),
+        None => return Response::error(id, "missing required parameter: project_name"),
+    };
+
+    let conn = match db::open_connection(&state.db_path) {
+        Ok(c) => c,
+        Err(e) => return Response::error(id, &format!("database error: {}", e)),
+    };
+
+    let mut project = match db::projects::get_project_by_name(&conn, &project_name) {
+        Ok(Some(p)) => p,
+        Ok(None) => {
+            return Response::error(
+                id,
+                &format!("NOT_FOUND: project '{}' not found", project_name),
+            )
+        }
+        Err(e) => return Response::error(id, &format!("database error: {}", e)),
+    };
+
+    // Set execution_enabled = false
+    if project.execution_enabled {
+        project.execution_enabled = false;
+        project.updated_at = chrono::Utc::now();
+        if let Err(e) = db::projects::update_project(&conn, &project) {
+            return Response::error(id, &format!("database error: {}", e));
+        }
+    }
+
+    // Count running and pending for status response
+    let running_count = match db::agent_runs::find_running_agent_runs_by_project(&conn, &project.id)
+    {
+        Ok(runs) => runs.len() as u32,
+        Err(e) => return Response::error(id, &format!("database error: {}", e)),
+    };
+
+    let pending_count = match db::work_items::count_pending_stories_by_project(&conn, &project.id) {
+        Ok(c) => c,
+        Err(e) => return Response::error(id, &format!("database error: {}", e)),
+    };
+
+    Response::ok(
+        id,
+        serde_json::json!({
+            "execution_enabled": false,
+            "running_count": running_count,
+            "pending_count": pending_count,
+        }),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5201,6 +5338,365 @@ mod tests {
             _ => panic!("expected Single response"),
         }
 
+        cleanup_db(&db_dir);
+    }
+
+    // --- exec.run tests ---
+
+    #[test]
+    fn test_exec_run_missing_project_name() {
+        let (state, db_dir) = make_db_state("exec_run_missing");
+        let req = Request {
+            id: "300".to_string(),
+            command: "exec.run".to_string(),
+            params: serde_json::json!({}),
+        };
+        match dispatch(req, &state) {
+            HandlerResult::Single(resp) => {
+                assert_eq!(resp.status, crate::socket::ResponseStatus::Error);
+                assert!(resp.data["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("missing required parameter"));
+            }
+            _ => panic!("expected Single response"),
+        }
+        cleanup_db(&db_dir);
+    }
+
+    #[test]
+    fn test_exec_run_project_not_found() {
+        let (state, db_dir) = make_db_state("exec_run_notfound");
+        let req = Request {
+            id: "301".to_string(),
+            command: "exec.run".to_string(),
+            params: serde_json::json!({ "project_name": "nonexistent" }),
+        };
+        match dispatch(req, &state) {
+            HandlerResult::Single(resp) => {
+                assert_eq!(resp.status, crate::socket::ResponseStatus::Error);
+                assert!(resp.data["message"].as_str().unwrap().contains("NOT_FOUND"));
+            }
+            _ => panic!("expected Single response"),
+        }
+        cleanup_db(&db_dir);
+    }
+
+    #[test]
+    fn test_exec_run_enables_execution() {
+        let (state, db_dir) = make_db_state("exec_run_enable");
+        // Insert project with execution_enabled = false (via direct DB insert)
+        let conn = db::open_connection(&state.db_path).unwrap();
+        let project_id = uuid::Uuid::new_v4();
+        let project = nflow_core::project::Project {
+            id: project_id,
+            name: "exec-test".to_string(),
+            path: "/tmp/fakepath".to_string(),
+            base_branch: "main".to_string(),
+            git_provider: GitProvider::Github,
+            execution_enabled: false,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        db::projects::insert_project(&conn, &project).unwrap();
+        drop(conn);
+
+        let req = Request {
+            id: "302".to_string(),
+            command: "exec.run".to_string(),
+            params: serde_json::json!({ "project_name": "exec-test" }),
+        };
+        match dispatch(req, &state) {
+            HandlerResult::Single(resp) => {
+                assert_eq!(resp.status, crate::socket::ResponseStatus::Ok);
+                assert_eq!(resp.data["execution_enabled"], true);
+                assert_eq!(resp.data["running_count"], 0);
+                assert_eq!(resp.data["pending_count"], 0);
+            }
+            _ => panic!("expected Single response"),
+        }
+
+        // Verify in DB
+        let conn = db::open_connection(&state.db_path).unwrap();
+        let updated = db::projects::get_project_by_name(&conn, "exec-test")
+            .unwrap()
+            .unwrap();
+        assert!(updated.execution_enabled);
+        drop(conn);
+
+        cleanup_db(&db_dir);
+    }
+
+    #[test]
+    fn test_exec_run_already_enabled() {
+        let (state, db_dir) = make_db_state("exec_run_already");
+        let _pid = insert_test_project(&state, "exec-already");
+
+        let req = Request {
+            id: "303".to_string(),
+            command: "exec.run".to_string(),
+            params: serde_json::json!({ "project_name": "exec-already" }),
+        };
+        match dispatch(req, &state) {
+            HandlerResult::Single(resp) => {
+                assert_eq!(resp.status, crate::socket::ResponseStatus::Ok);
+                assert_eq!(resp.data["execution_enabled"], true);
+            }
+            _ => panic!("expected Single response"),
+        }
+        cleanup_db(&db_dir);
+    }
+
+    #[test]
+    fn test_exec_run_with_pending_stories() {
+        let (state, db_dir) = make_db_state("exec_run_pending");
+        let project_id = insert_test_project(&state, "exec-pending");
+
+        // Insert a session and pending story
+        let conn = db::open_connection(&state.db_path).unwrap();
+        let session_id = uuid::Uuid::new_v4();
+        conn.execute(
+            "INSERT INTO decomposition_sessions (id, project_id, wave_number, status, created_at, updated_at)
+             VALUES (?1, ?2, 1, 'approved', '2024-01-01T00:00:00Z', '2024-01-01T00:00:00Z')",
+            rusqlite::params![session_id.to_string(), project_id.to_string()],
+        )
+        .unwrap();
+        let epic_id = uuid::Uuid::new_v4();
+        conn.execute(
+            "INSERT INTO work_items (id, decomposition_session_id, item_type, title, description, status, short_id, sort_order, created_at, updated_at)
+             VALUES (?1, ?2, 'epic', 'Epic', 'desc', 'pending', 'E1', 0, '2024-01-01T00:00:00Z', '2024-01-01T00:00:00Z')",
+            rusqlite::params![epic_id.to_string(), session_id.to_string()],
+        )
+        .unwrap();
+        let story_id = uuid::Uuid::new_v4();
+        conn.execute(
+            "INSERT INTO work_items (id, parent_id, decomposition_session_id, item_type, title, description, status, short_id, sort_order, created_at, updated_at)
+             VALUES (?1, ?2, ?3, 'story', 'Story 1', 'desc', 'pending', 'S1', 0, '2024-01-01T00:00:00Z', '2024-01-01T00:00:00Z')",
+            rusqlite::params![story_id.to_string(), epic_id.to_string(), session_id.to_string()],
+        )
+        .unwrap();
+        drop(conn);
+
+        let req = Request {
+            id: "304".to_string(),
+            command: "exec.run".to_string(),
+            params: serde_json::json!({ "project_name": "exec-pending" }),
+        };
+        match dispatch(req, &state) {
+            HandlerResult::Single(resp) => {
+                assert_eq!(resp.status, crate::socket::ResponseStatus::Ok);
+                assert_eq!(resp.data["execution_enabled"], true);
+                assert_eq!(resp.data["running_count"], 0);
+                assert_eq!(resp.data["pending_count"], 1);
+            }
+            _ => panic!("expected Single response"),
+        }
+        cleanup_db(&db_dir);
+    }
+
+    // --- exec.pause tests ---
+
+    #[test]
+    fn test_exec_pause_missing_project_name() {
+        let (state, db_dir) = make_db_state("exec_pause_missing");
+        let req = Request {
+            id: "310".to_string(),
+            command: "exec.pause".to_string(),
+            params: serde_json::json!({}),
+        };
+        match dispatch(req, &state) {
+            HandlerResult::Single(resp) => {
+                assert_eq!(resp.status, crate::socket::ResponseStatus::Error);
+                assert!(resp.data["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("missing required parameter"));
+            }
+            _ => panic!("expected Single response"),
+        }
+        cleanup_db(&db_dir);
+    }
+
+    #[test]
+    fn test_exec_pause_project_not_found() {
+        let (state, db_dir) = make_db_state("exec_pause_notfound");
+        let req = Request {
+            id: "311".to_string(),
+            command: "exec.pause".to_string(),
+            params: serde_json::json!({ "project_name": "nonexistent" }),
+        };
+        match dispatch(req, &state) {
+            HandlerResult::Single(resp) => {
+                assert_eq!(resp.status, crate::socket::ResponseStatus::Error);
+                assert!(resp.data["message"].as_str().unwrap().contains("NOT_FOUND"));
+            }
+            _ => panic!("expected Single response"),
+        }
+        cleanup_db(&db_dir);
+    }
+
+    #[test]
+    fn test_exec_pause_disables_execution() {
+        let (state, db_dir) = make_db_state("exec_pause_disable");
+        let _pid = insert_test_project(&state, "exec-pause-test");
+
+        let req = Request {
+            id: "312".to_string(),
+            command: "exec.pause".to_string(),
+            params: serde_json::json!({ "project_name": "exec-pause-test" }),
+        };
+        match dispatch(req, &state) {
+            HandlerResult::Single(resp) => {
+                assert_eq!(resp.status, crate::socket::ResponseStatus::Ok);
+                assert_eq!(resp.data["execution_enabled"], false);
+                assert_eq!(resp.data["running_count"], 0);
+                assert_eq!(resp.data["pending_count"], 0);
+            }
+            _ => panic!("expected Single response"),
+        }
+
+        // Verify in DB
+        let conn = db::open_connection(&state.db_path).unwrap();
+        let updated = db::projects::get_project_by_name(&conn, "exec-pause-test")
+            .unwrap()
+            .unwrap();
+        assert!(!updated.execution_enabled);
+        drop(conn);
+
+        cleanup_db(&db_dir);
+    }
+
+    #[test]
+    fn test_exec_pause_already_paused() {
+        let (state, db_dir) = make_db_state("exec_pause_already");
+        let conn = db::open_connection(&state.db_path).unwrap();
+        let project_id = uuid::Uuid::new_v4();
+        let project = nflow_core::project::Project {
+            id: project_id,
+            name: "exec-paused".to_string(),
+            path: "/tmp/fakepath".to_string(),
+            base_branch: "main".to_string(),
+            git_provider: GitProvider::Github,
+            execution_enabled: false,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        db::projects::insert_project(&conn, &project).unwrap();
+        drop(conn);
+
+        let req = Request {
+            id: "313".to_string(),
+            command: "exec.pause".to_string(),
+            params: serde_json::json!({ "project_name": "exec-paused" }),
+        };
+        match dispatch(req, &state) {
+            HandlerResult::Single(resp) => {
+                assert_eq!(resp.status, crate::socket::ResponseStatus::Ok);
+                assert_eq!(resp.data["execution_enabled"], false);
+            }
+            _ => panic!("expected Single response"),
+        }
+        cleanup_db(&db_dir);
+    }
+
+    #[test]
+    fn test_exec_run_then_pause_round_trip() {
+        let (state, db_dir) = make_db_state("exec_roundtrip");
+        let conn = db::open_connection(&state.db_path).unwrap();
+        let project_id = uuid::Uuid::new_v4();
+        let project = nflow_core::project::Project {
+            id: project_id,
+            name: "exec-roundtrip".to_string(),
+            path: "/tmp/fakepath".to_string(),
+            base_branch: "main".to_string(),
+            git_provider: GitProvider::Github,
+            execution_enabled: false,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        db::projects::insert_project(&conn, &project).unwrap();
+        drop(conn);
+
+        // exec.run
+        let req = Request {
+            id: "314".to_string(),
+            command: "exec.run".to_string(),
+            params: serde_json::json!({ "project_name": "exec-roundtrip" }),
+        };
+        match dispatch(req, &state) {
+            HandlerResult::Single(resp) => {
+                assert_eq!(resp.status, crate::socket::ResponseStatus::Ok);
+                assert_eq!(resp.data["execution_enabled"], true);
+            }
+            _ => panic!("expected Single response"),
+        }
+
+        // exec.pause
+        let req = Request {
+            id: "315".to_string(),
+            command: "exec.pause".to_string(),
+            params: serde_json::json!({ "project_name": "exec-roundtrip" }),
+        };
+        match dispatch(req, &state) {
+            HandlerResult::Single(resp) => {
+                assert_eq!(resp.status, crate::socket::ResponseStatus::Ok);
+                assert_eq!(resp.data["execution_enabled"], false);
+            }
+            _ => panic!("expected Single response"),
+        }
+
+        // Verify final state in DB
+        let conn = db::open_connection(&state.db_path).unwrap();
+        let updated = db::projects::get_project_by_name(&conn, "exec-roundtrip")
+            .unwrap()
+            .unwrap();
+        assert!(!updated.execution_enabled);
+        drop(conn);
+
+        cleanup_db(&db_dir);
+    }
+
+    #[test]
+    fn test_dispatch_exec_run_route() {
+        let (state, db_dir) = make_db_state("dispatch_exec_run");
+        let req = Request {
+            id: "320".to_string(),
+            command: "exec.run".to_string(),
+            params: serde_json::json!({}),
+        };
+        // Should route to exec.run (get error for missing param, not unknown command)
+        match dispatch(req, &state) {
+            HandlerResult::Single(resp) => {
+                assert_eq!(resp.status, crate::socket::ResponseStatus::Error);
+                assert!(resp.data["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("missing required parameter"));
+            }
+            _ => panic!("expected Single response"),
+        }
+        cleanup_db(&db_dir);
+    }
+
+    #[test]
+    fn test_dispatch_exec_pause_route() {
+        let (state, db_dir) = make_db_state("dispatch_exec_pause");
+        let req = Request {
+            id: "321".to_string(),
+            command: "exec.pause".to_string(),
+            params: serde_json::json!({}),
+        };
+        // Should route to exec.pause (get error for missing param, not unknown command)
+        match dispatch(req, &state) {
+            HandlerResult::Single(resp) => {
+                assert_eq!(resp.status, crate::socket::ResponseStatus::Error);
+                assert!(resp.data["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("missing required parameter"));
+            }
+            _ => panic!("expected Single response"),
+        }
         cleanup_db(&db_dir);
     }
 }
