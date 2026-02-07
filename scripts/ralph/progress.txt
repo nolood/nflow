@@ -70,6 +70,8 @@
 - NflowError variants: InvalidTransition, CyclicDependency, NotFound, AlreadyExists, InvalidState, InvalidParams, ValidationError
 - DaemonError wraps: Core(NflowError), Io, Db(rusqlite), Git, Claude, Socket — in nflow-daemon/src/error.rs
 - CliError wraps: Core(NflowError), Io, Db(String), Git, Claude, Socket — in nflow-cli/src/error.rs
+- RunConfig presets use `..Self::base(prompt)` struct update syntax for DRY construction
+- for_decompose takes working_dir as param (caller decides project root vs specs dir based on with_codebase)
 
 # Ralph Progress Log
 Started: Sat Feb  7 03:49:10 PM MSK 2026
@@ -474,4 +476,22 @@ Started: Sat Feb  7 03:49:10 PM MSK 2026
   - ClaudeProcess derives Debug — tokio's Child, Lines, BufReader all implement Debug
   - Distinguish NotFound (binary missing) from other IO errors in spawn error handling
   - cargo fmt breaks chained .arg().arg() calls across lines when the first arg is long
+---
+
+## 2026-02-07 - US-018
+- What was implemented: Claude process runner — invocation modes in nflow-claude
+  - RunConfig::base() private helper with common defaults (stream-json, verbose, include-partial-messages)
+  - RunConfig::for_spec(prompt, with_codebase) — with_codebase: Read,Glob,Grep,Write,AskUserQuestion; without: Write,AskUserQuestion; no max_turns
+  - RunConfig::for_decompose(prompt, with_codebase, working_dir) — with_codebase: Read,Glob,Grep + project root; without: no tools + specs dir; no max_turns
+  - RunConfig::for_impl_task(prompt) — Read,Write,Edit,Bash,Glob,Grep; max_turns: 50
+  - RunConfig::for_verify_task(prompt) — Read,Bash,Glob,Grep (NO Write/Edit); max_turns: 30
+  - All modes include output_format=StreamJson, verbose=true, include_partial_messages=true
+  - 10 new tests (364 total) covering all modes, tool lists, max_turns, working_dir, spawn integration
+- Files changed:
+  - crates/nflow-claude/src/runner.rs (added base(), for_spec, for_decompose, for_impl_task, for_verify_task constructors + tests)
+- **Learnings for future iterations:**
+  - Use `..Self::base(prompt)` struct update syntax for DRY preset constructors — cleaner than setting every field
+  - cargo fmt collapses short vec![] with 3 items to single line (e.g., Read, Glob, Grep) — don't fight it
+  - for_decompose takes working_dir as parameter since caller decides project root vs specs dir
+  - Verify task explicitly excludes Write/Edit — test for absence of these tools validates the security boundary
 ---
