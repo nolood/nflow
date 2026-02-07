@@ -44,7 +44,7 @@ impl fmt::Display for TaskKind {
 
 /// Status for work items. Used by epics, stories, and tasks.
 /// Not all statuses are valid for all item types — enforcement is via state machine methods.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum WorkItemStatus {
     Pending,

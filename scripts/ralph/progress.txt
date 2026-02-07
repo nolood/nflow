@@ -57,6 +57,11 @@
 - Use rusqlite `params![]` macro for parameterized queries, `row.get("column_name")` for named column access
 - Timestamps stored/retrieved as RFC 3339 strings via `.to_rfc3339()` / `.parse::<DateTime<Utc>>()`
 - nflow-daemon needs uuid and chrono in its own Cargo.toml (not just via nflow-core re-export)
+- WorkItemStatus needs `Hash` derive to be used as HashMap key (for count_tasks_by_status)
+- DB CRUD modules follow same pattern: *_to_str/*_from_str + parse_datetime + row_to_* + CRUD functions + tests
+- Work items use parent_id FK with ON DELETE CASCADE — deleting an epic cascades to stories, stories to tasks
+- list_dependencies_by_session joins on work_items to filter by session (dependencies table has no session_id column)
+- count_tasks_by_status uses GROUP BY + item_type='task' filter to count only tasks under a story
 
 # Ralph Progress Log
 Started: Sat Feb  7 03:49:10 PM MSK 2026
@@ -342,4 +347,36 @@ Started: Sat Feb  7 03:49:10 PM MSK 2026
   - find_unassigned_approved_specs uses NOT IN subquery on decomposition_specs — no need to filter by session status
   - reset_active_sessions returns conn.execute() as u64 — rusqlite returns usize for rows affected
   - cargo fmt collapses short function signatures to single lines — don't add manual line breaks for 3-param functions
+---
+
+## 2026-02-07 - US-014
+- What was implemented: Database CRUD for work items and dependencies in nflow-daemon
+  - Created db/work_items.rs module following same pattern as db/projects.rs and db/specs.rs
+  - insert_work_item(conn, item) — inserts WorkItem struct into SQLite with all 17 fields
+  - insert_dependency(conn, dep) — inserts Dependency (blocker_id, blocked_id) into dependencies table
+  - get_work_item_by_id(conn, id) -> Result<Option<WorkItem>> — single-row lookup by ID
+  - list_work_items_by_session(conn, session_id) — returns all work items for a session ordered by sort_order
+  - list_work_items_by_parent(conn, parent_id) — returns children of a work item ordered by sort_order
+  - list_dependencies_by_session(conn, session_id) — joins dependencies with work_items to filter by session
+  - list_blockers_for_story(conn, story_id) — returns all blocker dependencies for a story
+  - update_work_item_status(conn, id, status) — updates status and updated_at
+  - update_work_item_commit(conn, id, commit_hash) — stores commit hash on task completion
+  - update_story_worktree(conn, id, branch_name, worktree_path) — sets branch and worktree info
+  - update_story_mr(conn, id, mr_url) — stores merge request URL
+  - delete_work_items_by_session(conn, session_id) — bulk delete for plan regeneration
+  - count_tasks_by_status(conn, story_id) -> Result<HashMap<WorkItemStatus, u32>> — groups tasks by status
+  - Added Hash derive to WorkItemStatus in nflow-core for HashMap key usage
+  - Helper functions: item_type_to_str/from_str, task_kind_to_str/from_str, status_to_str/from_str, parse_datetime, parse_uuid, row_to_work_item
+  - 27 new tests (314 total) covering all CRUD operations, cascading deletes, session scoping, SQL injection resistance
+- Files changed:
+  - crates/nflow-core/src/work_item.rs (added Hash derive to WorkItemStatus)
+  - crates/nflow-daemon/src/db/mod.rs (added work_items module)
+  - crates/nflow-daemon/src/db/work_items.rs (new — full work items and dependencies CRUD with tests)
+- **Learnings for future iterations:**
+  - WorkItemStatus needs Hash derive to be used as HashMap key — simple addition but easy to forget
+  - list_dependencies_by_session requires JOIN on work_items since dependencies table has no session_id
+  - count_tasks_by_status filters by item_type='task' to exclude non-task children
+  - cargo fmt collapses 3-param function signatures and expands Dependency::new calls — follow its lead
+  - make_project test helper needs unique names (format with Uuid) when multiple projects are created in different tests
+  - Optional fields (branch_name, worktree_path, mr_url, commit_hash, kind) need Option<String> handling in row mapping
 ---
