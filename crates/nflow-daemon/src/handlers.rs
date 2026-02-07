@@ -57,6 +57,7 @@ fn dispatch(req: Request, state: &HandlerState) -> HandlerResult {
         "exec.status" => HandlerResult::Single(handle_exec_status(req, state)),
         "exec.retry" => HandlerResult::Single(handle_exec_retry(req, state)),
         "exec.skip" => HandlerResult::Single(handle_exec_skip(req, state)),
+        "exec.continue" => HandlerResult::Single(handle_exec_continue(req, state)),
         _ => HandlerResult::Single(Response::error(
             req.id,
             &format!("unknown command: {}", req.command),
@@ -3778,6 +3779,507 @@ fn handle_exec_skip(req: Request, state: &HandlerState) -> Response {
         data["skipped_verify"] = serde_json::json!(vid);
     }
     Response::ok(id, data)
+}
+
+/// Handle "exec.continue" command.
+///
+/// Resumes a failed or cancelled story. For failed stories, skips the current
+/// failed task and resumes from the next pending task. For cancelled stories,
+/// restores them to the appropriate state based on worktree existence and
+/// dependency state.
+///
+/// Params: story_id (required, wave-prefixed like "W1-S1"), force (optional bool)
+fn handle_exec_continue(req: Request, state: &HandlerState) -> Response {
+    let id = req.id.clone();
+
+    let story_id_str = match req.params.get("story_id").and_then(|v| v.as_str()) {
+        Some(s) => s.to_string(),
+        None => return Response::error(id, "missing required parameter: story_id"),
+    };
+
+    let force = req
+        .params
+        .get("force")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    let conn = match db::open_connection(&state.db_path) {
+        Ok(c) => c,
+        Err(e) => return Response::error(id, &format!("database error: {}", e)),
+    };
+
+    // 1. Find the story by wave-prefixed short ID
+    let story = match db::work_items::find_work_item_by_wave_short_id(&conn, &story_id_str) {
+        Ok(Some(s)) => s,
+        Ok(None) => {
+            return Response::error(
+                id,
+                &format!("NOT_FOUND: story '{}' not found", story_id_str),
+            )
+        }
+        Err(e) => return Response::error(id, &format!("database error: {}", e)),
+    };
+
+    // Validate it's a story
+    if story.item_type != ItemType::Story {
+        return Response::error(
+            id,
+            &format!("INVALID_PARAMS: '{}' is not a story", story_id_str),
+        );
+    }
+
+    // 2. Validate story is in failed or cancelled state
+    if story.status != WorkItemStatus::Failed && story.status != WorkItemStatus::Cancelled {
+        return Response::error(
+            id,
+            &format!(
+                "INVALID_STATE: story '{}' is in '{}' state, expected 'failed' or 'cancelled'",
+                story_id_str, story.status
+            ),
+        );
+    }
+
+    // 3. For cancelled stories, check dependents and warn if not forced
+    if story.status == WorkItemStatus::Cancelled && !force {
+        let dependents = match db::work_items::list_dependents_of_story(&conn, &story.id) {
+            Ok(d) => d,
+            Err(e) => return Response::error(id, &format!("database error: {}", e)),
+        };
+        if !dependents.is_empty() {
+            return Response::error(
+                id,
+                &format!(
+                    "INVALID_STATE: story '{}' has {} dependent(s) that may be affected. Use --force to skip this check",
+                    story_id_str,
+                    dependents.len()
+                ),
+            );
+        }
+    }
+
+    // Handle based on story state
+    match story.status {
+        WorkItemStatus::Failed => handle_continue_failed_story(&conn, id, &story_id_str, &story),
+        WorkItemStatus::Cancelled => {
+            handle_continue_cancelled_story(&conn, id, &story_id_str, &story)
+        }
+        _ => unreachable!(), // Already validated above
+    }
+}
+
+/// Continue a failed story: skip the failed task, resume from next pending.
+fn handle_continue_failed_story(
+    conn: &rusqlite::Connection,
+    id: String,
+    story_id_str: &str,
+    story: &WorkItem,
+) -> Response {
+    // Find the current failed task in this story
+    let tasks = match db::work_items::list_work_items_by_parent(conn, &story.id) {
+        Ok(t) => t,
+        Err(e) => return Response::error(id, &format!("database error: {}", e)),
+    };
+
+    let failed_task = tasks
+        .iter()
+        .find(|t| t.item_type == ItemType::Task && t.status == WorkItemStatus::Failed);
+
+    if let Some(failed_task) = failed_task {
+        // Mark the failed task as done (skipped)
+        if let Err(e) =
+            db::work_items::update_work_item_status(conn, &failed_task.id, WorkItemStatus::Done)
+        {
+            return Response::error(id, &format!("database error: {}", e));
+        }
+
+        // If it's an impl task, handle paired verify
+        if failed_task.kind == Some(TaskKind::Impl) {
+            let verify = tasks.iter().find(|t| {
+                t.item_type == ItemType::Task
+                    && t.kind == Some(TaskKind::Verify)
+                    && t.parent_id == failed_task.parent_id
+                    && t.sort_order == failed_task.sort_order + 1
+            });
+
+            if let Some(verify_task) = verify {
+                let new_status = match verify_task.status {
+                    WorkItemStatus::Pending => WorkItemStatus::Cancelled,
+                    WorkItemStatus::Failed => WorkItemStatus::Done,
+                    _ => verify_task.status,
+                };
+                if new_status != verify_task.status {
+                    let _ =
+                        db::work_items::update_work_item_status(conn, &verify_task.id, new_status);
+                }
+            }
+        }
+    }
+
+    // Re-read tasks after updates
+    let tasks = match db::work_items::list_work_items_by_parent(conn, &story.id) {
+        Ok(t) => t,
+        Err(e) => return Response::error(id, &format!("database error: {}", e)),
+    };
+
+    let next_pending = nflow_core::work_item::get_next_pending_task(story.id, &tasks);
+
+    if let Some(next_task) = next_pending {
+        // Mark next task as InProgress
+        if let Err(e) =
+            db::work_items::update_work_item_status(conn, &next_task.id, WorkItemStatus::InProgress)
+        {
+            return Response::error(id, &format!("database error: {}", e));
+        }
+
+        // Restore story to InProgress
+        if let Err(e) =
+            db::work_items::update_work_item_status(conn, &story.id, WorkItemStatus::InProgress)
+        {
+            return Response::error(id, &format!("database error: {}", e));
+        }
+
+        // Spawn Claude agent for next task if worktree exists
+        if let Some(ref _worktree_path) = story.worktree_path {
+            if let Err(e) = spawn_agent_for_task(conn, next_task, story) {
+                // Revert next task to pending on spawn failure
+                let _ = db::work_items::update_work_item_status(
+                    conn,
+                    &next_task.id,
+                    WorkItemStatus::Pending,
+                );
+                return Response::error(id, &format!("failed to spawn agent: {}", e));
+            }
+        }
+
+        return Response::ok(
+            id,
+            serde_json::json!({
+                "story_id": story_id_str,
+                "next_task_id": next_task.short_id,
+                "resumed": true,
+            }),
+        );
+    }
+
+    // No pending tasks — check if all tasks are done/cancelled
+    let all_finished = tasks
+        .iter()
+        .filter(|t| t.item_type == ItemType::Task)
+        .all(|t| t.status == WorkItemStatus::Done || t.status == WorkItemStatus::Cancelled);
+
+    if all_finished {
+        if let Err(e) =
+            db::work_items::update_work_item_status(conn, &story.id, WorkItemStatus::Done)
+        {
+            return Response::error(id, &format!("database error: {}", e));
+        }
+    }
+
+    Response::ok(
+        id,
+        serde_json::json!({
+            "story_id": story_id_str,
+            "resumed": all_finished,
+        }),
+    )
+}
+
+/// Continue a cancelled story: restore to appropriate state based on worktree and dependencies.
+fn handle_continue_cancelled_story(
+    conn: &rusqlite::Connection,
+    id: String,
+    story_id_str: &str,
+    story: &WorkItem,
+) -> Response {
+    if story.worktree_path.is_some() {
+        // Has worktree: set to in_progress, resume from first pending task
+        if let Err(e) =
+            db::work_items::update_work_item_status(conn, &story.id, WorkItemStatus::InProgress)
+        {
+            return Response::error(id, &format!("database error: {}", e));
+        }
+
+        // Find and start the first pending task
+        let tasks = match db::work_items::list_work_items_by_parent(conn, &story.id) {
+            Ok(t) => t,
+            Err(e) => return Response::error(id, &format!("database error: {}", e)),
+        };
+
+        // Restore cancelled tasks to pending
+        for task in &tasks {
+            if task.item_type == ItemType::Task && task.status == WorkItemStatus::Cancelled {
+                let _ = db::work_items::update_work_item_status(
+                    conn,
+                    &task.id,
+                    WorkItemStatus::Pending,
+                );
+            }
+        }
+
+        // Re-read tasks after restoring
+        let tasks = match db::work_items::list_work_items_by_parent(conn, &story.id) {
+            Ok(t) => t,
+            Err(e) => return Response::error(id, &format!("database error: {}", e)),
+        };
+
+        let next_pending = nflow_core::work_item::get_next_pending_task(story.id, &tasks);
+
+        if let Some(next_task) = next_pending {
+            if let Err(e) = db::work_items::update_work_item_status(
+                conn,
+                &next_task.id,
+                WorkItemStatus::InProgress,
+            ) {
+                return Response::error(id, &format!("database error: {}", e));
+            }
+
+            return Response::ok(
+                id,
+                serde_json::json!({
+                    "story_id": story_id_str,
+                    "next_task_id": next_task.short_id,
+                    "resumed": true,
+                }),
+            );
+        }
+
+        Response::ok(
+            id,
+            serde_json::json!({
+                "story_id": story_id_str,
+                "resumed": true,
+            }),
+        )
+    } else {
+        // No worktree: set to ready or pending based on dependency state
+        let blockers = match db::work_items::list_blockers_for_story(conn, &story.id) {
+            Ok(b) => b,
+            Err(e) => return Response::error(id, &format!("database error: {}", e)),
+        };
+
+        let all_blockers_done = if blockers.is_empty() {
+            true
+        } else {
+            blockers.iter().all(|dep| {
+                match db::work_items::get_work_item_by_id(conn, &dep.blocker_id) {
+                    Ok(Some(blocker)) => {
+                        blocker.status == WorkItemStatus::Done
+                            || blocker.status == WorkItemStatus::Cancelled
+                    }
+                    _ => false,
+                }
+            })
+        };
+
+        // Restore cancelled tasks to pending
+        let tasks = match db::work_items::list_work_items_by_parent(conn, &story.id) {
+            Ok(t) => t,
+            Err(e) => return Response::error(id, &format!("database error: {}", e)),
+        };
+
+        for task in &tasks {
+            if task.item_type == ItemType::Task && task.status == WorkItemStatus::Cancelled {
+                let _ = db::work_items::update_work_item_status(
+                    conn,
+                    &task.id,
+                    WorkItemStatus::Pending,
+                );
+            }
+        }
+
+        let new_status = if all_blockers_done {
+            WorkItemStatus::Ready
+        } else {
+            WorkItemStatus::Pending
+        };
+
+        if let Err(e) = db::work_items::update_work_item_status(conn, &story.id, new_status) {
+            return Response::error(id, &format!("database error: {}", e));
+        }
+
+        Response::ok(
+            id,
+            serde_json::json!({
+                "story_id": story_id_str,
+                "resumed": false,
+            }),
+        )
+    }
+}
+
+/// Spawn a Claude agent for a task within a story's worktree.
+/// Reusable helper for continue/skip/retry handlers.
+fn spawn_agent_for_task(
+    conn: &rusqlite::Connection,
+    task: &WorkItem,
+    story: &WorkItem,
+) -> std::result::Result<(), String> {
+    let session = match db::decomposition_sessions::get_decomposition_session(
+        conn,
+        &task.decomposition_session_id,
+    ) {
+        Ok(Some(s)) => s,
+        Ok(None) => return Err("decomposition session not found".into()),
+        Err(e) => return Err(format!("database error: {}", e)),
+    };
+
+    let project = match db::projects::get_project_by_id(conn, &session.project_id) {
+        Ok(Some(p)) => p,
+        Ok(None) => return Err("project not found".into()),
+        Err(e) => return Err(format!("database error: {}", e)),
+    };
+
+    let worktree_path = match &story.worktree_path {
+        Some(p) => PathBuf::from(p),
+        None => return Err("story has no worktree".into()),
+    };
+
+    let nflow_home = match crate::daemon::nflow_home() {
+        Ok(h) => h,
+        Err(e) => return Err(format!("failed to get nflow home: {}", e)),
+    };
+
+    let is_verify = task.kind == Some(TaskKind::Verify);
+    let override_dir = nflow_home.join("prompts");
+    let override_path = if override_dir.is_dir() {
+        Some(override_dir)
+    } else {
+        None
+    };
+
+    let template_name = if is_verify {
+        "verify_task"
+    } else {
+        "task_execution"
+    };
+    let template =
+        match nflow_claude::prompt::load_template(template_name, override_path.as_deref()) {
+            Ok(t) => t,
+            Err(e) => return Err(format!("failed to load prompt template: {}", e)),
+        };
+
+    let all_tasks = match db::work_items::list_work_items_by_parent(conn, &story.id) {
+        Ok(t) => t,
+        Err(e) => return Err(format!("database error: {}", e)),
+    };
+
+    let vars_map = if is_verify {
+        let impl_task = all_tasks
+            .iter()
+            .find(|t| {
+                t.item_type == ItemType::Task
+                    && t.kind == Some(TaskKind::Impl)
+                    && t.parent_id == task.parent_id
+                    && t.sort_order == task.sort_order - 1
+            })
+            .unwrap_or(task);
+        nflow_claude::context::build_verify_context(task, impl_task, &project.name)
+    } else {
+        let completed: Vec<_> = all_tasks
+            .iter()
+            .filter(|t| {
+                t.item_type == ItemType::Task
+                    && t.kind == Some(TaskKind::Impl)
+                    && t.status == WorkItemStatus::Done
+                    && t.id != task.id
+            })
+            .cloned()
+            .collect();
+        nflow_claude::context::build_task_context(task, &project.name, &completed, "")
+    };
+
+    let vars_ref: std::collections::HashMap<&str, &str> = vars_map
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+
+    let rendered_prompt = match nflow_claude::prompt::render_template(&template, &vars_ref) {
+        Ok(p) => p,
+        Err(e) => return Err(format!("failed to render prompt: {}", e)),
+    };
+
+    let agent_logs_dir = nflow_home
+        .join("projects")
+        .join(&project.name)
+        .join("agent-logs");
+    if let Err(e) = std::fs::create_dir_all(&agent_logs_dir) {
+        return Err(format!("failed to create agent-logs dir: {}", e));
+    }
+
+    let prompt_file_path = agent_logs_dir.join(format!("{}.prompt.md", task.short_id));
+    if let Err(e) = std::fs::write(&prompt_file_path, &rendered_prompt) {
+        return Err(format!("failed to write prompt file: {}", e));
+    }
+
+    let task_prompt = format!(
+        "Implement the task as described in the system prompt file. Task: [{}] {}",
+        task.short_id, task.title
+    );
+
+    let mut run_config = if is_verify {
+        nflow_claude::runner::RunConfig::for_verify_task(task_prompt)
+    } else {
+        nflow_claude::runner::RunConfig::for_impl_task(task_prompt)
+    };
+    run_config.working_dir = Some(worktree_path);
+    run_config.system_prompt_file = Some(prompt_file_path);
+
+    let runner = nflow_claude::runner::ClaudeRunner::new();
+    let process = match runner.spawn(&run_config) {
+        Ok(p) => p,
+        Err(e) => return Err(format!("failed to spawn Claude agent: {}", e)),
+    };
+
+    let pid = process.pid;
+    let pid_start_time = crate::recovery::read_process_start_time(pid);
+
+    let log_path = agent_logs_dir.join(format!("{}.log", task.short_id));
+    let log_path_str = log_path.to_string_lossy().to_string();
+
+    let agent_run = db::agent_runs::AgentRun {
+        id: uuid::Uuid::new_v4(),
+        work_item_id: task.id,
+        pid: Some(pid),
+        session_id: None,
+        pid_start_time,
+        status: db::agent_runs::AgentRunStatus::Running,
+        exit_code: None,
+        log_path: Some(log_path_str),
+        error_message: None,
+        started_at: chrono::Utc::now(),
+        finished_at: None,
+    };
+
+    if let Err(e) = db::agent_runs::insert_agent_run(conn, &agent_run) {
+        return Err(format!("database error: {}", e));
+    }
+
+    // Spawn background task to pipe stdout to log file
+    let mut stdout = process.stdout;
+    let _stderr = process.stderr;
+    let _child = process.child;
+
+    tokio::spawn(async move {
+        let log_file = match tokio::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+            .await
+        {
+            Ok(f) => f,
+            Err(_) => return,
+        };
+        let mut writer = tokio::io::BufWriter::new(log_file);
+
+        while let Ok(Some(line)) = stdout.next_line().await {
+            use tokio::io::AsyncWriteExt;
+            let _ = writer.write_all(line.as_bytes()).await;
+            let _ = writer.write_all(b"\n").await;
+            let _ = writer.flush().await;
+        }
+    });
+
+    Ok(())
 }
 
 #[cfg(test)]

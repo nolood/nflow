@@ -225,6 +225,24 @@ pub fn list_blockers_for_story(conn: &Connection, story_id: &Uuid) -> Result<Vec
     Ok(deps)
 }
 
+pub fn list_dependents_of_story(conn: &Connection, story_id: &Uuid) -> Result<Vec<Dependency>> {
+    let mut stmt =
+        conn.prepare("SELECT blocker_id, blocked_id FROM dependencies WHERE blocker_id = ?1")?;
+    let rows = stmt.query_map(params![story_id.to_string()], |row| {
+        let blocker_str: String = row.get("blocker_id")?;
+        let blocked_str: String = row.get("blocked_id")?;
+        Ok(Dependency::new(
+            parse_uuid(&blocker_str),
+            parse_uuid(&blocked_str),
+        ))
+    })?;
+    let mut deps = Vec::new();
+    for row in rows {
+        deps.push(row?);
+    }
+    Ok(deps)
+}
+
 pub fn update_work_item_status(conn: &Connection, id: &Uuid, status: WorkItemStatus) -> Result<()> {
     conn.execute(
         "UPDATE work_items SET status = ?1, updated_at = ?2 WHERE id = ?3",

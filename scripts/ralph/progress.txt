@@ -2,6 +2,9 @@
 - Wave-prefixed short IDs: "W{wave}-{short_id}" format. Use find_work_item_by_wave_short_id() to look up by parsing wave number and joining on decomposition_sessions.
 - Handlers that need to spawn Claude agents must inline the spawning logic (not call start_task_execution) because Connection isn't Send across async boundaries. Use std::process::Command for sync git ops, ClaudeRunner::spawn() for sync process creation, tokio::spawn only for log piping.
 - exec.skip handler pattern: skip task (Done), skip/cancel verify, find next pending task → spawn agent, or trigger story completion if all tasks finished
+- exec.continue handler pattern: story-level (not task-level), handles both Failed and Cancelled stories differently. Failed→skip failed task + resume. Cancelled with worktree→InProgress + restore cancelled tasks to Pending. Cancelled without worktree→Ready/Pending based on blockers.
+- spawn_agent_for_task() is a reusable helper for spawning Claude agents — extracted from common pattern in exec.skip/exec.continue/exec.retry
+- list_dependents_of_story() finds stories blocked by a given story (WHERE blocker_id = X), complementary to list_blockers_for_story() (WHERE blocked_id = X)
 - Story completion lifecycle: rebase → push → MR creation → DB update → worktree cleanup → event broadcast (all in execute_complete_story)
 - On any failure during story completion (rebase/push/MR), story is rolled back to Failed status via fail_story_on_completion_error()
 - Wall-clock timeout: check_agent_timeouts() runs as Phase 0.5 in scheduler_tick (after reaping, before scheduling). Uses nix SIGTERM→sleep(10s)→SIGKILL pattern.
@@ -1618,4 +1621,23 @@ Started: Sat Feb  7 03:49:10 PM MSK 2026
   - Verify task status determines action: Pending→Cancelled, Failed→Done (matching nflow-core skip_task semantics)
   - Story completion after skip is determined by checking all_finished (Done|Cancelled) on remaining tasks
   - When task is skipped but next task exists: restore story from Failed→InProgress before spawning agent
+---
+
+## 2026-02-07 - US-063
+- What was implemented: exec.continue command handler for resuming failed or cancelled stories
+  - For failed stories: finds current failed task, marks as done (skipped), handles paired verify task, finds next pending task, spawns agent
+  - For cancelled stories with worktree: restores to InProgress, restores cancelled tasks to Pending, resumes from first pending task
+  - For cancelled stories without worktree: checks dependency state, sets to Ready (all blockers done) or Pending (blockers remaining)
+  - Dependents check: warns if cancelled story has dependents, --force flag bypasses
+  - Extracted spawn_agent_for_task() reusable helper from common agent spawning pattern
+  - Added list_dependents_of_story() DB function (WHERE blocker_id = X)
+  - Returns { story_id, next_task_id?, resumed: bool }
+- Files changed:
+  - crates/nflow-daemon/src/handlers.rs (handle_exec_continue, handle_continue_failed_story, handle_continue_cancelled_story, spawn_agent_for_task, dispatch route)
+  - crates/nflow-daemon/src/db/work_items.rs (list_dependents_of_story)
+- **Learnings for future iterations:**
+  - Story state machine doesn't allow Cancelled→InProgress directly — exec.continue bypasses via update_work_item_status() at DB level
+  - Cancelled stories need task restoration: cancelled tasks should be reset to Pending before finding next pending task
+  - exec.continue operates on story_id (wave-prefixed like "W1-S1") not task_id — different from exec.retry/exec.skip
+  - spawn_agent_for_task() is a good refactoring target — exec.retry and exec.skip could also use it to reduce duplication
 ---
