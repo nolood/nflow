@@ -1,4 +1,5 @@
 ## Codebase Patterns
+- CLI uses clap::Parser with nested Subcommand enums: Cli → Commands → DaemonCommand/SpecCommand/PlanCommand/etc. Global flags use `#[arg(global = true)]`
 - Filesystem security: ~/.nflow/ created with 0700, enforce_dir_permissions() checks & fixes too-open dirs, socket 0600, DB inherits from dir
 - Config files: global at ~/.nflow/config.toml, per-project at ~/.nflow/projects/{name}/config.toml — both use TOML format with PartialConfig struct
 - KNOWN_CONFIG_KEYS constant maps key names to expected types (integer/string/boolean) for validation
@@ -1759,4 +1760,18 @@ Started: Sat Feb  7 03:49:10 PM MSK 2026
   - Don't modify HOME env var in tests — causes race conditions with parallel tests that use nflow_home()
   - Database file permissions are inherited from the parent directory's 0700 mode — no explicit chmod needed on the DB file
   - std::os::unix::fs::PermissionsExt works identically on Linux and macOS (both POSIX)
+---
+
+## 2026-02-08 - US-069
+- What was implemented: CLI skeleton with clap — all commands and subcommands defined via clap derive macros
+  - Cli struct with global flags: --project, --verbose, --json, --no-color
+  - Command groups: daemon (start/stop/status), init, projects (list), project (delete), spec (new/list/view/resume/approve/reopen/delete), plan (generate/show/feedback/approve/discard), run, pause, status, log, retry, skip, continue, stop, cancel, worktree (list/clean), cleanup, config (show/set), tui
+  - All flags match docs/cli.md specification (--with-codebase, --wave, --follow, --force, --dry-run, --parallel, --story, --all, --older-than, --dag, --specs, --foreground, etc.)
+- Files changed:
+  - crates/nflow-cli/src/cli.rs (new — all CLI command definitions)
+  - crates/nflow-cli/src/main.rs (updated — uses Cli::parse())
+- **Learnings for future iterations:**
+  - clap global flags propagate to all subcommands with `#[arg(global = true)]`
+  - Nested subcommands use `#[command(subcommand)]` attribute on the enum variant
+  - Command dispatch to daemon will map CLI commands → daemon command strings (e.g., `nflow spec new` → `"spec.new"`)
 ---
