@@ -4,12 +4,17 @@ pub mod error;
 pub mod events;
 pub mod handlers;
 mod recovery;
+mod scheduler_loop;
 mod shutdown;
 pub mod socket;
 
 use std::env;
+use std::time::Duration;
 
-fn main() {
+use tracing::debug;
+
+#[tokio::main]
+async fn main() {
     let mode = env::var("NFLOW_DAEMON_MODE")
         .unwrap_or_default()
         .to_lowercase();
@@ -46,11 +51,38 @@ fn main() {
                 std::process::id()
             );
 
-            // Main loop — wait for shutdown signal
-            // When shutting_down is set, the scheduler stops and no new
-            // connections are accepted.
-            while !daemon::is_shutting_down() {
-                std::thread::sleep(std::time::Duration::from_millis(100));
+            // --- Scheduler loop on the main task ---
+            // Ticks every 2 seconds, serialized with command handling.
+            // Skips tick when shutting_down flag is set.
+            let mut interval = tokio::time::interval(Duration::from_secs(2));
+
+            loop {
+                interval.tick().await;
+
+                if daemon::is_shutting_down() {
+                    break;
+                }
+
+                // Open DB connection for this tick
+                let db_path = match daemon::db_path() {
+                    Ok(p) => p,
+                    Err(_) => continue,
+                };
+
+                let conn = match db::open_connection(&db_path) {
+                    Ok(c) => c,
+                    Err(_) => continue,
+                };
+
+                // Run scheduler tick (synchronous — serialized on main task)
+                let actions = scheduler_loop::scheduler_tick(&conn);
+
+                if !actions.is_empty() {
+                    debug!("scheduler: {} actions produced this tick", actions.len());
+                }
+
+                // Action execution will be implemented in future stories (US-053+).
+                // For now, the scheduler only logs actions at DEBUG level.
             }
 
             eprintln!("nflow-daemon shutting down gracefully...");
@@ -73,7 +105,6 @@ fn main() {
                         report.agents_sigtermed,
                         report.agents_sigkilled
                     );
-                    // Connection is dropped here, closing the database
                 }
                 Err(e) => {
                     eprintln!("Warning: could not open database for shutdown: {}", e);

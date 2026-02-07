@@ -1,4 +1,6 @@
 ## Codebase Patterns
+- Scheduler loop runs on main tokio task with tokio::time::interval(2s) — serialized, no concurrent DB writes
+- scheduler_tick() takes &Connection, builds SchedulerState per project from DB, calls nflow-core schedule()
 - recovery.rs uses db::Result (DbError), not error::Result (DaemonError) — DB-centric modules should use the db error type
 - Command handlers in handlers.rs: HandlerState holds db_path, create_handler() returns a CommandHandler closure, dispatch() routes by command string
 - Handlers run in spawn_blocking (sync context) — use std::process::Command for git, not tokio::process
@@ -1364,4 +1366,28 @@ Started: Sat Feb  7 03:49:10 PM MSK 2026
   - The discard handler operates directly on DB (delete work items, update specs, update session status) rather than using nflow-core's discard_session() helper, since the handler already has DB access and the helper works on in-memory structs
   - auto_execute is a Config field but isn't wired up to handlers yet — accept it as a param to plan.approve for now
   - Pre-existing flaky test: daemon::tests::test_foreground_mode_writes_pid_file_and_sets_shutdown fails when run with full workspace due to filesystem race conditions
+---
+
+## 2026-02-07 - US-052
+- What was implemented: Scheduler loop — main integration in nflow-daemon
+  - New `scheduler_loop.rs` module with `scheduler_tick()` function that:
+    - Lists all projects, skips those without execution_enabled
+    - For each enabled project: loads sessions, work items, dependencies, running agents from DB
+    - Builds `SchedulerState` snapshot, calls nflow-core's pure `schedule()` function
+    - Logs all returned actions at DEBUG level via `tracing::debug!`
+    - Returns collected (project_id, SchedulerAction) pairs
+  - Converted `main.rs` from sync polling loop to `#[tokio::main]` async with `tokio::time::interval(Duration::from_secs(2))`
+  - Scheduler tick runs on the main task (not spawned), serialized with future command handling
+  - Skips tick when `daemon::is_shutting_down()` returns true (breaks loop)
+  - Skips tick when no projects have `execution_enabled = true`
+  - 5 new unit tests covering: empty DB, disabled projects, no sessions, approved session mark_ready, unapproved session skip
+- Files changed:
+  - crates/nflow-daemon/src/scheduler_loop.rs (new — scheduler tick logic with tests)
+  - crates/nflow-daemon/src/main.rs (converted to #[tokio::main], added scheduler interval loop, registered scheduler_loop module)
+- **Learnings for future iterations:**
+  - scheduler_tick() accepts &Connection for testability (test_conn() gives in-memory migrated DB)
+  - DecompositionStatus→SessionStatus mapping needed at daemon layer (core uses separate enums)
+  - max_parallel is hardcoded to 3 — will be read from config in a future US
+  - Action execution (applying MarkStoryReady, StartStory, UpdateEpicStatus to DB and spawning agents) deferred to US-053+
+  - The main tokio runtime is needed for the scheduler interval; socket server already uses tokio::spawn internally
 ---
