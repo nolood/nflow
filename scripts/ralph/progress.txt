@@ -44,6 +44,9 @@
 - Generate dialog filters specs_list.items by status=="approved" to populate PlanGenerateState.specs
 - Plan view Enter now opens detail popup (not collapse toggle); Space toggles collapse instead
 - TUI plan tree view: PlanTreeState with flat Vec<PlanTreeNode>, visible_nodes() filters collapsed/verify; depth=0 wave, 1 epic, 2 story, 3 task; status icons mapped from string status; collapsible via toggle_collapse(); h toggles hide_verify
+- TUI execute split view: 40% tree (ExecuteTreeState) + 60% output (ExecuteOutputState); tree mirrors plan tree pattern; output supports streaming (auto-scroll bottom) and historical (scroll from top); Enter on task fetches log; J/K scroll output pane
+- exec.status returns { waves: [{ wave_number, status, epics: [...] }] } — multi-wave unlike plan.show which returns a single wave
+- ExecuteOutputState streaming: start_streaming(task_id, request_id) then append_line(); stop_streaming() on done; auto_select_running_task() finds first in_progress task at depth 3
 - plan.show daemon command returns { wave_number, status, epics: [{ short_id, title, status, stories: [{ ..., progress, depends_on, tasks }] }] }
 - visible_nodes() pattern: iterate all nodes, skip children when parent.collapsed, filter verify tasks when hide_verify — returns Vec<(real_index, &node)> for mapping back to flat array
 - Story completion lifecycle: rebase → push → MR creation → DB update → worktree cleanup → event broadcast (all in execute_complete_story)
@@ -2034,4 +2037,19 @@ Started: Sat Feb  7 03:49:10 PM MSK 2026
   - Generate dialog only shows approved specs — filter from specs_list.items by status
   - Confirmation popup uses ConfirmAction enum to carry intent; y/n dispatches the actual action
   - Detail popup shows basic node info; "any key dismisses" pattern (except Esc which goes through PlanSubViewExit)
+---
+
+## 2026-02-08 - US-081
+- What was implemented: TUI execute split view with task tree (left 40%) and agent output (right 60%)
+- Files changed:
+  - crates/nflow-tui/src/app.rs: Added ExecuteTreeNode, ExecuteTreeState (tree with visible_nodes, collapse, auto_select_running_task, update_from_response for multi-wave exec.status), ExecuteOutputState (historical + streaming output with scroll); App fields execute_tree/execute_output; fetch_execute(), in_execute_streaming() methods
+  - crates/nflow-tui/src/event.rs: Added ViewAction::ExecuteSelectTask; handle_execute_key (j/k nav, Space collapse, h verify toggle, Enter select task, J/K scroll output); wired into handle_view_key dispatch
+  - crates/nflow-tui/src/main.rs: Added handle_execute_select_task (fetch historical log or start streaming), parse_log_lines, poll_execute_streaming_data; execute streaming poll in event loop; fetch_execute on startup
+  - crates/nflow-tui/src/ui.rs: Added render_execute_view (horizontal split), render_execute_tree (reuses plan tree rendering pattern), render_execute_output (streaming with auto-scroll-bottom vs historical top-scroll)
+- **Learnings for future iterations:**
+  - exec.status returns { waves: [...] } array (multi-wave), unlike plan.show which returns a single wave object
+  - Execute tree uses same visible_nodes() pattern as plan tree but with ExecuteTreeNode (separate struct to avoid coupling)
+  - Output pane scrolling: streaming uses "offset from bottom" (0=latest), historical uses "offset from top" (0=first line)
+  - Auto-select running task on view entry: iterate visible nodes looking for depth=3 + status="in_progress"
+  - J/K (uppercase) for output pane scroll, j/k (lowercase) for tree navigation — avoids conflicts
 ---
