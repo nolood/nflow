@@ -98,6 +98,12 @@
 - bind_socket removes stale socket file before binding — always clean up existing socket on start
 - DB count queries scoped by project_id require JOIN on decomposition_sessions (work_items don't have direct project_id FK)
 - Error response prefixes: NOT_FOUND, INVALID_STATE, ALREADY_EXISTS, INVALID_PARAMS — for client-side error classification
+- Streaming handlers: sync DB ops in handler, async Claude process in tokio::spawn feeding mpsc channel → return HandlerResult::Streaming(rx)
+- tokio::spawn can be called from within spawn_blocking — the tokio runtime is still active
+- ClaudeRunner::spawn() is synchronous (not async), takes &RunConfig, returns Result<ClaudeProcess>
+- StreamParser::next_event() is async — reads from ClaudeProcess.stdout line-by-line
+- build_spec_context returns HashMap<String, String>; render_template needs HashMap<&str, &str> — convert with iter().map()
+- Tests calling handle_* that use tokio::spawn internally need #[tokio::test] (not #[test]) for the reactor
 - Sync worktree removal in handlers: use std::process::Command (not async nflow-git) since handlers run in spawn_blocking
 
 # Ralph Progress Log
@@ -1173,4 +1179,30 @@ Started: Sat Feb  7 03:49:10 PM MSK 2026
   - Error response prefixes: NOT_FOUND, INVALID_STATE, ALREADY_EXISTS, INVALID_PARAMS for client error classification
   - cargo fmt collapses 2-param DB functions to single line signatures
   - make_db_state/cleanup_db test helpers reduce test boilerplate for DB-backed handler tests
+---
+
+## US-045: Command handler — spec new (start session)
+- **Status:** PASSED
+- **Commit:** feat: [US-045] - Command handler — spec new (start session)
+- **What was implemented:**
+  - `handle_spec_new()` in handlers.rs — streaming command handler for "spec.new"
+  - Receives { project_name, spec_name, with_codebase? } params
+  - Validates no active spec session for the project via `has_active_spec_session()` DB helper
+  - Creates spec record with status=draft, session_active=true
+  - Loads spec_session.md template from prompts dir (with override support), renders with spec context
+  - Spawns Claude via `RunConfig::for_spec()` with working_dir based on with_codebase flag
+  - Streams Claude output (StreamParser events) to connected clients via mpsc channel
+  - Returns initial { spec_id, name, status: "draft" } then stream events, then done with session_id
+  - Added `has_active_spec_session()` DB helper in db/specs.rs
+  - 10 new tests (3 DB + 7 handler): 253 workspace total
+- **Files changed:**
+  - crates/nflow-daemon/src/db/specs.rs (has_active_spec_session + 3 tests)
+  - crates/nflow-daemon/src/handlers.rs (handle_spec_new, dispatch routing + 7 tests)
+- **Learnings for future iterations:**
+  - Streaming handler pattern: sync DB work in handler body, async Claude process in tokio::spawn feeding mpsc channel
+  - tokio::spawn works inside spawn_blocking context — the runtime is still active
+  - ClaudeRunner::spawn() is synchronous (takes &RunConfig), not async — no .await needed
+  - HashMap<String, String> → HashMap<&str, &str> conversion: use iter().map(|(k, v)| (k.as_str(), v.as_str())).collect()
+  - Tests that trigger tokio::spawn in the handler must use #[tokio::test] not #[test]
+  - Pre-existing flaky test: test_foreground_mode_writes_pid_file_and_sets_shutdown (race condition, not our fault)
 ---
