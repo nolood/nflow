@@ -4,7 +4,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Row, Table, Tabs, Wrap};
 use ratatui::Frame;
 
-use crate::app::{App, DaemonState, Overlay, View};
+use crate::app::{App, DaemonState, DialogueSessionState, Overlay, View};
 
 /// Render the entire TUI frame.
 pub fn render(app: &App, frame: &mut Frame) {
@@ -64,7 +64,13 @@ fn render_header(app: &App, frame: &mut Frame, area: Rect) {
 /// Render the main content area based on the active view.
 fn render_content(app: &App, frame: &mut Frame, area: Rect) {
     match app.current_view {
-        View::Specs => render_specs_list(app, frame, area),
+        View::Specs => {
+            if app.spec_dialogue.is_some() {
+                render_spec_dialogue(app, frame, area);
+            } else {
+                render_specs_list(app, frame, area);
+            }
+        }
         View::Plan => {
             let block = Block::default().borders(Borders::ALL).title("Plan");
             let paragraph = Paragraph::new("Plan view — shows decomposition waves").block(block);
@@ -202,6 +208,141 @@ fn render_specs_list(app: &App, frame: &mut Frame, area: Rect) {
         .column_spacing(1);
 
     frame.render_widget(table, area);
+}
+
+/// Render the spec dialogue sub-view with chat history and input field.
+fn render_spec_dialogue(app: &App, frame: &mut Frame, area: Rect) {
+    let dialogue = match &app.spec_dialogue {
+        Some(d) => d,
+        None => return,
+    };
+
+    // Split: 80% chat history, 20% input area (min 3 lines for input)
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage(80), // chat history
+            Constraint::Percentage(20), // input area
+        ])
+        .split(area);
+
+    // Ensure input area has at least 3 rows
+    let (chat_area, input_area) = if chunks[1].height < 3 {
+        let input_height = 3u16.min(area.height);
+        let chat_height = area.height.saturating_sub(input_height);
+        (
+            Rect::new(area.x, area.y, area.width, chat_height),
+            Rect::new(area.x, area.y + chat_height, area.width, input_height),
+        )
+    } else {
+        (chunks[0], chunks[1])
+    };
+
+    // --- Chat history ---
+    let title = format!("Spec: {} — Dialogue", dialogue.spec_name);
+    let chat_block = Block::default()
+        .borders(Borders::ALL)
+        .title(title)
+        .title_style(Style::default().add_modifier(Modifier::BOLD));
+
+    let mut chat_lines: Vec<Line> = Vec::new();
+    for msg in &dialogue.messages {
+        let (prefix_style, text_style) = if msg.sender == "Claude" {
+            (
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+                Style::default().fg(Color::White),
+            )
+        } else {
+            (
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+                Style::default().fg(Color::White),
+            )
+        };
+
+        let prefix = format!("{}: ", msg.sender);
+        let mut first = true;
+        for text_line in msg.text.lines() {
+            if first {
+                chat_lines.push(Line::from(vec![
+                    Span::styled(prefix.clone(), prefix_style),
+                    Span::styled(text_line, text_style),
+                ]));
+                first = false;
+            } else {
+                // Continuation lines indented by prefix width
+                let indent = " ".repeat(prefix.len());
+                chat_lines.push(Line::from(vec![
+                    Span::raw(indent),
+                    Span::styled(text_line, text_style),
+                ]));
+            }
+        }
+        if msg.text.is_empty() {
+            chat_lines.push(Line::from(vec![Span::styled(prefix, prefix_style)]));
+        }
+        // Blank line between messages
+        chat_lines.push(Line::from(""));
+    }
+
+    // Add streaming indicator if currently streaming
+    if dialogue.session_state == DialogueSessionState::Streaming {
+        chat_lines.push(Line::from(Span::styled(
+            "Claude is thinking...",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::ITALIC),
+        )));
+    }
+
+    // Calculate scroll: auto-scroll to bottom, offset adjusts
+    let inner_height = chat_area.height.saturating_sub(2); // borders
+    let total_lines = chat_lines.len() as u16;
+    let max_scroll = total_lines.saturating_sub(inner_height);
+    let scroll = max_scroll.saturating_sub(dialogue.scroll_offset);
+
+    let chat = Paragraph::new(chat_lines)
+        .block(chat_block)
+        .wrap(Wrap { trim: false })
+        .scroll((scroll, 0));
+
+    frame.render_widget(chat, chat_area);
+
+    // --- Input area ---
+    let input_title = match dialogue.session_state {
+        DialogueSessionState::WaitingForInput => {
+            "Your answer (Enter to send, Ctrl+D to end, Esc to exit)"
+        }
+        DialogueSessionState::Streaming => "Waiting for Claude...",
+        DialogueSessionState::Completed => "Session completed (Esc to exit)",
+    };
+
+    let input_border_color = match dialogue.session_state {
+        DialogueSessionState::WaitingForInput => Color::Green,
+        DialogueSessionState::Streaming => Color::Yellow,
+        DialogueSessionState::Completed => Color::DarkGray,
+    };
+
+    let input_block = Block::default()
+        .borders(Borders::ALL)
+        .title(input_title)
+        .title_style(Style::default().fg(input_border_color))
+        .border_style(Style::default().fg(input_border_color));
+
+    let input_text = if dialogue.session_state == DialogueSessionState::WaitingForInput {
+        format!("{}_", dialogue.input) // Show cursor
+    } else {
+        dialogue.input.clone()
+    };
+
+    let input = Paragraph::new(input_text)
+        .block(input_block)
+        .wrap(Wrap { trim: false });
+
+    frame.render_widget(input, input_area);
 }
 
 /// Render the status bar at the bottom.

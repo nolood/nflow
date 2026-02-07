@@ -33,6 +33,9 @@
 - nix crate for TUI needs features = ["signal", "process", "fs"] (fs for Flock/FlockArg)
 - TUI overlay pattern: Overlay enum + App.toggle_overlay()/close_overlay()/has_overlay(); Esc closes any overlay; navigation keys guarded with `if !app.has_overlay()`
 - TUI view-specific keys: handle_key_event returns (bool, ViewAction); handle_view_key dispatches by current_view to per-view handler (handle_specs_key etc.)
+- TUI sub-view pattern: App.spec_dialogue: Option<SpecDialogueState> — presence indicates sub-view active; handle_key_event checks in_dialogue() before global keys; dialogue keys handled exclusively in handle_dialogue_key()
+- TUI streaming in event loop: try_read_streaming_line(10ms timeout) polls non-blocking in main loop; streaming state controls whether poll happens; input disabled during Streaming state
+- TUI dialogue message coalescing: add_claude_message() appends to last message if sender matches — avoids fragmenting contiguous text events into separate messages
 - TUI list state pattern: XxxListState struct with items Vec, selected usize, select_prev/select_next, update_from_response
 - centered_rect(percent_x, percent_y, area) computes a centered Rect for popup overlays; use Clear widget before rendering popup
 - Story completion lifecycle: rebase → push → MR creation → DB update → worktree cleanup → event broadcast (all in execute_complete_story)
@@ -1954,4 +1957,28 @@ Started: Sat Feb  7 03:49:10 PM MSK 2026
   - `handle_key_event` returning `(bool, ViewAction)` cleanly separates sync state updates from async daemon operations
   - Selection clamping in `update_from_response()` prevents out-of-bounds after refresh with fewer items
   - View-specific keys routed through `handle_view_key` → per-view handler — extensible for Plan/Execute/Logs views
+---
+
+## 2026-02-08 - US-077
+- What was implemented: TUI spec dialogue sub-view — interactive chat interface for Claude spec conversations
+- Key implementation details:
+  - SpecDialogueState: messages Vec, input buffer, session_state (Streaming/WaitingForInput/Completed), spec_id, scroll_offset
+  - DialogueMessage coalescing: contiguous Claude messages merged into single message (streaming text events)
+  - Split layout: 80% scrollable chat history (with auto-scroll) + 20% input area with cursor indicator
+  - Non-blocking streaming: try_read_streaming_line(10ms) polls in event loop without blocking UI
+  - Dialogue intercepts all keys: Esc exits, Ctrl+D ends session, Enter sends input, Up/Down scroll
+  - State-dependent input: typing only in WaitingForInput, scroll always works, completed only allows Esc
+  - send_streaming_command returns request_id; events processed by type (text, result, question with options)
+  - 18 new tests (61 total): dialogue state, message coalescing, key handling in all states, global key blocking
+- Files changed:
+  - crates/nflow-tui/src/app.rs (DialogueMessage, DialogueSessionState, SpecDialogueState, enter/exit_dialogue, in_dialogue, 11 new tests)
+  - crates/nflow-tui/src/event.rs (ViewAction::Dialogue*, handle_dialogue_key, 13 new tests)
+  - crates/nflow-tui/src/ui.rs (render_spec_dialogue, split layout, chat rendering, input area)
+  - crates/nflow-tui/src/main.rs (event_loop with client, poll_streaming_data, handle_spec_new/resume/send_answer/end)
+  - crates/nflow-tui/src/socket_client.rs (send_streaming_command, try_read_streaming_line)
+- **Learnings for future iterations:**
+  - Non-blocking streaming in TUI: use short timeout (10ms) on read to keep event loop responsive; check state before polling
+  - Dialogue sub-views override all global keys except Ctrl+C — must be checked first in handle_key_event
+  - Message coalescing: check last message sender before creating new DialogueMessage to avoid fragmented streaming output
+  - Paragraph.scroll((y, x)) + Wrap for auto-scrolling chat — calculate max_scroll from line count and viewport height
 ---

@@ -57,7 +57,6 @@ pub enum ResponseStatus {
     Error,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StreamingResponseLine {
     pub id: String,
@@ -197,6 +196,42 @@ impl SocketClient {
         }
 
         Ok(response)
+    }
+
+    /// Send a command and start receiving a streaming response.
+    ///
+    /// Returns the request ID. Use `try_read_streaming_line` to poll for lines.
+    pub async fn send_streaming_command(
+        &mut self,
+        command: &str,
+        params: serde_json::Value,
+    ) -> Result<String> {
+        let request_id = uuid::Uuid::new_v4().to_string();
+
+        let request = Request {
+            id: request_id.clone(),
+            command: command.to_string(),
+            params,
+        };
+
+        self.write_line(&request).await?;
+
+        Ok(request_id)
+    }
+
+    /// Try to read a streaming response line with a short timeout.
+    ///
+    /// Returns `Ok(Some(line))` if a line was available, `Ok(None)` if timed out
+    /// (no data yet), or `Err` on connection/parse errors.
+    pub async fn try_read_streaming_line(
+        &mut self,
+        poll_timeout: Duration,
+    ) -> Result<Option<StreamingResponseLine>> {
+        match timeout(poll_timeout, self.read_line::<StreamingResponseLine>()).await {
+            Ok(Ok(line)) => Ok(Some(line)),
+            Ok(Err(e)) => Err(e),
+            Err(_) => Ok(None), // Timeout — no data available yet
+        }
     }
 
     /// Write a serializable value as a single NDJSON line.

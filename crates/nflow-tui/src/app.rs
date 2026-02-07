@@ -84,6 +84,96 @@ impl SpecsListState {
     }
 }
 
+/// A single message in the spec dialogue chat.
+#[derive(Debug, Clone)]
+pub struct DialogueMessage {
+    /// Who sent this message ("Claude" or "You").
+    pub sender: String,
+    /// The message text.
+    pub text: String,
+}
+
+/// State of the spec dialogue streaming session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DialogueSessionState {
+    /// Streaming output from Claude (input disabled).
+    Streaming,
+    /// Waiting for user input (input enabled).
+    WaitingForInput,
+    /// Session completed or ended.
+    Completed,
+}
+
+/// State for the spec dialogue sub-view.
+#[derive(Debug)]
+pub struct SpecDialogueState {
+    /// Chat messages history.
+    pub messages: Vec<DialogueMessage>,
+    /// Current user input buffer.
+    pub input: String,
+    /// Current session state (streaming, waiting for input, completed).
+    pub session_state: DialogueSessionState,
+    /// The spec ID for this dialogue (set once streaming starts).
+    pub spec_id: Option<String>,
+    /// The spec name being dialogued.
+    pub spec_name: String,
+    /// Streaming request ID (to validate response lines).
+    pub request_id: Option<String>,
+    /// Scroll offset for the message area (0 = bottom, auto-scroll).
+    pub scroll_offset: u16,
+}
+
+impl SpecDialogueState {
+    /// Create a new dialogue state for the given spec.
+    pub fn new(spec_name: String) -> Self {
+        Self {
+            messages: Vec::new(),
+            input: String::new(),
+            session_state: DialogueSessionState::Streaming,
+            spec_id: None,
+            spec_name,
+            request_id: None,
+            scroll_offset: 0,
+        }
+    }
+
+    /// Add a message from Claude.
+    pub fn add_claude_message(&mut self, text: String) {
+        if let Some(last) = self.messages.last_mut() {
+            if last.sender == "Claude" {
+                // Append to existing Claude message for contiguous text events
+                last.text.push_str(&text);
+                self.scroll_offset = 0; // Auto-scroll
+                return;
+            }
+        }
+        self.messages.push(DialogueMessage {
+            sender: "Claude".to_string(),
+            text,
+        });
+        self.scroll_offset = 0;
+    }
+
+    /// Add a message from the user.
+    pub fn add_user_message(&mut self, text: String) {
+        self.messages.push(DialogueMessage {
+            sender: "You".to_string(),
+            text,
+        });
+        self.scroll_offset = 0;
+    }
+
+    /// Scroll up in the message area.
+    pub fn scroll_up(&mut self) {
+        self.scroll_offset = self.scroll_offset.saturating_add(1);
+    }
+
+    /// Scroll down in the message area.
+    pub fn scroll_down(&mut self) {
+        self.scroll_offset = self.scroll_offset.saturating_sub(1);
+    }
+}
+
 /// Overlay that can be displayed on top of the current view.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Overlay {
@@ -173,6 +263,8 @@ pub struct App {
     pub active_agent_count: u32,
     /// Specs list view state.
     pub specs_list: SpecsListState,
+    /// Active spec dialogue state (if in dialogue sub-view).
+    pub spec_dialogue: Option<SpecDialogueState>,
 }
 
 impl App {
@@ -188,6 +280,7 @@ impl App {
             current_wave: None,
             active_agent_count: 0,
             specs_list: SpecsListState::new(),
+            spec_dialogue: None,
         }
     }
 
@@ -244,6 +337,21 @@ impl App {
     /// Returns true if any overlay is currently shown.
     pub fn has_overlay(&self) -> bool {
         self.overlay.is_some()
+    }
+
+    /// Returns true if a spec dialogue is active.
+    pub fn in_dialogue(&self) -> bool {
+        self.spec_dialogue.is_some()
+    }
+
+    /// Enter spec dialogue mode for a given spec.
+    pub fn enter_dialogue(&mut self, spec_name: String) {
+        self.spec_dialogue = Some(SpecDialogueState::new(spec_name));
+    }
+
+    /// Exit spec dialogue mode and return to specs list.
+    pub fn exit_dialogue(&mut self) {
+        self.spec_dialogue = None;
     }
 
     /// Attempt to connect to the daemon and fetch initial state.
@@ -558,5 +666,105 @@ mod tests {
         let app = App::new("test".to_string());
         assert!(app.specs_list.items.is_empty());
         assert_eq!(app.specs_list.selected, 0);
+    }
+
+    // --- SpecDialogueState tests ---
+
+    #[test]
+    fn test_dialogue_initial_state() {
+        let state = SpecDialogueState::new("test-spec".to_string());
+        assert!(state.messages.is_empty());
+        assert!(state.input.is_empty());
+        assert_eq!(state.session_state, DialogueSessionState::Streaming);
+        assert_eq!(state.spec_name, "test-spec");
+        assert!(state.spec_id.is_none());
+        assert!(state.request_id.is_none());
+        assert_eq!(state.scroll_offset, 0);
+    }
+
+    #[test]
+    fn test_dialogue_add_claude_message() {
+        let mut state = SpecDialogueState::new("test".to_string());
+        state.add_claude_message("Hello!".to_string());
+        assert_eq!(state.messages.len(), 1);
+        assert_eq!(state.messages[0].sender, "Claude");
+        assert_eq!(state.messages[0].text, "Hello!");
+    }
+
+    #[test]
+    fn test_dialogue_add_user_message() {
+        let mut state = SpecDialogueState::new("test".to_string());
+        state.add_user_message("My answer".to_string());
+        assert_eq!(state.messages.len(), 1);
+        assert_eq!(state.messages[0].sender, "You");
+        assert_eq!(state.messages[0].text, "My answer");
+    }
+
+    #[test]
+    fn test_dialogue_claude_message_coalescing() {
+        let mut state = SpecDialogueState::new("test".to_string());
+        state.add_claude_message("Part 1".to_string());
+        state.add_claude_message(" Part 2".to_string());
+        // Contiguous Claude messages should be merged
+        assert_eq!(state.messages.len(), 1);
+        assert_eq!(state.messages[0].text, "Part 1 Part 2");
+    }
+
+    #[test]
+    fn test_dialogue_message_interleaving() {
+        let mut state = SpecDialogueState::new("test".to_string());
+        state.add_claude_message("Question?".to_string());
+        state.add_user_message("Answer!".to_string());
+        state.add_claude_message("Thanks!".to_string());
+        assert_eq!(state.messages.len(), 3);
+        assert_eq!(state.messages[0].sender, "Claude");
+        assert_eq!(state.messages[1].sender, "You");
+        assert_eq!(state.messages[2].sender, "Claude");
+    }
+
+    #[test]
+    fn test_dialogue_scroll() {
+        let mut state = SpecDialogueState::new("test".to_string());
+        assert_eq!(state.scroll_offset, 0);
+
+        state.scroll_up();
+        assert_eq!(state.scroll_offset, 1);
+
+        state.scroll_up();
+        assert_eq!(state.scroll_offset, 2);
+
+        state.scroll_down();
+        assert_eq!(state.scroll_offset, 1);
+
+        state.scroll_down();
+        assert_eq!(state.scroll_offset, 0);
+
+        // Can't go below 0
+        state.scroll_down();
+        assert_eq!(state.scroll_offset, 0);
+    }
+
+    #[test]
+    fn test_dialogue_auto_scroll_on_new_message() {
+        let mut state = SpecDialogueState::new("test".to_string());
+        state.scroll_offset = 5;
+        state.add_claude_message("New message".to_string());
+        // Auto-scroll resets offset to 0
+        assert_eq!(state.scroll_offset, 0);
+    }
+
+    #[test]
+    fn test_app_dialogue_lifecycle() {
+        let mut app = App::new("test".to_string());
+        assert!(!app.in_dialogue());
+        assert!(app.spec_dialogue.is_none());
+
+        app.enter_dialogue("my-spec".to_string());
+        assert!(app.in_dialogue());
+        assert_eq!(app.spec_dialogue.as_ref().unwrap().spec_name, "my-spec");
+
+        app.exit_dialogue();
+        assert!(!app.in_dialogue());
+        assert!(app.spec_dialogue.is_none());
     }
 }

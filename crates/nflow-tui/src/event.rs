@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 
-use crate::app::{App, Overlay, View};
+use crate::app::{App, DialogueSessionState, Overlay, View};
 
 /// Poll for a crossterm event with the given timeout.
 ///
@@ -31,6 +31,12 @@ pub enum ViewAction {
     SpecView,
     /// Request to resume the selected spec session.
     SpecResume,
+    /// User submitted input in the dialogue (text from input buffer).
+    DialogueSendAnswer(String),
+    /// User ended the dialogue session (Ctrl+D).
+    DialogueEndSession,
+    /// User exited dialogue back to specs list (Esc).
+    DialogueExit,
 }
 
 /// Handle a key event, returning true if the app should continue, false to quit.
@@ -40,6 +46,12 @@ pub fn handle_key_event(app: &mut App, key: KeyEvent) -> (bool, ViewAction) {
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
         app.should_quit = true;
         return (false, ViewAction::None);
+    }
+
+    // If in dialogue mode, handle dialogue keys exclusively
+    if app.in_dialogue() {
+        let action = handle_dialogue_key(app, key);
+        return (true, action);
     }
 
     // Escape closes any open overlay
@@ -108,6 +120,74 @@ pub fn handle_key_event(app: &mut App, key: KeyEvent) -> (bool, ViewAction) {
         }
 
         _ => (true, ViewAction::None),
+    }
+}
+
+/// Handle key events in the spec dialogue sub-view.
+fn handle_dialogue_key(app: &mut App, key: KeyEvent) -> ViewAction {
+    let dialogue = match &mut app.spec_dialogue {
+        Some(d) => d,
+        None => return ViewAction::None,
+    };
+
+    // Esc always exits dialogue and returns to specs list
+    if key.code == KeyCode::Esc {
+        return ViewAction::DialogueExit;
+    }
+
+    // Ctrl+D ends the session
+    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('d') {
+        return ViewAction::DialogueEndSession;
+    }
+
+    match dialogue.session_state {
+        DialogueSessionState::WaitingForInput => match key.code {
+            KeyCode::Enter => {
+                let text = dialogue.input.clone();
+                if !text.is_empty() {
+                    dialogue.add_user_message(text.clone());
+                    dialogue.input.clear();
+                    dialogue.session_state = DialogueSessionState::Streaming;
+                    return ViewAction::DialogueSendAnswer(text);
+                }
+                ViewAction::None
+            }
+            KeyCode::Backspace => {
+                dialogue.input.pop();
+                ViewAction::None
+            }
+            KeyCode::Char(c) => {
+                dialogue.input.push(c);
+                ViewAction::None
+            }
+            KeyCode::Up => {
+                dialogue.scroll_up();
+                ViewAction::None
+            }
+            KeyCode::Down => {
+                dialogue.scroll_down();
+                ViewAction::None
+            }
+            _ => ViewAction::None,
+        },
+        DialogueSessionState::Streaming => {
+            // While streaming, only scroll keys work
+            match key.code {
+                KeyCode::Up => {
+                    dialogue.scroll_up();
+                    ViewAction::None
+                }
+                KeyCode::Down => {
+                    dialogue.scroll_down();
+                    ViewAction::None
+                }
+                _ => ViewAction::None,
+            }
+        }
+        DialogueSessionState::Completed => {
+            // Session done — only Esc to exit (handled above)
+            ViewAction::None
+        }
     }
 }
 
@@ -405,5 +485,154 @@ mod tests {
 
         let (_, action) = handle_key_event(&mut app, make_key(KeyCode::Char('n')));
         assert_eq!(action, ViewAction::None);
+    }
+
+    // --- Dialogue sub-view keybindings ---
+
+    fn app_in_dialogue() -> App {
+        let mut app = App::new("test".to_string());
+        app.enter_dialogue("test-spec".to_string());
+        // Set to waiting for input so we can test typing
+        app.spec_dialogue.as_mut().unwrap().session_state = DialogueSessionState::WaitingForInput;
+        app
+    }
+
+    #[test]
+    fn test_dialogue_esc_returns_exit_action() {
+        let mut app = app_in_dialogue();
+        let (cont, action) = handle_key_event(&mut app, make_key(KeyCode::Esc));
+        assert!(cont);
+        assert_eq!(action, ViewAction::DialogueExit);
+    }
+
+    #[test]
+    fn test_dialogue_ctrl_d_returns_end_session() {
+        let mut app = app_in_dialogue();
+        let (cont, action) = handle_key_event(
+            &mut app,
+            make_key_with_mod(KeyCode::Char('d'), KeyModifiers::CONTROL),
+        );
+        assert!(cont);
+        assert_eq!(action, ViewAction::DialogueEndSession);
+    }
+
+    #[test]
+    fn test_dialogue_typing_characters() {
+        let mut app = app_in_dialogue();
+
+        handle_key_event(&mut app, make_key(KeyCode::Char('h')));
+        handle_key_event(&mut app, make_key(KeyCode::Char('i')));
+
+        assert_eq!(app.spec_dialogue.as_ref().unwrap().input, "hi");
+    }
+
+    #[test]
+    fn test_dialogue_backspace_deletes() {
+        let mut app = app_in_dialogue();
+        app.spec_dialogue.as_mut().unwrap().input = "hello".to_string();
+
+        handle_key_event(&mut app, make_key(KeyCode::Backspace));
+        assert_eq!(app.spec_dialogue.as_ref().unwrap().input, "hell");
+    }
+
+    #[test]
+    fn test_dialogue_enter_sends_answer() {
+        let mut app = app_in_dialogue();
+        app.spec_dialogue.as_mut().unwrap().input = "my answer".to_string();
+
+        let (cont, action) = handle_key_event(&mut app, make_key(KeyCode::Enter));
+        assert!(cont);
+        assert_eq!(
+            action,
+            ViewAction::DialogueSendAnswer("my answer".to_string())
+        );
+        // Input should be cleared and user message added
+        assert!(app.spec_dialogue.as_ref().unwrap().input.is_empty());
+        assert_eq!(app.spec_dialogue.as_ref().unwrap().messages.len(), 1);
+        assert_eq!(
+            app.spec_dialogue.as_ref().unwrap().messages[0].sender,
+            "You"
+        );
+    }
+
+    #[test]
+    fn test_dialogue_enter_on_empty_does_nothing() {
+        let mut app = app_in_dialogue();
+
+        let (cont, action) = handle_key_event(&mut app, make_key(KeyCode::Enter));
+        assert!(cont);
+        assert_eq!(action, ViewAction::None);
+    }
+
+    #[test]
+    fn test_dialogue_scroll_keys() {
+        let mut app = app_in_dialogue();
+
+        handle_key_event(&mut app, make_key(KeyCode::Up));
+        assert_eq!(app.spec_dialogue.as_ref().unwrap().scroll_offset, 1);
+
+        handle_key_event(&mut app, make_key(KeyCode::Down));
+        assert_eq!(app.spec_dialogue.as_ref().unwrap().scroll_offset, 0);
+    }
+
+    #[test]
+    fn test_dialogue_streaming_blocks_typing() {
+        let mut app = App::new("test".to_string());
+        app.enter_dialogue("test-spec".to_string());
+        // Default state is Streaming
+
+        let (_, action) = handle_key_event(&mut app, make_key(KeyCode::Char('a')));
+        assert_eq!(action, ViewAction::None);
+        assert!(app.spec_dialogue.as_ref().unwrap().input.is_empty());
+    }
+
+    #[test]
+    fn test_dialogue_streaming_allows_scroll() {
+        let mut app = App::new("test".to_string());
+        app.enter_dialogue("test-spec".to_string());
+        // Default state is Streaming
+
+        handle_key_event(&mut app, make_key(KeyCode::Up));
+        assert_eq!(app.spec_dialogue.as_ref().unwrap().scroll_offset, 1);
+    }
+
+    #[test]
+    fn test_dialogue_blocks_global_keys() {
+        let mut app = app_in_dialogue();
+
+        // q should not quit when in dialogue
+        let (cont, _) = handle_key_event(&mut app, make_key(KeyCode::Char('q')));
+        assert!(cont);
+        assert!(!app.should_quit);
+
+        // Number keys should not switch views
+        handle_key_event(&mut app, make_key(KeyCode::Char('2')));
+        assert_eq!(app.current_view, View::Specs);
+    }
+
+    #[test]
+    fn test_dialogue_ctrl_c_still_quits() {
+        let mut app = app_in_dialogue();
+
+        let (cont, _) = handle_key_event(
+            &mut app,
+            make_key_with_mod(KeyCode::Char('c'), KeyModifiers::CONTROL),
+        );
+        assert!(!cont);
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn test_dialogue_enter_sets_streaming_state() {
+        let mut app = app_in_dialogue();
+        app.spec_dialogue.as_mut().unwrap().input = "answer".to_string();
+
+        handle_key_event(&mut app, make_key(KeyCode::Enter));
+
+        // After sending, state should be Streaming
+        assert_eq!(
+            app.spec_dialogue.as_ref().unwrap().session_state,
+            DialogueSessionState::Streaming
+        );
     }
 }
