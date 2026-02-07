@@ -1668,3 +1668,22 @@ Started: Sat Feb  7 03:49:10 PM MSK 2026
   - Use std::collections::HashSet to deduplicate parent story IDs when stopping multiple agents
   - get_session_by_wave() already exists in decomposition_sessions — useful for wave-level operations
 ---
+
+## 2026-02-07 - US-065
+- What was implemented: Command handler for log viewing (exec.log)
+  - exec.log handler receives { task_id, follow? } parameters
+  - Non-follow mode: reads log file, parses all stream-json events via nflow_claude::stream::parse_line(), returns structured array of events
+  - Follow mode: streams parsed log content as it's written, using tokio file tailing with 500ms poll interval and 60s inactivity timeout
+  - Returns parsed output with event types: text, tool_use, tool_result, result, error, parse_error
+  - Error if no log file exists (checks agent_run.log_path and filesystem)
+  - Dispatch entry added to handlers.rs dispatch() function
+  - Helper functions: parse_log_events() for batch parsing, parse_single_log_event() for individual lines
+- Files changed:
+  - crates/nflow-daemon/src/handlers.rs (exec.log handler, dispatch entry, parse helpers)
+- **Learnings for future iterations:**
+  - Follow/streaming handlers return HandlerResult::Streaming(rx) with a tokio::spawn background task feeding the mpsc channel
+  - Non-follow handlers return HandlerResult::Single(Response::ok(...))
+  - Streaming dispatch route calls handle_exec_log() directly (not wrapped in HandlerResult::Single)
+  - File tailing in async Rust: open file, read existing lines, then re-open and seek to end for new content polling
+  - StreamingResponseLine::data() for intermediate lines, StreamingResponseLine::done() for final line
+---

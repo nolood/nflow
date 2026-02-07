@@ -60,6 +60,7 @@ fn dispatch(req: Request, state: &HandlerState) -> HandlerResult {
         "exec.continue" => HandlerResult::Single(handle_exec_continue(req, state)),
         "exec.stop" => HandlerResult::Single(handle_exec_stop(req, state)),
         "exec.cancel" => HandlerResult::Single(handle_exec_cancel(req, state)),
+        "exec.log" => handle_exec_log(req, state),
         _ => HandlerResult::Single(Response::error(
             req.id,
             &format!("unknown command: {}", req.command),
@@ -4706,6 +4707,301 @@ fn spawn_agent_for_task(
     });
 
     Ok(())
+}
+
+/// Handle "exec.log" command.
+///
+/// Receives: { task_id, follow? }
+/// Without follow: reads log file, parses stream-json events, returns structured content.
+/// With follow: streams parsed log content as it's written.
+fn handle_exec_log(req: Request, state: &HandlerState) -> HandlerResult {
+    let id = req.id.clone();
+
+    let task_id_str = match req.params.get("task_id").and_then(|v| v.as_str()) {
+        Some(t) => t.to_string(),
+        None => {
+            return HandlerResult::Single(Response::error(
+                id,
+                "missing required parameter: task_id",
+            ));
+        }
+    };
+
+    let follow = req
+        .params
+        .get("follow")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    let conn = match db::open_connection(&state.db_path) {
+        Ok(c) => c,
+        Err(e) => {
+            return HandlerResult::Single(Response::error(id, &format!("database error: {}", e)));
+        }
+    };
+
+    // Find the task by wave-prefixed short ID
+    let task = match db::work_items::find_work_item_by_wave_short_id(&conn, &task_id_str) {
+        Ok(Some(t)) => t,
+        Ok(None) => {
+            return HandlerResult::Single(Response::error(
+                id,
+                &format!("NOT_FOUND: task '{}' not found", task_id_str),
+            ));
+        }
+        Err(e) => {
+            return HandlerResult::Single(Response::error(id, &format!("database error: {}", e)));
+        }
+    };
+
+    // Validate it's a task
+    if task.item_type != ItemType::Task {
+        return HandlerResult::Single(Response::error(
+            id,
+            &format!("INVALID_PARAMS: '{}' is not a task", task_id_str),
+        ));
+    }
+
+    // Find the most recent agent run for this task
+    let agent_run = match db::agent_runs::find_latest_agent_run_for_task(&conn, &task.id) {
+        Ok(Some(r)) => r,
+        Ok(None) => {
+            return HandlerResult::Single(Response::error(
+                id,
+                &format!("NOT_FOUND: no agent run found for task '{}'", task_id_str),
+            ));
+        }
+        Err(e) => {
+            return HandlerResult::Single(Response::error(id, &format!("database error: {}", e)));
+        }
+    };
+
+    // Get the log path
+    let log_path = match &agent_run.log_path {
+        Some(p) => p.clone(),
+        None => {
+            return HandlerResult::Single(Response::error(
+                id,
+                &format!("NOT_FOUND: no log file for task '{}'", task_id_str),
+            ));
+        }
+    };
+
+    if !follow {
+        // Non-follow mode: read entire log file and return parsed events
+        let content = match std::fs::read_to_string(&log_path) {
+            Ok(c) => c,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return HandlerResult::Single(Response::error(
+                    id,
+                    &format!("NOT_FOUND: log file does not exist: {}", log_path),
+                ));
+            }
+            Err(e) => {
+                return HandlerResult::Single(Response::error(
+                    id,
+                    &format!("failed to read log file: {}", e),
+                ));
+            }
+        };
+
+        let events = parse_log_events(&content);
+
+        HandlerResult::Single(Response::ok(
+            id,
+            serde_json::json!({
+                "task_id": task_id_str,
+                "log_path": log_path,
+                "events": events,
+            }),
+        ))
+    } else {
+        // Follow mode: stream log content as it's written
+        let (tx, rx) = tokio::sync::mpsc::channel::<StreamingResponseLine>(64);
+        let id_clone = id.clone();
+
+        tokio::spawn(async move {
+            use tokio::io::AsyncBufReadExt;
+
+            // Open the file (or wait for it to appear)
+            let file = match tokio::fs::File::open(&log_path).await {
+                Ok(f) => f,
+                Err(e) => {
+                    let _ = tx
+                        .send(StreamingResponseLine::error(
+                            id_clone,
+                            &format!("failed to open log file: {}", e),
+                        ))
+                        .await;
+                    return;
+                }
+            };
+
+            let reader = tokio::io::BufReader::new(file);
+            let mut lines = reader.lines();
+
+            // Read existing lines first
+            while let Ok(Some(line)) = lines.next_line().await {
+                let event = parse_single_log_event(&line);
+                if tx
+                    .send(StreamingResponseLine::data(id_clone.clone(), event))
+                    .await
+                    .is_err()
+                {
+                    return; // client disconnected
+                }
+            }
+
+            // Now tail: poll for new content
+            // Re-open with seek to end and poll
+            let file = match tokio::fs::File::open(&log_path).await {
+                Ok(f) => f,
+                Err(_) => {
+                    let _ = tx
+                        .send(StreamingResponseLine::done(
+                            id_clone,
+                            serde_json::json!({"reason": "log file closed"}),
+                        ))
+                        .await;
+                    return;
+                }
+            };
+
+            let mut reader = tokio::io::BufReader::new(file);
+            // Seek to current end
+            {
+                use tokio::io::AsyncSeekExt;
+                let metadata = match tokio::fs::metadata(&log_path).await {
+                    Ok(m) => m,
+                    Err(_) => {
+                        let _ = tx
+                            .send(StreamingResponseLine::done(
+                                id_clone,
+                                serde_json::json!({"reason": "log file closed"}),
+                            ))
+                            .await;
+                        return;
+                    }
+                };
+                let _ = reader.seek(std::io::SeekFrom::Start(metadata.len())).await;
+            }
+
+            let mut lines = reader.lines();
+            let mut idle_count = 0u32;
+
+            loop {
+                match tokio::time::timeout(std::time::Duration::from_millis(500), lines.next_line())
+                    .await
+                {
+                    Ok(Ok(Some(line))) => {
+                        idle_count = 0;
+                        let event = parse_single_log_event(&line);
+                        if tx
+                            .send(StreamingResponseLine::data(id_clone.clone(), event))
+                            .await
+                            .is_err()
+                        {
+                            return; // client disconnected
+                        }
+                    }
+                    Ok(Ok(None)) => {
+                        // EOF — file may still be written to
+                        idle_count += 1;
+                        if idle_count > 120 {
+                            // ~60 seconds of inactivity, assume agent is done
+                            let _ = tx
+                                .send(StreamingResponseLine::done(
+                                    id_clone,
+                                    serde_json::json!({"reason": "stream timeout"}),
+                                ))
+                                .await;
+                            return;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    }
+                    Ok(Err(_)) => {
+                        let _ = tx
+                            .send(StreamingResponseLine::done(
+                                id_clone,
+                                serde_json::json!({"reason": "read error"}),
+                            ))
+                            .await;
+                        return;
+                    }
+                    Err(_) => {
+                        // Timeout — no new data, continue polling
+                        idle_count += 1;
+                        if idle_count > 120 {
+                            let _ = tx
+                                .send(StreamingResponseLine::done(
+                                    id_clone,
+                                    serde_json::json!({"reason": "stream timeout"}),
+                                ))
+                                .await;
+                            return;
+                        }
+                    }
+                }
+            }
+        });
+
+        HandlerResult::Streaming(rx)
+    }
+}
+
+/// Parse all log lines into structured events for non-follow mode.
+fn parse_log_events(content: &str) -> Vec<serde_json::Value> {
+    content
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(parse_single_log_event)
+        .collect()
+}
+
+/// Parse a single log line into a structured JSON event.
+fn parse_single_log_event(line: &str) -> serde_json::Value {
+    let event = nflow_claude::stream::parse_line(line);
+    match event {
+        nflow_claude::stream::StreamEvent::TextDelta { text } => {
+            serde_json::json!({
+                "type": "text",
+                "text": text,
+            })
+        }
+        nflow_claude::stream::StreamEvent::ToolUse { name, input } => {
+            serde_json::json!({
+                "type": "tool_use",
+                "name": name,
+                "input": input,
+            })
+        }
+        nflow_claude::stream::StreamEvent::ToolResult { content } => {
+            serde_json::json!({
+                "type": "tool_result",
+                "content": content,
+            })
+        }
+        nflow_claude::stream::StreamEvent::Result { text, session_id } => {
+            serde_json::json!({
+                "type": "result",
+                "text": text,
+                "session_id": session_id,
+            })
+        }
+        nflow_claude::stream::StreamEvent::Error { message } => {
+            serde_json::json!({
+                "type": "error",
+                "message": message,
+            })
+        }
+        nflow_claude::stream::StreamEvent::ParseError { line, reason } => {
+            serde_json::json!({
+                "type": "parse_error",
+                "line": line,
+                "reason": reason,
+            })
+        }
+    }
 }
 
 #[cfg(test)]
