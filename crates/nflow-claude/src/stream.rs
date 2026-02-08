@@ -546,6 +546,57 @@ mod tests {
         assert_eq!(parser.session_id(), Some("s2"));
     }
 
+    #[tokio::test]
+    async fn stream_parser_partial_line_buffered_until_newline() {
+        // Demonstrates that StreamParser (backed by BufReader::lines) buffers
+        // partial data until a newline arrives — no event is yielded mid-line.
+        use tokio::io::AsyncWriteExt;
+
+        // Use `cat` as a pass-through so we control when data arrives
+        let mut child = tokio::process::Command::new("cat")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("cat should spawn");
+
+        let mut stdin = child.stdin.take().expect("stdin piped");
+        let stdout = child.stdout.take().expect("stdout piped");
+        let lines = tokio::io::BufReader::new(stdout).lines();
+        let mut parser = StreamParser::new(lines);
+
+        // Write a partial JSON line (no newline yet)
+        let partial = r#"{"type":"stream_event","event":{"delta":{"type":"text_delta","#;
+        stdin.write_all(partial.as_bytes()).await.unwrap();
+        stdin.flush().await.unwrap();
+
+        // Short timeout: no event should be available (line is incomplete)
+        let poll =
+            tokio::time::timeout(std::time::Duration::from_millis(100), parser.next_event()).await;
+        assert!(poll.is_err(), "should timeout — no complete line yet");
+
+        // Now complete the line with the rest + newline
+        let rest = r#""text":"buffered"}}}"#;
+        stdin
+            .write_all(format!("{rest}\n").as_bytes())
+            .await
+            .unwrap();
+        stdin.flush().await.unwrap();
+
+        // Now the full line is available
+        let event = parser.next_event().await.unwrap().unwrap();
+        assert_eq!(
+            event,
+            StreamEvent::TextDelta {
+                text: "buffered".to_string()
+            }
+        );
+
+        // Close stdin to end the stream
+        drop(stdin);
+        let end = parser.next_event().await.unwrap();
+        assert!(end.is_none(), "stream should end after stdin closes");
+    }
+
     #[test]
     fn parse_tool_result_no_content() {
         let line = r#"{"type":"tool_result"}"#;

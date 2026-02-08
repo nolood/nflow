@@ -2300,3 +2300,14 @@ Started: Sat Feb  7 03:49:10 PM MSK 2026
   - resolve() is the primary layered merge function: defaults → global → project → env
   - Use Config { field: value, ..Config::default() } struct syntax for creating test configs with one override
 ---
+
+## 2026-02-08 - US-096
+- What was implemented: Added missing "partial line buffered until newline" test to stream-JSON parser test suite
+- The test uses `cat` as a pass-through subprocess, writes partial JSON (no newline), verifies timeout (no event yet), then completes the line and verifies the event is yielded
+- Files changed:
+  - crates/nflow-claude/src/stream.rs (added 1 new async test: stream_parser_partial_line_buffered_until_newline)
+- **Learnings for future iterations:**
+  - StreamParser is typed to `Lines<BufReader<ChildStdout>>` — cannot use tokio::io::duplex() for tests; use `cat` subprocess as pass-through instead
+  - Most US-096 acceptance criteria were already covered by existing tests (140 tests); the only gap was the partial line buffering test
+  - tokio::time::timeout() is the right pattern for asserting "no event available yet" in async stream tests
+---
