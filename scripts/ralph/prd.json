@@ -1562,7 +1562,7 @@
         "Tests pass: cargo test -p nflow-core scheduler"
       ],
       "priority": 91,
-      "passes": false,
+      "passes": true,
       "notes": ""
     },
     {

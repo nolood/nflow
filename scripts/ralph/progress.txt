@@ -2212,3 +2212,31 @@ Started: Sat Feb  7 03:49:10 PM MSK 2026
   - test_config_set_validation_rejects_zero_max_parallel is a pre-existing flaky test (shared state in parallel execution) — not caused by signal changes
   - SIGINT needed for foreground daemon Ctrl+C handling even though AC only specified SIGTERM/SIGKILL/SIGHUP — keep the enum extensible
 ---
+
+## 2026-02-08 - US-090
+- What was implemented: Added missing unit tests for DAG and topological sort
+- Files changed: crates/nflow-core/src/dag.rs, scripts/ralph/prd.json
+- **Learnings for future iterations:**
+  - Most DAG tests were already implemented inline when the DAG module was originally written (US-009 era)
+  - Only needed to add: 5-story linear chain topological sort test and explicit cross-wave dependency rejection test
+  - Cross-wave = cross-session: build_dag validates all stories share the same decomposition_session_id
+  - The existing test `build_dag_cross_session_stories_rejected` already covered the cross-wave logic, but an explicit `cross_wave` named test makes the AC mapping clearer
+---
+
+## 2026-02-08 - US-091
+- What was implemented: Added 7 targeted unit tests for the scheduler algorithm covering all acceptance criteria
+- Files changed: crates/nflow-core/src/scheduler.rs, scripts/ralph/prd.json
+- Tests added:
+  - `schedule_five_ready_stories_max_parallel_three_starts_three` — 5 ready, max 3 → 3 start actions
+  - `schedule_two_running_three_ready_max_three_starts_one` — 2 running + 3 ready, max 3 → 1 start action
+  - `schedule_all_stories_done_returns_no_start_or_ready_actions` — all done → no actions
+  - `schedule_wave_ordering_earlier_session_before_later` — W1 session before W2 via fixed UUIDs
+  - `schedule_epic_status_materialization_mixed_children` — done + in_progress → InProgress
+  - `schedule_epic_status_materialization_all_cancelled` — all cancelled → Cancelled
+  - `schedule_epic_status_materialization_failed` — failed + pending → Failed
+- **Learnings for future iterations:**
+  - Scheduler already had 23 tests covering most ACs; only needed precise per-AC variants
+  - Wave ordering uses session_id UUID ordering as proxy (wave_number not yet on WorkItem)
+  - For deterministic wave ordering tests, use fixed UUIDs via Uuid::parse_str with known lexicographic ordering
+  - propagate_epic_status() in work_item module handles materialization; scheduler just detects diffs
+---

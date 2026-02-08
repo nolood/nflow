@@ -833,6 +833,251 @@ mod tests {
         )));
     }
 
+    // --- AC: 5 ready stories, max_parallel=3 -> returns 3 start actions ---
+
+    #[test]
+    fn schedule_five_ready_stories_max_parallel_three_starts_three() {
+        let session_id = Uuid::new_v4();
+        let epic = make_epic(session_id);
+        let mut stories: Vec<WorkItem> = (0..5)
+            .map(|i| {
+                let mut s = make_story_with_order(epic.id, session_id, &format!("S{}", i + 1), i);
+                s.story_mark_ready(true).unwrap();
+                s
+            })
+            .collect();
+
+        let mut work_items = vec![epic];
+        work_items.append(&mut stories);
+
+        let state = SchedulerState {
+            work_items,
+            dependencies: vec![],
+            running_count: 0,
+            max_parallel: 3,
+            execution_enabled: true,
+            session_statuses: [approved_session(session_id)].into(),
+        };
+
+        let actions = schedule(&state);
+        let start_actions: Vec<_> = actions
+            .iter()
+            .filter(|a| matches!(a, SchedulerAction::StartStory { .. }))
+            .collect();
+
+        assert_eq!(start_actions.len(), 3);
+    }
+
+    // --- AC: 2 running + 3 ready, max_parallel=3 -> returns 1 start action ---
+
+    #[test]
+    fn schedule_two_running_three_ready_max_three_starts_one() {
+        let session_id = Uuid::new_v4();
+        let epic = make_epic(session_id);
+        let mut s1 = make_story_with_order(epic.id, session_id, "S1", 0);
+        let mut s2 = make_story_with_order(epic.id, session_id, "S2", 1);
+        let mut s3 = make_story_with_order(epic.id, session_id, "S3", 2);
+
+        s1.story_mark_ready(true).unwrap();
+        s2.story_mark_ready(true).unwrap();
+        s3.story_mark_ready(true).unwrap();
+
+        let state = SchedulerState {
+            work_items: vec![epic, s1, s2, s3],
+            dependencies: vec![],
+            running_count: 2,
+            max_parallel: 3,
+            execution_enabled: true,
+            session_statuses: [approved_session(session_id)].into(),
+        };
+
+        let actions = schedule(&state);
+        let start_actions: Vec<_> = actions
+            .iter()
+            .filter(|a| matches!(a, SchedulerAction::StartStory { .. }))
+            .collect();
+
+        assert_eq!(start_actions.len(), 1);
+    }
+
+    // --- AC: all stories done -> returns no actions ---
+
+    #[test]
+    fn schedule_all_stories_done_returns_no_start_or_ready_actions() {
+        let session_id = Uuid::new_v4();
+        let mut epic = make_epic(session_id);
+        epic.status = WorkItemStatus::Done;
+
+        let mut stories: Vec<WorkItem> = (0..3)
+            .map(|i| {
+                let mut s = make_story_with_order(epic.id, session_id, &format!("S{}", i + 1), i);
+                s.story_mark_ready(true).unwrap();
+                s.story_start().unwrap();
+                s.story_complete().unwrap();
+                s
+            })
+            .collect();
+
+        let mut work_items = vec![epic];
+        work_items.append(&mut stories);
+
+        let state = SchedulerState {
+            work_items,
+            dependencies: vec![],
+            running_count: 0,
+            max_parallel: 3,
+            execution_enabled: true,
+            session_statuses: [approved_session(session_id)].into(),
+        };
+
+        let actions = schedule(&state);
+        // No start or mark-ready actions when everything is done
+        assert!(!actions
+            .iter()
+            .any(|a| matches!(a, SchedulerAction::StartStory { .. })));
+        assert!(!actions
+            .iter()
+            .any(|a| matches!(a, SchedulerAction::MarkStoryReady { .. })));
+        // No epic update either since epic is already Done
+        assert!(!actions
+            .iter()
+            .any(|a| matches!(a, SchedulerAction::UpdateEpicStatus { .. })));
+    }
+
+    // --- AC: wave ordering: W1 before W2 ---
+    // Wave ordering is approximated by session_id ordering since wave_number
+    // is not yet on WorkItem. This test verifies that stories from different
+    // sessions are sorted by session_id (deterministic UUID ordering).
+
+    #[test]
+    fn schedule_wave_ordering_earlier_session_before_later() {
+        // Use fixed UUIDs to control ordering: session1 < session2 lexicographically
+        let session1 = Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
+        let session2 = Uuid::parse_str("ffffffff-ffff-ffff-ffff-ffffffffffff").unwrap();
+        let epic1 = WorkItem::new_epic(session1, "Epic W1".into(), "D".into(), "E1".into(), 0);
+        let epic2 = WorkItem::new_epic(session2, "Epic W2".into(), "D".into(), "E2".into(), 0);
+
+        let mut s_w2 = make_story_with_order(epic2.id, session2, "S2", 0);
+        let mut s_w1 = make_story_with_order(epic1.id, session1, "S1", 0);
+
+        s_w1.story_mark_ready(true).unwrap();
+        s_w2.story_mark_ready(true).unwrap();
+
+        let state = SchedulerState {
+            // Deliberately put W2 story first to verify sorting
+            work_items: vec![epic1, epic2, s_w2.clone(), s_w1.clone()],
+            dependencies: vec![],
+            running_count: 0,
+            max_parallel: 1,
+            execution_enabled: true,
+            session_statuses: [
+                (session1, SessionStatus::Approved),
+                (session2, SessionStatus::Approved),
+            ]
+            .into(),
+        };
+
+        let actions = schedule(&state);
+        let start_actions: Vec<Uuid> = actions
+            .iter()
+            .filter_map(|a| match a {
+                SchedulerAction::StartStory { story_id } => Some(*story_id),
+                _ => None,
+            })
+            .collect();
+
+        // Only 1 slot, should pick W1 (session1 sorts before session2)
+        assert_eq!(start_actions.len(), 1);
+        assert_eq!(start_actions[0], s_w1.id);
+    }
+
+    // --- AC: epic status materialization from child stories (comprehensive) ---
+
+    #[test]
+    fn schedule_epic_status_materialization_mixed_children() {
+        let session_id = Uuid::new_v4();
+        let epic = make_epic(session_id);
+
+        // Two stories: one done, one in_progress -> epic should be InProgress
+        let mut s1 = make_story_with_order(epic.id, session_id, "S1", 0);
+        let mut s2 = make_story_with_order(epic.id, session_id, "S2", 1);
+
+        s1.story_mark_ready(true).unwrap();
+        s1.story_start().unwrap();
+        s1.story_complete().unwrap();
+        s2.story_mark_ready(true).unwrap();
+        s2.story_start().unwrap();
+
+        let state = SchedulerState {
+            work_items: vec![epic.clone(), s1, s2],
+            dependencies: vec![],
+            running_count: 1,
+            max_parallel: 3,
+            execution_enabled: true,
+            session_statuses: [approved_session(session_id)].into(),
+        };
+
+        let actions = schedule(&state);
+        assert!(actions.contains(&SchedulerAction::UpdateEpicStatus {
+            epic_id: epic.id,
+            new_status: WorkItemStatus::InProgress,
+        }));
+    }
+
+    #[test]
+    fn schedule_epic_status_materialization_all_cancelled() {
+        let session_id = Uuid::new_v4();
+        let epic = make_epic(session_id);
+        let mut s1 = make_story_with_order(epic.id, session_id, "S1", 0);
+        let mut s2 = make_story_with_order(epic.id, session_id, "S2", 1);
+
+        s1.story_cancel().unwrap();
+        s2.story_cancel().unwrap();
+
+        let state = SchedulerState {
+            work_items: vec![epic.clone(), s1, s2],
+            dependencies: vec![],
+            running_count: 0,
+            max_parallel: 3,
+            execution_enabled: true,
+            session_statuses: [approved_session(session_id)].into(),
+        };
+
+        let actions = schedule(&state);
+        assert!(actions.contains(&SchedulerAction::UpdateEpicStatus {
+            epic_id: epic.id,
+            new_status: WorkItemStatus::Cancelled,
+        }));
+    }
+
+    #[test]
+    fn schedule_epic_status_materialization_failed() {
+        let session_id = Uuid::new_v4();
+        let epic = make_epic(session_id);
+        let mut s1 = make_story_with_order(epic.id, session_id, "S1", 0);
+        let s2 = make_story_with_order(epic.id, session_id, "S2", 1);
+
+        s1.story_mark_ready(true).unwrap();
+        s1.story_start().unwrap();
+        s1.story_fail().unwrap();
+        // s2 still pending
+
+        let state = SchedulerState {
+            work_items: vec![epic.clone(), s1, s2],
+            dependencies: vec![],
+            running_count: 0,
+            max_parallel: 3,
+            execution_enabled: true,
+            session_statuses: [approved_session(session_id)].into(),
+        };
+
+        let actions = schedule(&state);
+        assert!(actions.contains(&SchedulerAction::UpdateEpicStatus {
+            epic_id: epic.id,
+            new_status: WorkItemStatus::Failed,
+        }));
+    }
+
     // --- Complex scenario: chain with multiple waves ---
 
     #[test]
