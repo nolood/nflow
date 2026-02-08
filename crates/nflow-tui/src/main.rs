@@ -64,6 +64,9 @@ async fn run(args: Args) -> error::Result<()> {
     // Connect to daemon
     let mut client = SocketClient::connect().await?;
 
+    // Auto-init project if it doesn't exist yet
+    ensure_project_initialized(&project, &mut client).await;
+
     // Create app state
     let mut app = App::new(project);
 
@@ -89,6 +92,62 @@ async fn run(args: Args) -> error::Result<()> {
     terminal::restore(&mut tui)?;
 
     result
+}
+
+/// Check if the project exists in the daemon DB; if not, auto-initialize it.
+async fn ensure_project_initialized(project: &str, client: &mut SocketClient) {
+    // Try to get project status — if it fails with NOT_FOUND, init
+    let resp = client
+        .send_command(
+            "exec.status",
+            serde_json::json!({ "project_name": project }),
+        )
+        .await;
+
+    let needs_init = match resp {
+        Ok(r) => {
+            if r.status == ResponseStatus::Ok {
+                false
+            } else {
+                let msg = r
+                    .data
+                    .get("message")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                msg.contains("NOT_FOUND")
+            }
+        }
+        Err(_) => false, // connection error, don't try init
+    };
+
+    if needs_init {
+        let cwd = env::current_dir()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_default();
+
+        let params = serde_json::json!({
+            "name": project,
+            "path": cwd,
+            "base_branch": "main",
+        });
+
+        match client.send_command("project.init", params).await {
+            Ok(r) if r.status == ResponseStatus::Ok => {
+                eprintln!("Project '{}' initialized automatically", project);
+            }
+            Ok(r) => {
+                let msg = r
+                    .data
+                    .get("message")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown error");
+                eprintln!("Warning: auto-init failed: {}", msg);
+            }
+            Err(e) => {
+                eprintln!("Warning: auto-init failed: {}", e);
+            }
+        }
+    }
 }
 
 /// Main event loop: render frame, poll events, handle input.
@@ -143,8 +202,8 @@ async fn event_loop(
 
             // Handle view actions
             match action {
-                event::ViewAction::SpecNew => {
-                    handle_spec_new(app, client).await;
+                event::ViewAction::SpecNew(name) => {
+                    handle_spec_new(app, client, &name).await;
                 }
                 event::ViewAction::SpecResume => {
                     handle_spec_resume(app, client).await;
@@ -153,12 +212,20 @@ async fn event_loop(
                     handle_dialogue_send_answer(app, client, &text).await;
                 }
                 event::ViewAction::DialogueEndSession => {
+                    deactivate_spec_session(app, client).await;
                     handle_dialogue_end(app);
                 }
                 event::ViewAction::DialogueExit => {
+                    deactivate_spec_session(app, client).await;
                     app.exit_dialogue();
                     // Refresh specs list after dialogue
                     app.fetch_specs(client).await.ok();
+                }
+                event::ViewAction::SpecApprove => {
+                    handle_spec_approve_action(app, client).await;
+                }
+                event::ViewAction::SpecDelete => {
+                    handle_spec_delete_action(app, client).await;
                 }
                 event::ViewAction::SpecView => {
                     handle_spec_view(app, client).await;
@@ -334,12 +401,12 @@ async fn poll_streaming_data(app: &mut App, client: &mut SocketClient) {
 }
 
 /// Handle starting a new spec dialogue.
-async fn handle_spec_new(app: &mut App, client: &mut SocketClient) {
-    // Enter dialogue mode with a placeholder name
-    app.enter_dialogue("New Spec".to_string());
+async fn handle_spec_new(app: &mut App, client: &mut SocketClient, spec_name: &str) {
+    app.enter_dialogue(spec_name.to_string());
 
     let params = serde_json::json!({
         "project_name": &app.project,
+        "spec_name": spec_name,
     });
 
     match client.send_streaming_command("spec.new", params).await {
@@ -428,6 +495,25 @@ async fn handle_dialogue_send_answer(app: &mut App, client: &mut SocketClient, t
     }
 }
 
+/// Notify daemon to deactivate the spec session (set session_active=false).
+/// Called when user exits dialogue via Esc or Ctrl+D.
+async fn deactivate_spec_session(app: &App, client: &mut SocketClient) {
+    let spec_name = match &app.spec_dialogue {
+        Some(d) => d.spec_name.clone(),
+        None => return,
+    };
+
+    let _ = client
+        .send_command(
+            "spec.deactivate",
+            serde_json::json!({
+                "project_name": &app.project,
+                "spec_name": &spec_name,
+            }),
+        )
+        .await;
+}
+
 /// Handle ending a dialogue session.
 fn handle_dialogue_end(app: &mut App) {
     if let Some(dialogue) = &mut app.spec_dialogue {
@@ -452,6 +538,7 @@ async fn handle_plan_generate(
     match client.send_command("plan.generate", params).await {
         Ok(resp) if resp.status == ResponseStatus::Ok => {
             app.status_message = "Plan generation started".to_string();
+            app.decomposition_in_progress = true;
             // Refresh plan tree
             app.fetch_plan(client).await.ok();
         }
@@ -479,6 +566,7 @@ async fn handle_plan_feedback(app: &mut App, client: &mut SocketClient, text: &s
     match client.send_command("plan.feedback", params).await {
         Ok(resp) if resp.status == ResponseStatus::Ok => {
             app.status_message = "Feedback sent".to_string();
+            app.decomposition_in_progress = true;
             // Refresh plan tree
             app.fetch_plan(client).await.ok();
         }
@@ -955,6 +1043,11 @@ async fn handle_daemon_event(
             // Refresh the execute tree to pick up completion status
             app.fetch_execute(client).await.ok();
         }
+        "decomposition_completed" => {
+            app.decomposition_in_progress = false;
+            app.status_message = "Plan generation complete".to_string();
+            app.fetch_plan(client).await.ok();
+        }
         _ => {
             // Unknown event type — ignore
         }
@@ -995,6 +1088,80 @@ async fn handle_spec_view(app: &mut App, client: &mut SocketClient) {
                 .get("message")
                 .and_then(|v| v.as_str())
                 .unwrap_or("Failed to load spec");
+            app.status_message = msg.to_string();
+        }
+        Err(e) => {
+            app.status_message = format!("Error: {}", e);
+        }
+    }
+}
+
+/// Handle approving the selected spec.
+async fn handle_spec_approve_action(app: &mut App, client: &mut SocketClient) {
+    let spec_name = app
+        .specs_list
+        .selected_item()
+        .map(|s| s.name.clone())
+        .unwrap_or_default();
+
+    if spec_name.is_empty() {
+        app.status_message = "No spec selected".to_string();
+        return;
+    }
+
+    let params = serde_json::json!({
+        "project_name": &app.project,
+        "spec_name": &spec_name,
+    });
+
+    match client.send_command("spec.approve", params).await {
+        Ok(resp) if resp.status == ResponseStatus::Ok => {
+            app.status_message = format!("Spec '{}' approved", spec_name);
+            app.fetch_specs(client).await.ok();
+        }
+        Ok(resp) => {
+            let msg = resp
+                .data
+                .get("message")
+                .and_then(|v| v.as_str())
+                .unwrap_or("Failed to approve spec");
+            app.status_message = msg.to_string();
+        }
+        Err(e) => {
+            app.status_message = format!("Error: {}", e);
+        }
+    }
+}
+
+/// Handle deleting the selected spec.
+async fn handle_spec_delete_action(app: &mut App, client: &mut SocketClient) {
+    let spec_name = app
+        .specs_list
+        .selected_item()
+        .map(|s| s.name.clone())
+        .unwrap_or_default();
+
+    if spec_name.is_empty() {
+        app.status_message = "No spec selected".to_string();
+        return;
+    }
+
+    let params = serde_json::json!({
+        "project_name": &app.project,
+        "spec_name": &spec_name,
+    });
+
+    match client.send_command("spec.delete", params).await {
+        Ok(resp) if resp.status == ResponseStatus::Ok => {
+            app.status_message = format!("Spec '{}' deleted", spec_name);
+            app.fetch_specs(client).await.ok();
+        }
+        Ok(resp) => {
+            let msg = resp
+                .data
+                .get("message")
+                .and_then(|v| v.as_str())
+                .unwrap_or("Failed to delete spec");
             app.status_message = msg.to_string();
         }
         Err(e) => {

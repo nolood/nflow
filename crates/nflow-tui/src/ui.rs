@@ -6,6 +6,216 @@ use ratatui::Frame;
 
 use crate::app::{App, ConfirmAction, DaemonState, DialogueSessionState, Overlay, View};
 
+/// Convert a markdown string into styled ratatui Lines.
+///
+/// Supports: headers (#), code blocks (```), inline code (`), bold (**),
+/// italic (*), and list items (- / *).
+fn markdown_to_lines(text: &str, base_style: Style) -> Vec<Line<'static>> {
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut in_code_block = false;
+
+    for raw_line in text.lines() {
+        // Code block toggle
+        if raw_line.trim_start().starts_with("```") {
+            in_code_block = !in_code_block;
+            if in_code_block {
+                // Show language hint if present
+                let lang = raw_line.trim_start().trim_start_matches('`').trim();
+                if lang.is_empty() {
+                    lines.push(Line::from(Span::styled(
+                        "───",
+                        Style::default().fg(Color::DarkGray),
+                    )));
+                } else {
+                    lines.push(Line::from(Span::styled(
+                        format!("─── {} ───", lang),
+                        Style::default().fg(Color::DarkGray),
+                    )));
+                }
+            } else {
+                lines.push(Line::from(Span::styled(
+                    "───",
+                    Style::default().fg(Color::DarkGray),
+                )));
+            }
+            continue;
+        }
+
+        if in_code_block {
+            lines.push(Line::from(Span::styled(
+                format!("  {}", raw_line),
+                Style::default().fg(Color::Green),
+            )));
+            continue;
+        }
+
+        // Headers
+        if raw_line.starts_with("### ") {
+            lines.push(Line::from(Span::styled(
+                raw_line[4..].to_string(),
+                base_style
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )));
+            continue;
+        }
+        if raw_line.starts_with("## ") {
+            lines.push(Line::from(Span::styled(
+                raw_line[3..].to_string(),
+                base_style
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )));
+            continue;
+        }
+        if raw_line.starts_with("# ") {
+            lines.push(Line::from(Span::styled(
+                raw_line[2..].to_string(),
+                base_style
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+            )));
+            continue;
+        }
+
+        // Horizontal rules
+        let trimmed = raw_line.trim();
+        if (trimmed.starts_with("---") || trimmed.starts_with("***") || trimmed.starts_with("___"))
+            && trimmed.chars().all(|c| c == '-' || c == '*' || c == '_' || c == ' ')
+            && trimmed.len() >= 3
+        {
+            lines.push(Line::from(Span::styled(
+                "────────────────────",
+                Style::default().fg(Color::DarkGray),
+            )));
+            continue;
+        }
+
+        // List items: render bullet
+        let (list_prefix, content) = if raw_line.starts_with("- ") {
+            ("  • ".to_string(), &raw_line[2..])
+        } else if raw_line.starts_with("* ") {
+            ("  • ".to_string(), &raw_line[2..])
+        } else if raw_line.len() > 2
+            && raw_line.as_bytes()[0].is_ascii_digit()
+            && raw_line[1..].starts_with(". ")
+        {
+            (format!("  {}. ", raw_line.as_bytes()[0] as char), &raw_line[3..])
+        } else {
+            (String::new(), raw_line)
+        };
+
+        // Parse inline styles: **bold**, *italic*, `code`
+        let spans = parse_inline_markdown(content, base_style);
+
+        if list_prefix.is_empty() {
+            lines.push(Line::from(spans));
+        } else {
+            let mut all_spans = vec![Span::styled(list_prefix, base_style)];
+            all_spans.extend(spans);
+            lines.push(Line::from(all_spans));
+        }
+    }
+
+    lines
+}
+
+/// Parse inline markdown (bold, italic, code) into styled Spans.
+fn parse_inline_markdown(text: &str, base_style: Style) -> Vec<Span<'static>> {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut chars = text.char_indices().peekable();
+    let mut buf = String::new();
+
+    while let Some(&(i, c)) = chars.peek() {
+        match c {
+            '`' => {
+                // Flush buffer
+                if !buf.is_empty() {
+                    spans.push(Span::styled(buf.clone(), base_style));
+                    buf.clear();
+                }
+                chars.next();
+                // Collect until closing `
+                let mut code = String::new();
+                while let Some(&(_, ch)) = chars.peek() {
+                    if ch == '`' {
+                        chars.next();
+                        break;
+                    }
+                    code.push(ch);
+                    chars.next();
+                }
+                spans.push(Span::styled(
+                    code,
+                    Style::default().fg(Color::Green),
+                ));
+            }
+            '*' => {
+                // Check for ** (bold) or * (italic)
+                let rest = &text[i..];
+                if rest.starts_with("**") {
+                    // Flush buffer
+                    if !buf.is_empty() {
+                        spans.push(Span::styled(buf.clone(), base_style));
+                        buf.clear();
+                    }
+                    chars.next();
+                    chars.next();
+                    // Collect until **
+                    let mut bold_text = String::new();
+                    while let Some(&(j, ch)) = chars.peek() {
+                        if text[j..].starts_with("**") {
+                            chars.next();
+                            chars.next();
+                            break;
+                        }
+                        bold_text.push(ch);
+                        chars.next();
+                    }
+                    spans.push(Span::styled(
+                        bold_text,
+                        base_style.add_modifier(Modifier::BOLD),
+                    ));
+                } else {
+                    // Single * = italic
+                    if !buf.is_empty() {
+                        spans.push(Span::styled(buf.clone(), base_style));
+                        buf.clear();
+                    }
+                    chars.next();
+                    let mut italic_text = String::new();
+                    while let Some(&(_, ch)) = chars.peek() {
+                        if ch == '*' {
+                            chars.next();
+                            break;
+                        }
+                        italic_text.push(ch);
+                        chars.next();
+                    }
+                    spans.push(Span::styled(
+                        italic_text,
+                        base_style.add_modifier(Modifier::ITALIC),
+                    ));
+                }
+            }
+            _ => {
+                buf.push(c);
+                chars.next();
+            }
+        }
+    }
+
+    if !buf.is_empty() {
+        spans.push(Span::styled(buf, base_style));
+    }
+
+    if spans.is_empty() {
+        spans.push(Span::styled(String::new(), base_style));
+    }
+
+    spans
+}
+
 /// Render the entire TUI frame.
 pub fn render(app: &App, frame: &mut Frame) {
     let chunks = Layout::default()
@@ -24,6 +234,11 @@ pub fn render(app: &App, frame: &mut Frame) {
     // Render overlay on top if active
     if let Some(overlay) = &app.overlay {
         render_overlay(overlay, app, frame, frame.area());
+    }
+
+    // Render spec name input popup on top
+    if app.spec_name_input.is_some() {
+        render_spec_name_input(app, frame, frame.area());
     }
 
     // Render plan sub-views on top
@@ -248,19 +463,29 @@ fn render_plan_tree(app: &App, frame: &mut Frame, area: Rect) {
 
     if tree.nodes.is_empty() {
         let block = Block::default().borders(Borders::ALL).title("Plan");
-        let empty = Paragraph::new(vec![
-            Line::from(""),
-            Line::from(Span::styled(
-                "  No decomposition waves found.",
-                Style::default().fg(Color::DarkGray),
-            )),
-            Line::from(""),
-            Line::from(Span::styled(
-                "  Use 'nflow plan generate' to create a plan.",
-                Style::default().fg(Color::DarkGray),
-            )),
-        ])
-        .block(block);
+        let text = if app.decomposition_in_progress {
+            vec![
+                Line::from(""),
+                Line::from(Span::styled(
+                    "  ▶ Generating plan...",
+                    Style::default().fg(Color::Cyan),
+                )),
+            ]
+        } else {
+            vec![
+                Line::from(""),
+                Line::from(Span::styled(
+                    "  No decomposition waves found.",
+                    Style::default().fg(Color::DarkGray),
+                )),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "  Use 'nflow plan generate' to create a plan.",
+                    Style::default().fg(Color::DarkGray),
+                )),
+            ]
+        };
+        let empty = Paragraph::new(text).block(block);
         frame.render_widget(empty, area);
         return;
     }
@@ -897,8 +1122,9 @@ fn render_spec_pager(app: &App, frame: &mut Frame, area: Rect) {
     let max_scroll = pager.total_lines.saturating_sub(inner_height);
     let scroll = pager.scroll_offset.min(max_scroll);
 
-    // Build lines with wrapping support
-    let content_lines: Vec<Line> = pager.lines.iter().map(|l| Line::from(l.as_str())).collect();
+    // Build lines with markdown rendering
+    let full_text = pager.lines.join("\n");
+    let content_lines: Vec<Line> = markdown_to_lines(&full_text, Style::default().fg(Color::White));
 
     let paragraph = Paragraph::new(content_lines)
         .block(block)
@@ -961,26 +1187,31 @@ fn render_spec_dialogue(app: &App, frame: &mut Frame, area: Rect) {
             )
         };
 
-        let prefix = format!("{}: ", msg.sender);
-        let mut first = true;
-        for text_line in msg.text.lines() {
-            if first {
+        // Sender header
+        chat_lines.push(Line::from(Span::styled(
+            format!("{}:", msg.sender),
+            prefix_style,
+        )));
+
+        if msg.text.is_empty() {
+            // nothing
+        } else if msg.sender == "Claude" {
+            // Render Claude's messages as markdown
+            let md_lines = markdown_to_lines(&msg.text, text_style);
+            for line in md_lines {
+                // Indent all content lines
+                let mut indented = vec![Span::raw("  ")];
+                indented.extend(line.spans.into_iter());
+                chat_lines.push(Line::from(indented));
+            }
+        } else {
+            // User messages: plain text, indented
+            for text_line in msg.text.lines() {
                 chat_lines.push(Line::from(vec![
-                    Span::styled(prefix.clone(), prefix_style),
-                    Span::styled(text_line, text_style),
-                ]));
-                first = false;
-            } else {
-                // Continuation lines indented by prefix width
-                let indent = " ".repeat(prefix.len());
-                chat_lines.push(Line::from(vec![
-                    Span::raw(indent),
-                    Span::styled(text_line, text_style),
+                    Span::raw("  "),
+                    Span::styled(text_line.to_string(), text_style),
                 ]));
             }
-        }
-        if msg.text.is_empty() {
-            chat_lines.push(Line::from(vec![Span::styled(prefix, prefix_style)]));
         }
         // Blank line between messages
         chat_lines.push(Line::from(""));
@@ -998,7 +1229,15 @@ fn render_spec_dialogue(app: &App, frame: &mut Frame, area: Rect) {
 
     // Calculate scroll: auto-scroll to bottom, offset adjusts
     let inner_height = chat_area.height.saturating_sub(2); // borders
-    let total_lines = chat_lines.len() as u16;
+    let inner_width = chat_area.width.saturating_sub(2).max(1) as usize; // borders
+    // Account for line wrapping: each Line may occupy multiple visual rows
+    let total_lines: u16 = chat_lines
+        .iter()
+        .map(|line| {
+            let w = line.width();
+            (((w + inner_width - 1) / inner_width) as u16).max(1)
+        })
+        .sum();
     let max_scroll = total_lines.saturating_sub(inner_height);
     let scroll = max_scroll.saturating_sub(dialogue.scroll_offset);
 
@@ -1075,6 +1314,14 @@ fn render_status_bar(app: &App, frame: &mut Frame, area: Rect) {
         ));
     }
 
+    if app.decomposition_in_progress {
+        spans.push(Span::raw(" | "));
+        spans.push(Span::styled(
+            "Generating...",
+            Style::default().fg(Color::Yellow),
+        ));
+    }
+
     // Running counts from execute tree
     let (running, total, done, failed) = app.execute_tree.count_task_stats();
     if total > 0 {
@@ -1118,10 +1365,22 @@ fn render_status_bar(app: &App, frame: &mut Frame, area: Rect) {
         ));
     }
 
-    // Keyboard hints
+    // View-specific keyboard hints
+    spans.push(Span::raw(" | "));
+    let view_hints = match app.current_view {
+        View::Specs => "Enter:open n:new a:approve d:delete v:view r:resume",
+        View::Plan => "Enter:detail Space:collapse g:gen a:approve",
+        View::Execute => "Enter:log r:run s:stop e:escalate",
+        View::Logs => "Enter:view Esc:back",
+    };
+    spans.push(Span::styled(
+        view_hints,
+        Style::default().fg(Color::DarkGray),
+    ));
+
     spans.push(Span::raw(" | "));
     spans.push(Span::styled(
-        "q:quit ?:help p:project /:filter Tab:next",
+        "?:help q:quit",
         Style::default().fg(Color::DarkGray),
     ));
 
@@ -1244,6 +1503,7 @@ fn view_keybindings(view: View) -> Vec<Line<'static>> {
     match view {
         View::Specs => vec![
             help_key("j/k", "Navigate spec list"),
+            help_key("Enter", "Open spec (resume draft / view approved)"),
             help_key("n", "New spec"),
             help_key("r", "Resume spec dialogue"),
             help_key("v", "View spec content"),
@@ -1492,6 +1752,43 @@ fn render_generate_dialog(app: &App, frame: &mut Frame, area: Rect) {
 }
 
 /// Render the plan feedback input popup.
+fn render_spec_name_input(app: &App, frame: &mut Frame, area: Rect) {
+    let input = match &app.spec_name_input {
+        Some(s) => s,
+        None => return,
+    };
+
+    let popup_area = centered_rect(50, 20, area);
+    frame.render_widget(Clear, popup_area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title("New Spec — Enter:create Esc:cancel")
+        .title_style(
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )
+        .border_style(Style::default().fg(Color::Cyan));
+
+    let lines = vec![
+        Line::from(Span::styled(
+            " Enter spec name:",
+            Style::default().fg(Color::White),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            format!(" > {}_", input.input),
+            Style::default().fg(Color::Green),
+        )),
+    ];
+
+    let paragraph = Paragraph::new(lines)
+        .block(block)
+        .wrap(Wrap { trim: false });
+    frame.render_widget(paragraph, popup_area);
+}
+
 fn render_feedback_input(app: &App, frame: &mut Frame, area: Rect) {
     let fb = match &app.plan_feedback {
         Some(f) => f,

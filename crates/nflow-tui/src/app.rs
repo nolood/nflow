@@ -67,8 +67,7 @@ impl SpecsListState {
         }
     }
 
-    /// Get the currently selected item (used by action handlers in future stories).
-    #[allow(dead_code)]
+    /// Get the currently selected item.
     pub fn selected_item(&self) -> Option<&SpecItem> {
         self.items.get(self.selected)
     }
@@ -666,6 +665,21 @@ impl PlanGenerateState {
     pub fn toggle_selection(&mut self) {
         if let Some(spec) = self.specs.get_mut(self.cursor) {
             spec.selected = !spec.selected;
+        }
+    }
+}
+
+/// State for the spec name input (when creating a new spec).
+#[derive(Debug)]
+pub struct SpecNameInputState {
+    /// User's spec name text input.
+    pub input: String,
+}
+
+impl SpecNameInputState {
+    pub fn new() -> Self {
+        Self {
+            input: String::new(),
         }
     }
 }
@@ -1783,6 +1797,8 @@ pub struct App {
     pub active_agent_count: u32,
     /// Specs list view state.
     pub specs_list: SpecsListState,
+    /// Active spec name input state (if prompting for new spec name).
+    pub spec_name_input: Option<SpecNameInputState>,
     /// Active spec dialogue state (if in dialogue sub-view).
     pub spec_dialogue: Option<SpecDialogueState>,
     /// Active spec pager state (if in pager sub-view).
@@ -1807,6 +1823,8 @@ pub struct App {
     pub event_subscription: EventSubscriptionState,
     /// Full-screen logs view state.
     pub logs_view: LogsViewState,
+    /// Whether a plan decomposition is currently running.
+    pub decomposition_in_progress: bool,
 }
 
 impl App {
@@ -1824,6 +1842,7 @@ impl App {
             current_wave: None,
             active_agent_count: 0,
             specs_list: SpecsListState::new(),
+            spec_name_input: None,
             spec_dialogue: None,
             spec_pager: None,
             plan_tree: PlanTreeState::new(),
@@ -1836,6 +1855,7 @@ impl App {
             execute_confirm: None,
             event_subscription: EventSubscriptionState::new(),
             logs_view: LogsViewState::new(),
+            decomposition_in_progress: false,
         }
     }
 
@@ -1920,6 +1940,7 @@ impl App {
         self.project = name;
         // Reset all view state
         self.specs_list = SpecsListState::new();
+        self.spec_name_input = None;
         self.spec_dialogue = None;
         self.spec_pager = None;
         self.plan_tree = PlanTreeState::new();
@@ -2018,6 +2039,16 @@ impl App {
             || self.plan_feedback.is_some()
             || self.plan_confirm.is_some()
             || self.plan_detail.is_some()
+    }
+
+    /// Open the spec name input popup.
+    pub fn open_spec_name_input(&mut self) {
+        self.spec_name_input = Some(SpecNameInputState::new());
+    }
+
+    /// Close the spec name input popup.
+    pub fn close_spec_name_input(&mut self) {
+        self.spec_name_input = None;
     }
 
     /// Open the plan generate dialog with available approved specs.
