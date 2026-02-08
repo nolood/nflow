@@ -124,8 +124,8 @@
         "Typecheck passes"
       ],
       "priority": 7,
-      "passes": false,
-      "notes": ""
+      "passes": true,
+      "notes": "Already had 35 dag tests + 30 scheduler tests = 65 total (far exceeds min 15). All 270 nflow-core tests pass. Clippy clean."
     },
     {
       "id": "US-108",
