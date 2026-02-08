@@ -2465,3 +2465,32 @@ Started: Sat Feb  7 03:49:10 PM MSK 2026
   - extract_commit_info() looks for `[branch hash] message` pattern in tool results — mock impl task must emit a ToolResult with git commit output format
   - is_valid_short_id validates W{n}-{prefix}{n}[v] pattern — wave number must be non-empty digits (vacuous truth on empty iterators means explicit !is_empty() check needed)
 ---
+
+## US-104: E2E test — full happy path
+- **Status:** PASS
+- **Commit:** feat: [US-104] - E2E test — full happy path
+- **What was implemented:**
+  - Full E2E test in `crates/nflow-daemon/src/e2e_tests.rs` exercising:
+    project init → spec creation (streaming) → spec approval → plan generation (streaming) →
+    plan approval → execution → scheduler ticks → story completion → status verification
+  - Test uses mock-claude binary, mock gh script, local bare git repo, temp NFLOW_HOME
+  - Verifies: all stories done, branches pushed, MRs created, commit hashes present, exec.status shows done
+- **Production bugs found and fixed during E2E testing:**
+  - `handlers.rs`: NFLOW_CLAUDE_BINARY env var not checked in `stream_claude_spec_session`, `exec.retry`, `exec.skip`, `spawn_agent_for_task` — only `stream_claude_decompose` and `scheduler_loop::start_task_execution` had it
+  - `scheduler_loop.rs::extract_commit_info()`: only handled `[branch hash]` format, not `[detached HEAD hash]` — fixed by checking last token in brackets
+  - `scheduler_loop.rs::start_task_execution()`: child process was dropped without waiting (`let _child = process.child`), so exit codes were never captured — reaper defaulted to exit code 1. Fixed by adding `child.wait()` in background task and storing via new `update_agent_run_exit_code()` DB function
+  - `scheduler_loop.rs::execute_complete_story()`: missing `create_branch` step before `push_branch` — worktrees are created in detached HEAD state, so pushing a named branch failed. Added step 5 to create the local branch from HEAD
+  - `mock-claude`: `find_spec_file_path()` returned None because runner uses `cmd.current_dir()` not `--cwd` arg — added `MOCK_CLAUDE_SPEC_FILE` env var override
+- **Files changed:**
+  - `crates/nflow-daemon/src/e2e_tests.rs` (new — 670 lines)
+  - `crates/nflow-daemon/src/main.rs` (added e2e_tests module)
+  - `crates/nflow-daemon/src/handlers.rs` (NFLOW_CLAUDE_BINARY support in 4 spawn sites)
+  - `crates/nflow-daemon/src/scheduler_loop.rs` (extract_commit_info fix, exit code capture, create_branch step)
+  - `crates/nflow-daemon/src/db/agent_runs.rs` (new update_agent_run_exit_code function)
+  - `crates/mock-claude/src/main.rs` (MOCK_CLAUDE_SPEC_FILE env var)
+- **Learnings:**
+  - `git worktree add path origin/main` creates detached HEAD — must `git checkout -b branch` before pushing
+  - Agent child processes must be waited on to capture exit codes — dropping without wait causes reaper to assume exit code 1
+  - `extract_commit_info` must handle both `[branch hash]` and `[detached HEAD hash]` patterns
+  - E2E tests that use `std::env::set_var("HOME", ...)` are not safe to run concurrently with other tests that do the same — environment is process-global
+---
