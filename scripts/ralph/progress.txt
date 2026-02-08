@@ -2616,3 +2616,28 @@ Started: Sat Feb  7 03:49:10 PM MSK 2026
   - shutdown.rs has its own path-based remove_pid_file(path) — different from daemon.rs's parameterless version
   - Tests referencing removed functions must be updated or removed; prefer direct fs operations over wrapper functions in tests
 ---
+
+## 2026-02-08 - US-105
+- Eliminated all 8 remaining dead code warnings in nflow-daemon crate
+- Removed unused functions: list_specs_by_status(), reset_active_sessions(), count_tasks_by_status(), find_running_agent_runs_by_session(), read_process_start_time()
+- Removed associated tests (4 tests for specs, 3 tests for work_items)
+- Removed unused HashMap import from work_items.rs, get_pid_start_time re-export and platform::self import from recovery.rs
+- Renamed state → _state in handle_cleanup_logs() (handler signature requires param but function doesn't use it)
+- Wired ShutdownReport.socket_removed and .pid_file_removed into main.rs shutdown eprintln message
+- Files changed: db/specs.rs, db/work_items.rs, db/agent_runs.rs, handlers.rs, recovery.rs, main.rs
+- **Learnings for future iterations:**
+  - cargo build warnings are the authoritative check for dead code; clippy has additional suggestions (Error::other, redundant closure) that are separate concerns
+  - Handler signature requires (Request, &HandlerState) — use _state prefix for unused params
+  - ShutdownReport fields were only read in tests, not in main.rs — adding them to the shutdown log message resolved the warning
+  - recovery.rs has its own RecoveryReport struct separate from shutdown.rs's ShutdownReport — similar field names but different structs
+  - 11 pre-existing e2e test failures (mock Claude timeouts) and 1 pre-existing lock contention test failure (US-106) are unrelated to dead code cleanup
+---
+
+## 2026-02-08 - US-106
+- What was implemented: Relaxed timing assertion in test_acquire_lock_contention from >= 400ms to >= 200ms per acceptance criteria. The test was already passing but was brittle on fast machines.
+- Files changed: crates/nflow-cli/src/daemon_client.rs (line 426)
+- **Learnings for future iterations:**
+  - The lock contention test was actually passing consistently at 400ms threshold on this machine, but the relaxation to 200ms makes it more robust for CI and fast hardware
+  - 11 daemon e2e test failures (test_e2e_full_happy_path, test_e2e_parallel_execution, etc.) are pre-existing mock Claude streaming timeout issues — they pass individually but fail when run as a batch due to socket contention
+  - cargo test -p nflow-cli (82 tests) is the reliable test target; full workspace tests have flaky e2e tests
+---

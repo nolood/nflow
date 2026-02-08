@@ -423,7 +423,7 @@ mod tests {
 
         assert!(result.is_none(), "should not acquire lock when held");
         assert!(
-            elapsed >= Duration::from_millis(400),
+            elapsed >= Duration::from_millis(200),
             "should wait near timeout: {:?}",
             elapsed
         );
