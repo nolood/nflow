@@ -125,6 +125,19 @@ pub fn update_agent_run_status(
     Ok(())
 }
 
+/// Update just the exit_code on an agent run (called from background task after process exits).
+pub fn update_agent_run_exit_code(
+    conn: &Connection,
+    id: &Uuid,
+    exit_code: Option<i32>,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE agent_runs SET exit_code = ?1 WHERE id = ?2",
+        params![exit_code, id.to_string()],
+    )?;
+    Ok(())
+}
+
 pub fn find_running_agent_runs(conn: &Connection) -> Result<Vec<AgentRun>> {
     let mut stmt = conn.prepare(
         "SELECT id, work_item_id, pid, session_id, pid_start_time, status, exit_code, log_path, error_message, started_at, finished_at

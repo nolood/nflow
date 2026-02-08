@@ -204,15 +204,17 @@ fn parse_log_file(
 /// Returns (hash, full_commit_message) if found.
 fn extract_commit_info(text: &str) -> Option<(String, String)> {
     // Pattern: git commit output like "[branch abc1234] message"
+    // Also handles "[detached HEAD abc1234] message"
     for line in text.lines() {
         let trimmed = line.trim();
-        // Match: [branch hash] message
+        // Match: [... hash] message
         if trimmed.starts_with('[') {
             if let Some(bracket_end) = trimmed.find(']') {
                 let inside = &trimmed[1..bracket_end];
                 let parts: Vec<&str> = inside.split_whitespace().collect();
                 if parts.len() >= 2 {
-                    let candidate = parts[1];
+                    // The hash is the LAST token inside brackets
+                    let candidate = parts[parts.len() - 1];
                     if is_hex_hash(candidate) {
                         let message = trimmed[bracket_end + 1..].trim().to_string();
                         return Some((candidate.to_string(), message));
@@ -718,7 +720,23 @@ async fn execute_complete_story(
         return;
     }
 
-    // 5. Push the branch
+    // 5. Create the named branch from the current (detached) HEAD.
+    //    Worktrees are created in detached HEAD state via `git worktree add path origin/main`,
+    //    so we must create a local branch before pushing.
+    info!(
+        "complete_story: creating branch {} for story {}",
+        branch_name, story.short_id
+    );
+    if let Err(e) = nflow_git::branch::create_branch(&worktree_path, &branch_name).await {
+        warn!(
+            "complete_story: branch creation failed for story {}: {}",
+            story_id, e
+        );
+        fail_story_on_completion_error(conn, story_id, &story, event_bus);
+        return;
+    }
+
+    // 6. Push the branch
     info!(
         "complete_story: pushing branch {} for story {}",
         branch_name, story.short_id
@@ -729,7 +747,7 @@ async fn execute_complete_story(
         return;
     }
 
-    // 6. Load tasks and render MR body from template
+    // 7. Load tasks and render MR body from template
     let tasks = match db::work_items::list_work_items_by_parent(conn, story_id) {
         Ok(t) => t,
         Err(e) => {
@@ -760,7 +778,7 @@ async fn execute_complete_story(
         })
     };
 
-    // 7. Create MR/PR based on git provider
+    // 8. Create MR/PR based on git provider
     info!(
         "complete_story: creating MR for story {} via {:?}",
         story.short_id, project.git_provider
@@ -804,7 +822,7 @@ async fn execute_complete_story(
         }
     };
 
-    // 8. Store mr_url in DB
+    // 9. Store mr_url in DB
     if let Some(ref url) = mr_url {
         if let Err(e) = db::work_items::update_story_mr(conn, story_id, url) {
             warn!(
@@ -814,7 +832,7 @@ async fn execute_complete_story(
         }
     }
 
-    // 9. Cleanup worktree if configured
+    // 10. Cleanup worktree if configured
     // Load config to check cleanup_worktrees setting
     let cleanup = load_project_config(conn, &project_id);
     if cleanup {
@@ -832,7 +850,7 @@ async fn execute_complete_story(
         }
     }
 
-    // 10. Broadcast StoryCompleted event
+    // 11. Broadcast StoryCompleted event
     if let Some(bus) = event_bus {
         bus.broadcast(Event::StoryCompleted {
             story_id: story_id.to_string(),
@@ -1165,7 +1183,11 @@ pub async fn start_task_execution(
     run_config.working_dir = Some(worktree_path.clone());
     run_config.system_prompt_file = Some(prompt_file_path);
 
-    let runner = nflow_claude::runner::ClaudeRunner::new();
+    // Support NFLOW_CLAUDE_BINARY env override for testing with mock Claude
+    let runner = match std::env::var("NFLOW_CLAUDE_BINARY") {
+        Ok(bin) => nflow_claude::runner::ClaudeRunner::with_binary(bin),
+        Err(_) => nflow_claude::runner::ClaudeRunner::new(),
+    };
     let process = match runner.spawn(&run_config) {
         Ok(p) => p,
         Err(e) => {
@@ -1221,9 +1243,9 @@ pub async fn start_task_execution(
     let task_id_str = task_id.to_string();
     let mut stdout = process.stdout;
     let _stderr = process.stderr;
-    // We take ownership of the child but don't wait on it —
-    // the reaper (reap_finished_agents) will detect when the process dies.
-    let _child = process.child;
+    let mut child = process.child;
+    let agent_run_id = agent_run.id;
+    let db_path_for_task = crate::daemon::db_path().ok();
 
     tokio::spawn(async move {
         let log_file = match tokio::fs::OpenOptions::new()
@@ -1257,6 +1279,17 @@ pub async fn start_task_execution(
                     task_id: task_id_str.clone(),
                     line: line.clone(),
                 });
+            }
+        }
+
+        // Wait for child to exit and capture exit code
+        if let Ok(status) = child.wait().await {
+            let exit_code = status.code();
+            if let Some(ref db_path) = db_path_for_task {
+                if let Ok(conn) = db::open_connection(db_path) {
+                    let _ =
+                        db::agent_runs::update_agent_run_exit_code(&conn, &agent_run_id, exit_code);
+                }
             }
         }
     });

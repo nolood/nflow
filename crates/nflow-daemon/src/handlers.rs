@@ -637,8 +637,11 @@ async fn stream_claude_spec_session(
     spec_file_path: &str,
     db_path: &Path,
 ) {
-    // Spawn Claude process
-    let runner = nflow_claude::runner::ClaudeRunner::default();
+    // Spawn Claude process (supports NFLOW_CLAUDE_BINARY env override for testing)
+    let runner = match std::env::var("NFLOW_CLAUDE_BINARY") {
+        Ok(bin) => nflow_claude::runner::ClaudeRunner::with_binary(bin),
+        Err(_) => nflow_claude::runner::ClaudeRunner::default(),
+    };
     let process = match runner.spawn(&run_config) {
         Ok(p) => p,
         Err(e) => {
@@ -708,7 +711,9 @@ async fn stream_claude_spec_session(
                     break; // Client disconnected
                 }
             }
-            Ok(None) => break, // Stream ended
+            Ok(None) => {
+                break; // Stream ended
+            }
             Err(e) => {
                 let _ = tx
                     .send(StreamingResponseLine::error(
@@ -3348,7 +3353,11 @@ fn handle_exec_retry(req: Request, state: &HandlerState) -> Response {
     run_config.working_dir = Some(worktree_path);
     run_config.system_prompt_file = Some(prompt_file_path);
 
-    let runner = nflow_claude::runner::ClaudeRunner::new();
+    // Support NFLOW_CLAUDE_BINARY env override for testing with mock Claude
+    let runner = match std::env::var("NFLOW_CLAUDE_BINARY") {
+        Ok(bin) => nflow_claude::runner::ClaudeRunner::with_binary(bin),
+        Err(_) => nflow_claude::runner::ClaudeRunner::new(),
+    };
     let process = match runner.spawn(&run_config) {
         Ok(p) => p,
         Err(e) => {
@@ -3689,7 +3698,11 @@ fn handle_exec_skip(req: Request, state: &HandlerState) -> Response {
         run_config.working_dir = Some(worktree_path);
         run_config.system_prompt_file = Some(prompt_file_path);
 
-        let runner = nflow_claude::runner::ClaudeRunner::new();
+        // Support NFLOW_CLAUDE_BINARY env override for testing with mock Claude
+        let runner = match std::env::var("NFLOW_CLAUDE_BINARY") {
+            Ok(bin) => nflow_claude::runner::ClaudeRunner::with_binary(bin),
+            Err(_) => nflow_claude::runner::ClaudeRunner::new(),
+        };
         let process = match runner.spawn(&run_config) {
             Ok(p) => p,
             Err(e) => {
@@ -4660,7 +4673,11 @@ fn spawn_agent_for_task(
     run_config.working_dir = Some(worktree_path);
     run_config.system_prompt_file = Some(prompt_file_path);
 
-    let runner = nflow_claude::runner::ClaudeRunner::new();
+    // Support NFLOW_CLAUDE_BINARY env override for testing with mock Claude
+    let runner = match std::env::var("NFLOW_CLAUDE_BINARY") {
+        Ok(bin) => nflow_claude::runner::ClaudeRunner::with_binary(bin),
+        Err(_) => nflow_claude::runner::ClaudeRunner::new(),
+    };
     let process = match runner.spawn(&run_config) {
         Ok(p) => p,
         Err(e) => return Err(format!("failed to spawn Claude agent: {}", e)),

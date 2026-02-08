@@ -488,6 +488,11 @@ fn is_bare_short_id(id: &str) -> bool {
 /// The spec file path is typically embedded in the prompt or can be derived
 /// from the working directory and spec name.
 fn find_spec_file_path(parsed: &ParsedArgs) -> Option<PathBuf> {
+    // Check env var override first (for testing)
+    if let Ok(path) = env::var("MOCK_CLAUDE_SPEC_FILE") {
+        return Some(PathBuf::from(path));
+    }
+
     // Look for a file path in the prompt (e.g., "spec file at /path/to/spec.md")
     for word in parsed.prompt.split_whitespace() {
         if word.ends_with(".md") && (word.contains('/') || word.contains('\\')) {

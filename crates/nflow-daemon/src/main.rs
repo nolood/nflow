@@ -6,6 +6,8 @@ mod commands_plan_tests;
 mod commands_project_spec_tests;
 mod daemon;
 mod db;
+#[cfg(test)]
+mod e2e_tests;
 pub mod error;
 pub mod events;
 pub mod handlers;
