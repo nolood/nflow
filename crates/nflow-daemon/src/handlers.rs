@@ -24,6 +24,8 @@ fn git_provider_str(provider: GitProvider) -> &'static str {
 pub struct HandlerState {
     /// Path to the SQLite database file.
     pub db_path: PathBuf,
+    /// Event bus for broadcasting events to connected clients.
+    pub event_bus: Option<crate::events::SharedEventBus>,
 }
 
 /// Creates the main command handler that dispatches to specific handlers.
@@ -47,6 +49,7 @@ fn dispatch(req: Request, state: &HandlerState) -> HandlerResult {
         "spec.approve" => HandlerResult::Single(handle_spec_approve(req, state)),
         "spec.reopen" => HandlerResult::Single(handle_spec_reopen(req, state)),
         "spec.delete" => HandlerResult::Single(handle_spec_delete(req, state)),
+        "spec.deactivate" => HandlerResult::Single(handle_spec_deactivate(req, state)),
         "spec.resume" => handle_spec_resume(req, state),
         "plan.generate" => handle_plan_generate(req, state),
         "plan.show" => HandlerResult::Single(handle_plan_show(req, state)),
@@ -733,13 +736,27 @@ async fn stream_claude_spec_session(
     let spec_file_exists = Path::new(spec_file_path).exists();
     let session_completed = spec_file_exists;
 
-    // Update DB: store claude_session_id; if completed, mark session inactive
+    // Update DB: store claude_session_id; if completed, mark session inactive.
+    // Only overwrite claude_session_id if we got a new one — avoid clobbering
+    // a valid session_id from a previous turn when this turn produced None.
     if let Ok(conn) = db::open_connection(db_path) {
         if session_completed {
             let _ = db::specs::update_spec_session(&conn, &spec_id, false, session_id.as_deref());
-        } else {
-            // Session still active (waiting for user answer), just store the session ID
+        } else if session_id.is_some() {
+            // Session still active (waiting for user answer), store the new session ID
             let _ = db::specs::update_spec_session(&conn, &spec_id, true, session_id.as_deref());
+        } else {
+            // No session_id from this turn — keep existing claude_session_id, just mark active
+            let existing_sid = db::specs::get_spec_by_id(&conn, &spec_id)
+                .ok()
+                .flatten()
+                .and_then(|s| s.claude_session_id);
+            let _ = db::specs::update_spec_session(
+                &conn,
+                &spec_id,
+                true,
+                existing_sid.as_deref(),
+            );
         }
     }
 
@@ -1012,6 +1029,81 @@ fn handle_spec_reopen(req: Request, state: &HandlerState) -> Response {
         serde_json::json!({
             "name": spec.name,
             "status": spec.status.to_string(),
+        }),
+    )
+}
+
+/// Handle "spec.deactivate" command.
+///
+/// Receives: { project_name, spec_name }
+/// Sets session_active=false for a spec. Used by TUI when user exits a dialogue
+/// without the streaming session naturally completing.
+fn handle_spec_deactivate(req: Request, state: &HandlerState) -> Response {
+    let id = req.id.clone();
+
+    let project_name = match req.params.get("project_name").and_then(|v| v.as_str()) {
+        Some(n) => n.to_string(),
+        None => {
+            return Response::error(id, "missing required parameter: project_name");
+        }
+    };
+
+    let spec_name = match req.params.get("spec_name").and_then(|v| v.as_str()) {
+        Some(n) => n.to_string(),
+        None => {
+            return Response::error(id, "missing required parameter: spec_name");
+        }
+    };
+
+    let conn = match db::open_connection(&state.db_path) {
+        Ok(c) => c,
+        Err(e) => return Response::error(id, &format!("database error: {}", e)),
+    };
+
+    let project = match db::projects::get_project_by_name(&conn, &project_name) {
+        Ok(Some(p)) => p,
+        Ok(None) => {
+            return Response::error(
+                id,
+                &format!("NOT_FOUND: project '{}' not found", project_name),
+            );
+        }
+        Err(e) => return Response::error(id, &format!("database error: {}", e)),
+    };
+
+    let spec = match db::specs::get_spec_by_name(&conn, &project.id, &spec_name) {
+        Ok(Some(s)) => s,
+        Ok(None) => {
+            return Response::error(id, &format!("NOT_FOUND: spec '{}' not found", spec_name));
+        }
+        Err(e) => return Response::error(id, &format!("database error: {}", e)),
+    };
+
+    if !spec.session_active {
+        // Already inactive — no-op, return success
+        return Response::ok(
+            id,
+            serde_json::json!({
+                "name": spec.name,
+                "session_active": false,
+            }),
+        );
+    }
+
+    if let Err(e) = db::specs::update_spec_session(
+        &conn,
+        &spec.id,
+        false,
+        spec.claude_session_id.as_deref(),
+    ) {
+        return Response::error(id, &format!("database error: {}", e));
+    }
+
+    Response::ok(
+        id,
+        serde_json::json!({
+            "name": spec.name,
+            "session_active": false,
         }),
     )
 }
@@ -1566,6 +1658,8 @@ fn handle_plan_generate(req: Request, state: &HandlerState) -> HandlerResult {
     let session_id = session.id;
     let db_path = state.db_path.clone();
     let spec_ids: Vec<uuid::Uuid> = specs.iter().map(|s| s.id).collect();
+    let project_id = project.id;
+    let event_bus = state.event_bus.clone();
 
     let initial_id = id.clone();
     tokio::spawn(async move {
@@ -1589,6 +1683,8 @@ fn handle_plan_generate(req: Request, state: &HandlerState) -> HandlerResult {
             wave_number,
             spec_ids,
             &db_path,
+            project_id,
+            event_bus,
         )
         .await;
     });
@@ -1609,6 +1705,8 @@ async fn stream_claude_decompose(
     wave_number: u32,
     spec_ids: Vec<uuid::Uuid>,
     db_path: &Path,
+    project_id: uuid::Uuid,
+    event_bus: Option<crate::events::SharedEventBus>,
 ) {
     // Spawn Claude process (supports NFLOW_CLAUDE_BINARY env override for testing)
     let runner = match std::env::var("NFLOW_CLAUDE_BINARY") {
@@ -1731,6 +1829,15 @@ async fn stream_claude_decompose(
 
     match build_and_persist_work_items(&conn, &parsed, session_id, wave_number, &spec_ids) {
         Ok(counts) => {
+            // Broadcast decomposition completed event
+            if let Some(ref bus) = event_bus {
+                bus.broadcast(crate::events::Event::DecompositionCompleted {
+                    session_id: session_id.to_string(),
+                    project_id: project_id.to_string(),
+                    wave_number,
+                });
+            }
+
             let _ = tx
                 .send(StreamingResponseLine::done(
                     req_id,
@@ -2452,6 +2559,8 @@ fn handle_plan_feedback(req: Request, state: &HandlerState) -> HandlerResult {
     let session_id = session.id;
     let w = session.wave_number;
     let db_path = state.db_path.clone();
+    let project_id = project.id;
+    let event_bus = state.event_bus.clone();
 
     let initial_id = id.clone();
     tokio::spawn(async move {
@@ -2469,7 +2578,7 @@ fn handle_plan_feedback(req: Request, state: &HandlerState) -> HandlerResult {
             .await;
 
         stream_claude_decompose(
-            tx, initial_id, run_config, session_id, w, spec_ids, &db_path,
+            tx, initial_id, run_config, session_id, w, spec_ids, &db_path, project_id, event_bus,
         )
         .await;
     });
@@ -5943,6 +6052,7 @@ mod tests {
 
         let state = HandlerState {
             db_path: db_path.clone(),
+            event_bus: None,
         };
 
         let req = Request {
@@ -6019,6 +6129,7 @@ mod tests {
 
         let state = HandlerState {
             db_path: db_path.clone(),
+            event_bus: None,
         };
 
         // Create first project
@@ -6083,6 +6194,7 @@ mod tests {
 
         let state = HandlerState {
             db_path: db_path.clone(),
+            event_bus: None,
         };
 
         let req = Request {
@@ -6150,6 +6262,7 @@ mod tests {
 
         let state = HandlerState {
             db_path: db_path.clone(),
+            event_bus: None,
         };
 
         let req = Request {
@@ -6201,6 +6314,7 @@ mod tests {
     fn make_test_state() -> HandlerState {
         HandlerState {
             db_path: PathBuf::from("/nonexistent/test.db"),
+            event_bus: None,
         }
     }
 
@@ -6217,6 +6331,7 @@ mod tests {
 
         let state = HandlerState {
             db_path: db_path.clone(),
+            event_bus: None,
         };
         (state, db_dir)
     }

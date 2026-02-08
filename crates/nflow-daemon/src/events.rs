@@ -26,6 +26,12 @@ pub enum Event {
         branch_name: String,
         mr_url: Option<String>,
     },
+    /// Decomposition (plan generation) completed — work items are now in the database.
+    DecompositionCompleted {
+        session_id: String,
+        project_id: String,
+        wave_number: u32,
+    },
 }
 
 /// A client subscription identified by a unique ID.

@@ -52,6 +52,7 @@ mod tests {
     fn start_real_server(socket_path: &Path, db_path: &Path) -> crate::socket::SocketServerHandle {
         let state = Arc::new(HandlerState {
             db_path: db_path.to_path_buf(),
+            event_bus: None,
         });
         let handler = create_handler(state);
         let config = SocketServerConfig {
