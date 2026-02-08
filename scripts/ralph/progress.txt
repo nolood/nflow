@@ -2641,3 +2641,22 @@ Started: Sat Feb  7 03:49:10 PM MSK 2026
   - 11 daemon e2e test failures (test_e2e_full_happy_path, test_e2e_parallel_execution, etc.) are pre-existing mock Claude streaming timeout issues — they pass individually but fail when run as a batch due to socket contention
   - cargo test -p nflow-cli (82 tests) is the reliable test target; full workspace tests have flaky e2e tests
 ---
+
+## 2026-02-08 - US-107
+- What was implemented: Verified that existing tests in dag.rs (35 tests) and scheduler.rs (30 tests) already satisfy all acceptance criteria. No new code needed — tests were already comprehensive.
+- Files changed: scripts/ralph/prd.json (marked passes: true)
+- **Learnings for future iterations:**
+  - dag.rs has 35 unit tests covering: empty DAG, single node, linear chain, diamond, 5-story chain, cross-session rejection, invalid references, self-loop, direct/indirect cycle detection, topological sort (empty/single/chain/diamond/no-deps), find_ready (no deps, blocker done/pending/cancelled/in_progress/failed, mixed/all blockers), find_blocked (no deps, pending/resolved/cancelled blockers, partial)
+  - scheduler.rs has 30 unit tests covering: execution disabled, mark ready (no blockers, blocker done, blocked), max_parallel (limit/full/one slot), sort_order priority, unapproved/discarded sessions, epic status propagation (in_progress/done/no change/mixed/all cancelled/failed), edge cases (empty state, all done, already ready, in progress, failed, cancelled blocker), wave ordering, complex chain dependencies
+  - cargo test -p nflow-core runs 270 tests total across all modules, all passing
+  - nflow-core is a pure library with zero warnings on clippy
+---
+
+## 2026-02-08 - US-108
+- What was implemented: Verified that existing tests in work_item.rs (68 tests) and spec.rs (23 tests) already satisfy all acceptance criteria. No new code needed — tests were already comprehensive.
+- Files changed: scripts/ralph/prd.json (marked passes: true)
+- **Learnings for future iterations:**
+  - work_item.rs has 68 unit tests covering: struct fields (2), story happy paths — pending→ready→in_progress→done, pending→ready→in_progress→failed, failed→in_progress retry, cancel from pending/ready/in_progress (8), story invalid transitions — ready requires blockers, ready from non-pending, start from pending/done, complete from pending, fail from pending, cancel from done/failed/cancelled (8+), story on non-story type guard (1), epic status propagation (9), dependency model (2), task constructor (1), task happy paths — pending→in_progress→done(±commit_hash), in_progress→failed, failed→retry, pending→cancelled, failed→done skip (7), task invalid transitions (7), task on non-task type guards (2), verify tasks auto-generation (3), find paired verify/impl (4), get next pending task (4), skip task with paired verify (2), additional cross-state invalids (3), timestamp update tracking (2)
+  - spec.rs has 23 unit tests covering: defaults (1), happy paths — draft→approved, approved→draft reopen, approved→decomposed, decomposed→approved discard, draft→deleted, approved→deleted (6), invalid transitions — approve from approved/decomposed/deleted, reopen from draft/decomposed/deleted, decompose from draft, delete from decomposed/deleted, discard from draft/approved (11), session management — start/start-when-active/end-stores-id/end-overwrites (4), timestamp (1)
+  - 91 total state machine tests far exceeds the minimum 15 requirement
+---

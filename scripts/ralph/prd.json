@@ -140,8 +140,8 @@
         "Typecheck passes"
       ],
       "priority": 8,
-      "passes": false,
-      "notes": ""
+      "passes": true,
+      "notes": "Already had 68 work_item tests + 23 spec tests = 91 total (far exceeds min 15). Covers all valid/invalid transitions, verify task state machine, session_active toggling. All 270 nflow-core tests pass. Clippy clean."
     },
     {
       "id": "US-109",
