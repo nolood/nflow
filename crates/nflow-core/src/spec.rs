@@ -302,6 +302,22 @@ mod tests {
         assert!(matches!(err, NflowError::InvalidTransition { .. }));
     }
 
+    #[test]
+    fn reopen_from_deleted_fails() {
+        let mut spec = make_spec();
+        spec.delete().unwrap();
+        let err = spec.reopen().unwrap_err();
+        assert!(matches!(err, NflowError::InvalidTransition { .. }));
+    }
+
+    #[test]
+    fn approve_from_deleted_fails() {
+        let mut spec = make_spec();
+        spec.delete().unwrap();
+        let err = spec.approve().unwrap_err();
+        assert!(matches!(err, NflowError::InvalidTransition { .. }));
+    }
+
     // --- Session management ---
 
     #[test]

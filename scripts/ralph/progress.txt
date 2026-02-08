@@ -2254,3 +2254,16 @@ Started: Sat Feb  7 03:49:10 PM MSK 2026
   - The specific gap was cancelled->done invalid transition tests required by AC3
   - Work item module already has comprehensive coverage; future test stories should check existing tests first
 ---
+
+## 2026-02-08 - US-093
+- What was implemented: Added missing spec state machine tests for deleted->draft and deleted->approved invalid transitions
+- Files changed: crates/nflow-core/src/spec.rs
+- Tests added:
+  - `reopen_from_deleted_fails` — deleted spec cannot transition back to draft via reopen()
+  - `approve_from_deleted_fails` — deleted spec cannot transition to approved via approve()
+- All 26 spec tests pass (24 pre-existing + 2 new)
+- **Learnings for future iterations:**
+  - Most spec state machine tests were already implemented in US-003; the gap was the deleted->draft/approved invalid transition coverage
+  - Spec module already had comprehensive happy-path and most invalid-path tests; only edge cases for the deleted terminal state were missing
+  - Always check existing test coverage before writing new tests — many "test" stories have already been substantially covered by earlier implementation stories
+---
