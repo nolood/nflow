@@ -1710,7 +1710,7 @@
         "Tests pass: cargo test -p nflow-daemon commands_project_spec"
       ],
       "priority": 100,
-      "passes": false,
+      "passes": true,
       "notes": ""
     },
     {

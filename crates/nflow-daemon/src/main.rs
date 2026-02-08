@@ -1,3 +1,5 @@
+#[cfg(test)]
+mod commands_project_spec_tests;
 mod daemon;
 mod db;
 pub mod error;

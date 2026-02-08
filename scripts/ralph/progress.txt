@@ -1,5 +1,7 @@
 ## Codebase Patterns
 - Integration tests needing isolated NFLOW_HOME: use create_test_home() → (TempDir guard, PathBuf) with temp .nflow/ dir (0700 perms, logs/ subdir). create_test_db(&nflow_home) → on-disk SQLite with migrations. TempDir guard auto-cleans on drop.
+- Direct DB insert helpers for command tests: insert_test_project(db_path, name) → Uuid; insert_test_spec(db_path, project_id, name, SpecStatus) → Spec. Bypass streaming commands that need Claude.
+- ProjectService::create() always needs git_provider_override: Some(GitProvider::Github) when remote_url is None
 - Protocol integration tests use start_real_server(socket_path, db_path) → creates handler via create_handler(HandlerState{db_path}), starts socket server with real dispatch
 - Flock mechanism lives in nflow-cli/src/daemon_client.rs (not daemon) — CLI acquires exclusive lock on ~/.nflow/daemon.lock before spawning daemon. Use nix::fcntl::{Flock, FlockArg::LockExclusiveNonblock}.
 - graceful_shutdown() has a 60s agent grace period — test_full_lifecycle_with_agents takes ~70s. For CI, consider #[ignore] attribute or shorter timeouts.
@@ -2360,4 +2362,26 @@ Started: Sat Feb  7 03:49:10 PM MSK 2026
   - Streaming commands like `spec.new` require external Claude binary — use custom streaming handlers in tests instead
   - Pre-existing clippy errors (39) and 1 pre-existing test failure (`test_config_set_validation_rejects_zero_max_parallel`) exist but are unrelated
   - All test helpers (create_test_home, create_test_db, temp_socket_path, cleanup, do_handshake) follow same patterns as lifecycle_tests.rs
+---
+
+## 2026-02-08 - US-100
+- What was implemented: Integration tests for project and spec commands through the socket protocol
+  - 15 tests covering full command flow: client → socket → handler → DB → response
+  - project.init: success with DB verification and directory creation, duplicate name → ALREADY_EXISTS (consolidated into single test due to HOME env var)
+  - project.list: empty list, with projects, counts
+  - project.delete: cascade (specs deleted), not found → NOT_FOUND
+  - spec.new: error paths (missing project → NOT_FOUND)
+  - spec.list: empty, with specs, hides deleted specs (soft-delete filtering)
+  - spec.approve: draft → approved success, already approved → INVALID_STATE
+  - spec.delete: draft success (soft-delete), decomposed → INVALID_STATE error, approved requires force=true
+  - Full lifecycle flow: list → approve → list → re-approve fails
+- Files changed:
+  - `crates/nflow-daemon/src/commands_project_spec_tests.rs` (new, ~570 lines)
+  - `crates/nflow-daemon/src/main.rs` (added `#[cfg(test)] mod commands_project_spec_tests;`)
+- **Learnings for future iterations:**
+  - ProjectService::create() requires either remote_url or git_provider_override — use `Some(GitProvider::Github)` for direct DB insert helpers
+  - project.init with fresh git repos (no remote) needs explicit `git_provider` param since `get_remote_url()` returns None
+  - Tests using `std::env::set_var("HOME", ...)` must be consolidated into a single test to avoid parallel race conditions (process-global env)
+  - insert_test_project() and insert_test_spec() are useful helpers for bypassing streaming commands that need Claude
+  - Spec state transitions can be driven through nflow-core model (approve/decompose/delete) before DB insert for setting up test fixtures
 ---
