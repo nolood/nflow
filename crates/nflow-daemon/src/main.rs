@@ -6,6 +6,8 @@ pub mod handlers;
 #[cfg(test)]
 mod lifecycle_tests;
 pub mod platform;
+#[cfg(test)]
+mod protocol_tests;
 mod recovery;
 mod scheduler_loop;
 mod shutdown;

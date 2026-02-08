@@ -1694,7 +1694,7 @@
         "Tests pass: cargo test -p nflow-daemon protocol"
       ],
       "priority": 99,
-      "passes": false,
+      "passes": true,
       "notes": ""
     },
     {
