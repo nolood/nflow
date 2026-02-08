@@ -51,6 +51,9 @@
 - TUI async overlay pattern: overlays requiring daemon data (e.g., ProjectSwitcher) return a ViewAction (e.g., ProjectSwitcherOpen) from handle_key_event instead of toggling directly, so main loop can fetch data async then open the overlay via a dedicated open_*() method
 - TUI view-specific keys: handle_key_event returns (bool, ViewAction); handle_view_key dispatches by current_view to per-view handler (handle_specs_key etc.)
 - TUI sub-view pattern: App.spec_dialogue: Option<SpecDialogueState> — presence indicates sub-view active; handle_key_event checks in_dialogue() before global keys; dialogue keys handled exclusively in handle_dialogue_key()
+- E2E failure tests: set MOCK_CLAUDE_FAIL/VERIFY_FAIL/SLEEP env vars AFTER setup_execution_env() returns (not before), since setup invokes mock-claude for spec/plan generation
+- story short_ids in DB are wave-prefixed ("W1-S1"), task short_ids are bare ("T1") — use .ends_with("S1") not == "S1" when searching
+- spawn_agent_for_task() and exec.retry handler must wait for child.wait() and record exit_code — otherwise reaper defaults to exit_code=1 (failure)
 - TUI streaming in event loop: try_read_streaming_line(10ms timeout) polls non-blocking in main loop; streaming state controls whether poll happens; input disabled during Streaming state
 - TUI dialogue message coalescing: add_claude_message() appends to last message if sender matches — avoids fragmenting contiguous text events into separate messages
 - TUI list state pattern: XxxListState struct with items Vec, selected usize, select_prev/select_next, update_from_response
@@ -2493,4 +2496,27 @@ Started: Sat Feb  7 03:49:10 PM MSK 2026
   - Agent child processes must be waited on to capture exit codes — dropping without wait causes reaper to assume exit code 1
   - `extract_commit_info` must handle both `[branch hash]` and `[detached HEAD hash]` patterns
   - E2E tests that use `std::env::set_var("HOME", ...)` are not safe to run concurrently with other tests that do the same — environment is process-global
+---
+
+## 2026-02-08 - US-105
+- What was implemented:
+  - 7 E2E failure/recovery tests in `crates/nflow-daemon/src/e2e_tests.rs`:
+    - test_e2e_impl_task_fails: MOCK_CLAUDE_FAIL=1 → task + story marked Failed
+    - test_e2e_retry_succeeds: exec.retry on failed task → re-executed, story completes
+    - test_e2e_skip_task: exec.skip on failed impl → verify cancelled, story continues
+    - test_e2e_verify_task_fails: MOCK_CLAUDE_VERIFY_FAIL=1 → impl succeeds, verify fails, story Failed
+    - test_e2e_stop_agent: MOCK_CLAUDE_SLEEP=60 + exec.stop --all → agents terminated, stories cancelled
+    - test_e2e_continue_cancelled_story: stop then continue → story resumes and completes
+    - test_e2e_wall_clock_timeout: MOCK_CLAUDE_SLEEP=3600 + DB started_at manipulation → timeout detected, agent killed, task Failed
+  - Shared E2eEnv helper struct + setup_execution_env() for DRY test setup
+  - MOCK_CLAUDE_SLEEP env var added to mock-claude binary for timeout testing
+- Files changed:
+  - `crates/nflow-daemon/src/e2e_tests.rs` (+864 lines — 7 tests, helpers, E2eEnv struct)
+  - `crates/nflow-daemon/src/handlers.rs` (fixed child process exit code capture in spawn_agent_for_task and exec.retry)
+  - `crates/mock-claude/src/main.rs` (added MOCK_CLAUDE_SLEEP env var)
+- **Learnings for future iterations:**
+  - MOCK_CLAUDE_* env vars must be set AFTER setup_execution_env() since setup invokes mock-claude for spec/plan
+  - Handler agent spawning was missing child.wait() + exit_code recording — caused reaper to always see exit_code=1
+  - Story short_ids are wave-prefixed in DB ("W1-S1"), tasks are bare ("T1") — use ends_with() for matching
+  - For timeout testing, manipulate agent_run.started_at in DB rather than waiting real wall-clock time
 ---

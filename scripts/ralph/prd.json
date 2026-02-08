@@ -1797,8 +1797,8 @@
         "Tests pass on Linux and macOS"
       ],
       "priority": 105,
-      "passes": false,
-      "notes": ""
+      "passes": true,
+      "notes": "Tests require --test-threads=1 due to shared env vars (same as US-104 happy path test)"
     },
     {
       "id": "US-106",
