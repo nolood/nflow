@@ -2540,3 +2540,23 @@ Started: Sat Feb  7 03:49:10 PM MSK 2026
   - With max_parallel=3 (hardcoded in scheduler_loop) and 3 independent stories, the scheduler starts all 3 in the same tick
   - Fast mock-claude means stories may complete between scheduler ticks — don't rely on timing for exact parallelism checks
 ---
+
+## 2026-02-08 - US-107
+- What was implemented: Cross-platform CI via GitHub Actions
+  - GitHub Actions workflow at `.github/workflows/ci.yml`
+  - Matrix strategy: ubuntu-latest, macos-latest (fail-fast: false)
+  - Steps: cargo fmt --check, cargo clippy, cargo build (workspace includes mock-claude), cargo test (non-daemon), cargo test -p nflow-daemon --test-threads=1
+  - Cargo caching via actions/cache (registry, git, target)
+  - Triggers on push to main/ralph/** and PRs to main
+  - Mock-claude binary is built as part of the workspace (`cargo build --workspace`)
+  - E2E tests use `NFLOW_CLAUDE_BINARY` env var (set in `mock_claude_binary_path()` helper) which resolves relative to workspace root
+  - Daemon tests run single-threaded to avoid E2E env var races
+- Files changed:
+  - `.github/workflows/ci.yml` (new — GitHub Actions CI workflow)
+  - `scripts/ralph/prd.json` (US-107 passes: true)
+- **Learnings for future iterations:**
+  - E2E tests set `NFLOW_CLAUDE_BINARY` env var internally via `mock_claude_binary_path()` which uses `env!("CARGO_MANIFEST_DIR")` — no external env var needed in CI
+  - All daemon tests must run with `--test-threads=1` because E2E tests share env vars (HOME, PATH, NFLOW_CLAUDE_BINARY)
+  - Don't use `RUSTFLAGS: -Dwarnings` when existing codebase has accumulated clippy warnings across many iterations
+  - `cargo build --workspace` builds mock-claude automatically since it's a workspace member
+---
