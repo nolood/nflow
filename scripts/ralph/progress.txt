@@ -2577,3 +2577,15 @@ Started: Sat Feb  7 03:49:10 PM MSK 2026
   - The SocketServerHandle Drop impl already sends shutdown signal, so explicit shutdown() call is optional; storing as _server_handle ensures cleanup on scope exit
   - Socket server pattern: HandlerState{db_path} → create_handler(Arc::new(state)) → SocketServerConfig{socket_path, handler, event_bus: None} → start_server(config)
 ---
+
+## 2026-02-08 - US-102
+- What was implemented: Wired `db::run_migrations()` call in daemon `main.rs` `foreground_mode()` startup sequence, after resolving `db_path` and before starting the socket server. Opens a scoped DB connection, runs migrations, logs the resulting schema version. Exits with error on failure.
+- Files changed:
+  - `crates/nflow-daemon/src/main.rs` (added migration block between db_path resolution and socket server startup)
+  - `scripts/ralph/prd.json` (US-102 passes: true)
+- **Learnings for future iterations:**
+  - The migration call eliminates dead code warnings for `MIGRATIONS`, `current_version()`, `backup_db()`, and `DbError::Migration` — all were only used transitively by `run_migrations()` which was only called from test code
+  - DB connection for migrations is scoped in a block `{}` so it's dropped before the socket server starts — avoids holding a connection unnecessarily during the entire daemon lifetime
+  - `run_migrations()` takes both `&Connection` and `&Path` — the path is needed for `backup_db()` which copies the file before applying new migrations
+  - Same 11 pre-existing test failures (E2E + mock-claude) — no regressions from this change
+---

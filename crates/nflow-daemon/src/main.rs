@@ -68,7 +68,7 @@ async fn main() {
                 std::process::id()
             );
 
-            // --- Socket server startup ---
+            // --- Database migrations ---
             let db_path = match daemon::db_path() {
                 Ok(p) => p,
                 Err(e) => {
@@ -76,6 +76,27 @@ async fn main() {
                     std::process::exit(1);
                 }
             };
+
+            {
+                let conn = match db::open_connection(&db_path) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        eprintln!("Failed to open database: {}", e);
+                        std::process::exit(1);
+                    }
+                };
+                match db::run_migrations(&conn, &db_path) {
+                    Ok(version) => {
+                        eprintln!("database schema at version {}", version);
+                    }
+                    Err(e) => {
+                        eprintln!("Failed to run migrations: {}", e);
+                        std::process::exit(1);
+                    }
+                }
+            }
+
+            // --- Socket server startup ---
             let socket_path = match daemon::socket_path() {
                 Ok(p) => p,
                 Err(e) => {
