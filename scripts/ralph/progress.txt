@@ -1,5 +1,6 @@
 ## Codebase Patterns
 - Integration tests needing isolated NFLOW_HOME: use create_test_home() → (TempDir guard, PathBuf) with temp .nflow/ dir (0700 perms, logs/ subdir). create_test_db(&nflow_home) → on-disk SQLite with migrations. TempDir guard auto-cleans on drop.
+- Protocol integration tests use start_real_server(socket_path, db_path) → creates handler via create_handler(HandlerState{db_path}), starts socket server with real dispatch
 - Flock mechanism lives in nflow-cli/src/daemon_client.rs (not daemon) — CLI acquires exclusive lock on ~/.nflow/daemon.lock before spawning daemon. Use nix::fcntl::{Flock, FlockArg::LockExclusiveNonblock}.
 - graceful_shutdown() has a 60s agent grace period — test_full_lifecycle_with_agents takes ~70s. For CI, consider #[ignore] attribute or shorter timeouts.
 - platform::send_signal(pid, Signal) returns SendSignalResult {Sent, NoSuchProcess, PermissionDenied} — use instead of raw nix::sys::signal::kill()
@@ -2339,4 +2340,24 @@ Started: Sat Feb  7 03:49:10 PM MSK 2026
   - nix::fcntl::Flock::lock() returns Err((File, Errno)) — destructured as (_file, errno) to check for EAGAIN/EWOULDBLOCK
   - Cross-process flock testing: spawn bash with `exec 200>"file" && flock -xn 200 && sleep N` pattern
   - &Path preferred over &PathBuf for function params per clippy ptr_arg lint
+---
+
+## 2026-02-08 - US-099
+- What was implemented: 15 NDJSON protocol integration tests in `crates/nflow-daemon/src/protocol_tests.rs`
+- Tests cover all 7 acceptance criteria:
+  1. Valid request returns valid response with matching UUID (2 tests)
+  2. Malformed JSON returns error response with empty id (2 tests: garbage + partial JSON)
+  3. Unknown command returns error with "unknown command" message (2 tests: error + connection preservation)
+  4. Handshake succeeds/fails (4 tests: success, wrong version, invalid JSON, command before handshake)
+  5. Streaming response sends multiple lines until done=true (2 tests: response + shared ID verification)
+  6. Client disconnects mid-stream are handled gracefully (3 tests: mid-stream, before handshake, after handshake)
+- Files changed:
+  - `crates/nflow-daemon/src/protocol_tests.rs` (new, 869 lines)
+  - `crates/nflow-daemon/src/main.rs` (added `#[cfg(test)] mod protocol_tests;`)
+- **Learnings for future iterations:**
+  - Integration tests use `start_real_server()` helper with `create_handler(HandlerState{db_path})` for real dispatch, vs unit tests that use `echo_handler()`
+  - `send_request()` helper simplifies request/response cycle: builds JSON, writes NDJSON line, reads and parses response
+  - Streaming commands like `spec.new` require external Claude binary — use custom streaming handlers in tests instead
+  - Pre-existing clippy errors (39) and 1 pre-existing test failure (`test_config_set_validation_rejects_zero_max_parallel`) exist but are unrelated
+  - All test helpers (create_test_home, create_test_db, temp_socket_path, cleanup, do_handshake) follow same patterns as lifecycle_tests.rs
 ---
