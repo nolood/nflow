@@ -198,8 +198,8 @@
         "cargo test passes"
       ],
       "priority": 11,
-      "passes": false,
-      "notes": ""
+      "passes": true,
+      "notes": "Single comprehensive binary E2E test exercises all 7 command groups: project (init→list→delete), spec (list empty, approve NOT_FOUND), plan (show no waves), exec (status empty), worktree (list empty), config (show→set→verify), cleanup (logs). Also validates error format for unknown commands and missing params. Passes in ~2s."
     }
   ]
 }

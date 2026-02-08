@@ -388,4 +388,291 @@ mod tests {
         send_sigterm(&child);
         let _ = child.wait();
     }
+
+    /// Comprehensive test that exercises every CLI command group against a running daemon.
+    /// Covers: project, spec, plan, exec, worktree, config, cleanup.
+    #[test]
+    fn test_all_cli_command_groups() {
+        // --- Setup ---
+        let (tmp, nflow_home) = create_test_home();
+        let repo_dir = create_git_repo(tmp.path());
+        let socket_path = nflow_home.join("nflow.sock");
+
+        let mut child = spawn_daemon(tmp.path());
+
+        assert!(
+            wait_for_file(&socket_path, Duration::from_secs(10)),
+            "socket file was not created within 10s"
+        );
+
+        let (mut writer, mut reader) = connect_and_handshake(&socket_path);
+
+        // ========================================================
+        // PROJECT GROUP
+        // ========================================================
+
+        // project.init — create a project
+        let resp = send_request(
+            &mut writer,
+            &mut reader,
+            "proj-1",
+            "project.init",
+            serde_json::json!({
+                "name": "test-project",
+                "path": repo_dir.to_str().unwrap(),
+                "base_branch": "main",
+                "git_provider": "github"
+            }),
+        );
+        assert_eq!(resp["status"], "ok", "project.init failed: {:?}", resp);
+        assert_eq!(resp["data"]["name"], "test-project");
+
+        // project.list — should show the project
+        let resp = send_request(
+            &mut writer,
+            &mut reader,
+            "proj-2",
+            "project.list",
+            serde_json::json!({}),
+        );
+        assert_eq!(resp["status"], "ok", "project.list failed: {:?}", resp);
+        let projects = resp["data"]["projects"].as_array().unwrap();
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0]["name"], "test-project");
+
+        // ========================================================
+        // SPEC GROUP
+        // ========================================================
+
+        // spec.list — should return empty for new project
+        let resp = send_request(
+            &mut writer,
+            &mut reader,
+            "spec-1",
+            "spec.list",
+            serde_json::json!({ "project_name": "test-project" }),
+        );
+        assert_eq!(resp["status"], "ok", "spec.list failed: {:?}", resp);
+        let specs = resp["data"]["specs"].as_array().unwrap();
+        assert!(specs.is_empty(), "specs should be empty for new project");
+
+        // spec.approve on nonexistent — should return NOT_FOUND error
+        let resp = send_request(
+            &mut writer,
+            &mut reader,
+            "spec-2",
+            "spec.approve",
+            serde_json::json!({
+                "project_name": "test-project",
+                "spec_name": "nonexistent-spec"
+            }),
+        );
+        assert_eq!(resp["status"], "error", "spec.approve should fail for nonexistent spec");
+        let msg = resp["data"]["message"].as_str().unwrap();
+        assert!(
+            msg.contains("NOT_FOUND"),
+            "error should contain NOT_FOUND, got: {}",
+            msg
+        );
+
+        // ========================================================
+        // PLAN GROUP
+        // ========================================================
+
+        // plan.show — project with no plans should return NOT_FOUND
+        let resp = send_request(
+            &mut writer,
+            &mut reader,
+            "plan-1",
+            "plan.show",
+            serde_json::json!({ "project_name": "test-project" }),
+        );
+        assert_eq!(resp["status"], "error", "plan.show should fail with no plans");
+        let msg = resp["data"]["message"].as_str().unwrap();
+        assert!(
+            msg.contains("NOT_FOUND") && msg.contains("no decomposition waves"),
+            "error should mention no decomposition waves, got: {}",
+            msg
+        );
+
+        // ========================================================
+        // EXEC GROUP
+        // ========================================================
+
+        // exec.status — project with no execution should return ok with empty waves
+        let resp = send_request(
+            &mut writer,
+            &mut reader,
+            "exec-1",
+            "exec.status",
+            serde_json::json!({ "project_name": "test-project" }),
+        );
+        assert_eq!(resp["status"], "ok", "exec.status failed: {:?}", resp);
+        let waves = resp["data"]["waves"].as_array().unwrap();
+        assert!(
+            waves.is_empty(),
+            "waves should be empty for project with no execution"
+        );
+
+        // ========================================================
+        // WORKTREE GROUP
+        // ========================================================
+
+        // worktree.list — should return empty for new project
+        let resp = send_request(
+            &mut writer,
+            &mut reader,
+            "wt-1",
+            "worktree.list",
+            serde_json::json!({ "project": "test-project" }),
+        );
+        assert_eq!(resp["status"], "ok", "worktree.list failed: {:?}", resp);
+        let worktrees = resp["data"]["worktrees"].as_array().unwrap();
+        assert!(
+            worktrees.is_empty(),
+            "worktrees should be empty for new project"
+        );
+        assert_eq!(resp["data"]["count"], 0);
+
+        // ========================================================
+        // CONFIG GROUP
+        // ========================================================
+
+        // config.show — should return valid config (global, no project)
+        let resp = send_request(
+            &mut writer,
+            &mut reader,
+            "cfg-1",
+            "config.show",
+            serde_json::json!({}),
+        );
+        assert_eq!(resp["status"], "ok", "config.show failed: {:?}", resp);
+        let config = resp["data"]["config"].as_object().unwrap();
+        assert!(
+            config.contains_key("max_parallel"),
+            "config should contain max_parallel"
+        );
+        assert!(
+            config.contains_key("auto_execute"),
+            "config should contain auto_execute"
+        );
+
+        // config.set — update a value
+        let resp = send_request(
+            &mut writer,
+            &mut reader,
+            "cfg-2",
+            "config.set",
+            serde_json::json!({
+                "key": "max_parallel",
+                "value": 8
+            }),
+        );
+        assert_eq!(resp["status"], "ok", "config.set failed: {:?}", resp);
+        assert_eq!(resp["data"]["key"], "max_parallel");
+        assert_eq!(resp["data"]["value"], 8);
+
+        // config.show — verify the value was updated
+        let resp = send_request(
+            &mut writer,
+            &mut reader,
+            "cfg-3",
+            "config.show",
+            serde_json::json!({}),
+        );
+        assert_eq!(resp["status"], "ok");
+        assert_eq!(
+            resp["data"]["config"]["max_parallel"]["value"], 8,
+            "max_parallel should be updated to 8"
+        );
+
+        // ========================================================
+        // CLEANUP GROUP
+        // ========================================================
+
+        // cleanup.logs — should succeed (even with no logs to clean)
+        let resp = send_request(
+            &mut writer,
+            &mut reader,
+            "clean-1",
+            "cleanup.logs",
+            serde_json::json!({
+                "project": "test-project",
+                "all": true
+            }),
+        );
+        assert_eq!(resp["status"], "ok", "cleanup.logs failed: {:?}", resp);
+        assert_eq!(resp["data"]["count"], 0, "should have 0 logs to clean");
+
+        // ========================================================
+        // ERROR RESPONSE FORMAT VALIDATION
+        // ========================================================
+
+        // Verify unknown command returns proper error
+        let resp = send_request(
+            &mut writer,
+            &mut reader,
+            "err-1",
+            "nonexistent.command",
+            serde_json::json!({}),
+        );
+        assert_eq!(resp["status"], "error", "unknown command should return error");
+        let msg = resp["data"]["message"].as_str().unwrap();
+        assert!(
+            msg.contains("unknown command"),
+            "error should mention unknown command, got: {}",
+            msg
+        );
+
+        // Verify missing params returns proper error
+        let resp = send_request(
+            &mut writer,
+            &mut reader,
+            "err-2",
+            "spec.list",
+            serde_json::json!({}),
+        );
+        assert_eq!(resp["status"], "error", "missing params should return error");
+        let msg = resp["data"]["message"].as_str().unwrap();
+        assert!(
+            msg.contains("missing required parameter"),
+            "error should mention missing parameter, got: {}",
+            msg
+        );
+
+        // ========================================================
+        // PROJECT DELETE
+        // ========================================================
+
+        // project.delete — should remove the project
+        let resp = send_request(
+            &mut writer,
+            &mut reader,
+            "proj-3",
+            "project.delete",
+            serde_json::json!({ "name": "test-project" }),
+        );
+        assert_eq!(resp["status"], "ok", "project.delete failed: {:?}", resp);
+        assert_eq!(resp["data"]["deleted"], true);
+
+        // project.list — should now be empty
+        let resp = send_request(
+            &mut writer,
+            &mut reader,
+            "proj-4",
+            "project.list",
+            serde_json::json!({}),
+        );
+        assert_eq!(resp["status"], "ok");
+        let projects = resp["data"]["projects"].as_array().unwrap();
+        assert!(projects.is_empty(), "projects should be empty after delete");
+
+        // ========================================================
+        // CLEANUP
+        // ========================================================
+        drop(writer);
+        drop(reader);
+        send_sigterm(&child);
+        let _ = child.wait();
+    }
 }

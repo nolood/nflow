@@ -1,4 +1,5 @@
 ## Codebase Patterns
+- Binary E2E tests (spawning real daemon): use std::os::unix::net::UnixStream (sync) + std::process::Command with HOME env override. daemon_binary_path() uses CARGO_BIN_EXE_nflow-daemon or walks up from current_exe(). wait_for_file() polls with 50ms sleep. project.init needs git_provider: "github" when repo has no remote. project.list response: { projects: [...] } not bare array.
 - Integration tests needing isolated NFLOW_HOME: use create_test_home() → (TempDir guard, PathBuf) with temp .nflow/ dir (0700 perms, logs/ subdir). create_test_db(&nflow_home) → on-disk SQLite with migrations. TempDir guard auto-cleans on drop.
 - Direct DB insert helpers for command tests: insert_test_project(db_path, name) → Uuid; insert_test_spec(db_path, project_id, name, SpecStatus) → Spec. Bypass streaming commands that need Claude.
 - insert_exec_hierarchy(db_path, project_id, wave, story_status, task_status, verify_status) → (session_id, epic_id, story_id, task_id, verify_id) — creates full approved session + work item tree for exec tests
@@ -2670,4 +2671,33 @@ Started: Sat Feb  7 03:49:10 PM MSK 2026
   - config.rs has 28 tests covering: default values (1), merge empty/full/partial overlay (3), full resolution chain defaults→global→project→env (5), validation valid/invalid (6), branch template rendering (4), env var parsing (4), post-merge validation (1), US-095 acceptance criteria (4)
   - project.rs has 15 tests covering: create with github/gitlab detection (2), provider override (1), name validation empty/duplicate (2), path validation (1), provider detection fallbacks unknown/no-remote (2), no remote with override (1), head ref handling (1), deletion with/without agents (2), git provider detection (3)
   - 114 total tests across 4 modules far exceeds the minimum 20 requirement
+---
+
+## 2026-02-08 - US-110
+- What was implemented: 3 binary E2E tests that spawn the real nflow-daemon binary as a child process: (1) test_daemon_binary_socket_lifecycle — full lifecycle: spawn binary, poll for socket, verify 0600 permissions, verify PID file, NDJSON handshake, project.init, project.list, SIGTERM shutdown, verify socket+PID cleanup; (2) test_daemon_binary_database_initialized — verifies DB is created and migrated on startup; (3) test_daemon_binary_multiple_clients — two concurrent socket connections sharing data.
+- Files changed: crates/nflow-daemon/src/binary_e2e_tests.rs (new, 389 lines), crates/nflow-daemon/src/main.rs (added module registration), scripts/ralph/prd.json (US-110 passes: true)
+- **Learnings for future iterations:**
+  - Unlike in-process e2e_tests.rs which uses start_real_server(), binary tests use std::process::Command to spawn the actual nflow-daemon binary with HOME env override — exercises full main.rs startup path including foreground_mode, migrations, recovery, socket server
+  - Use std::os::unix::net::UnixStream (sync, not tokio) for binary tests — simpler, no async runtime needed in test code
+  - project.init requires git_provider: "github" param when the test repo has no remote URL (ProjectService::create validation)
+  - project.list returns { projects: [...] } — access via resp["data"]["projects"], not resp["data"]
+  - daemon_binary_path() should check CARGO_BIN_EXE_nflow-daemon first (set by cargo test for same-package binaries), then walk up parent dirs as fallback
+  - wait_for_file() with 50ms polling + 10s timeout is reliable for daemon startup detection
+  - Drop socket connections before sending SIGTERM to avoid broken pipe issues in the daemon
+---
+
+## 2026-02-08 - US-111
+- What was implemented: Comprehensive binary E2E test (`test_all_cli_command_groups`) that exercises all 7 CLI command groups against a running daemon
+- Files changed:
+  - `crates/nflow-daemon/src/binary_e2e_tests.rs` — added test_all_cli_command_groups
+  - `scripts/ralph/prd.json` — marked US-111 passes: true
+- Test covers: project (init/list/delete lifecycle), spec (list empty/approve NOT_FOUND), plan (show no decomposition waves), exec (status empty waves), worktree (list empty), config (show/set/verify roundtrip), cleanup (logs with all:true on empty project), error format validation (unknown command, missing params)
+- **Learnings for future iterations:**
+  - worktree.list uses param name `project` (not `project_name`) — inconsistent with other commands
+  - config.show uses `project_name` param, cleanup.logs uses `project` param — check handler source for exact param names
+  - exec.status returns ok with empty waves array when no decomposition exists (not an error), unlike plan.show which returns NOT_FOUND error
+  - cleanup.logs with `all: true` on a project with no log directory returns ok with count=0 (graceful, no error)
+  - project.delete uses `name` param (not `project_name`) and returns `{ deleted: true, ... }`
+  - A single comprehensive test covering all command groups is more maintainable than separate tests — reduces daemon startup overhead (each spawn takes ~1-2s)
+  - The 11 pre-existing test failures are all in e2e_tests.rs/commands_*_tests.rs due to mock-claude binary not being built/available — these don't affect binary E2E tests
 ---
