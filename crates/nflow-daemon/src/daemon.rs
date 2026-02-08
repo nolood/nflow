@@ -3,7 +3,6 @@ use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
@@ -97,30 +96,6 @@ pub fn write_pid_file() -> Result<()> {
     Ok(())
 }
 
-/// Reads the PID from ~/.nflow/daemon.pid. Returns None if file doesn't exist.
-pub fn read_pid_file() -> Result<Option<u32>> {
-    let pid_path = pid_file_path()?;
-    if !pid_path.exists() {
-        return Ok(None);
-    }
-    let content = fs::read_to_string(&pid_path)?;
-    let pid = content.trim().parse::<u32>().map_err(|e| {
-        DaemonError::Io(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("invalid PID in daemon.pid: {}", e),
-        ))
-    })?;
-    Ok(Some(pid))
-}
-
-/// Removes the PID file.
-pub fn remove_pid_file() -> Result<()> {
-    let pid_path = pid_file_path()?;
-    if pid_path.exists() {
-        fs::remove_file(&pid_path)?;
-    }
-    Ok(())
-}
 
 /// Opens the daemon log file for appending (creates if not exists).
 pub fn open_log_file() -> Result<File> {
@@ -240,59 +215,6 @@ pub fn is_shutting_down() -> bool {
     platform::is_shutting_down()
 }
 
-/// Spawn the daemon as a background process.
-///
-/// This is called from the CLI (`nflow daemon start`). It spawns the
-/// nflow-daemon binary as a detached child process. The spawned process
-/// will call `daemonize()` itself to fully detach.
-pub fn spawn_daemon(daemon_binary: &Path) -> Result<u32> {
-    spawn_daemon_with_mode(daemon_binary, "background")
-}
-
-/// Spawn the daemon in foreground mode.
-///
-/// This is called from the CLI (`nflow daemon start --foreground`). It spawns
-/// the nflow-daemon binary as a child process that inherits stdout/stderr,
-/// allowing logs to be visible in the terminal.
-pub fn spawn_daemon_foreground(daemon_binary: &Path) -> Result<u32> {
-    spawn_daemon_with_mode(daemon_binary, "foreground")
-}
-
-/// Spawn the daemon binary with the specified mode.
-fn spawn_daemon_with_mode(daemon_binary: &Path, mode: &str) -> Result<u32> {
-    ensure_nflow_home()?;
-
-    let mut cmd = Command::new(daemon_binary);
-    cmd.env("NFLOW_DAEMON_MODE", mode);
-
-    if mode == "background" {
-        cmd.stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .stdin(std::process::Stdio::null());
-    } else {
-        // Foreground: inherit stdout/stderr so logs are visible
-        cmd.stdin(std::process::Stdio::null());
-    }
-
-    let child = cmd.spawn().map_err(|e| {
-        DaemonError::Io(std::io::Error::new(
-            e.kind(),
-            format!("failed to spawn daemon: {}", e),
-        ))
-    })?;
-
-    let pid = child.id();
-    Ok(pid)
-}
-
-/// Check if a daemon process is currently running by reading the PID file
-/// and checking if the process exists.
-pub fn is_daemon_running() -> Result<bool> {
-    match read_pid_file()? {
-        None => Ok(false),
-        Some(pid) => Ok(crate::platform::is_process_alive(pid)),
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -390,55 +312,38 @@ mod tests {
         assert_eq!(mode, 0o700, ".nflow dir should be 0700");
     }
 
-    /// Tests PID file and is_daemon_running in a single sequential test
-    /// to avoid race conditions from parallel test runs sharing the same file.
+    /// Tests write_pid_file and direct PID file reads.
     #[test]
-    fn test_pid_file_and_daemon_running() {
-        // 1. Remove PID file — read returns None, is_daemon_running returns false
-        let _ = remove_pid_file();
-        assert_eq!(read_pid_file().unwrap(), None);
-        assert!(!is_daemon_running().unwrap());
-
-        // 2. Remove again — should succeed even if already gone
-        assert!(remove_pid_file().is_ok());
-
-        // 3. Write our own PID and read it back
-        write_pid_file().unwrap();
-        assert_eq!(read_pid_file().unwrap(), Some(std::process::id()));
-
-        // 4. Current process should show as running
-        assert!(is_daemon_running().unwrap());
-
-        // 5. Write a dead PID — should show as not running
-        ensure_nflow_home().unwrap();
+    fn test_write_pid_file() {
+        // Clean up first
         let pid_path = pid_file_path().unwrap();
-        let mut f = File::create(&pid_path).unwrap();
-        write!(f, "999999999").unwrap();
-        assert!(!is_daemon_running().unwrap());
+        let _ = fs::remove_file(&pid_path);
+
+        // Write PID file
+        write_pid_file().unwrap();
+
+        // Read back directly
+        let content = fs::read_to_string(&pid_path).unwrap();
+        let pid: u32 = content.trim().parse().unwrap();
+        assert_eq!(pid, std::process::id());
 
         // Cleanup
-        remove_pid_file().unwrap();
-    }
-
-    #[test]
-    fn test_spawn_daemon_nonexistent_binary() {
-        let result = spawn_daemon(Path::new("/nonexistent/nflow-daemon"));
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(err.to_string().contains("failed to spawn daemon"));
+        let _ = fs::remove_file(&pid_path);
     }
 
     #[test]
     fn test_foreground_mode_writes_pid_file_and_sets_shutdown() {
         // Clean up any existing PID file first
-        let _ = remove_pid_file();
+        let pid_path = pid_file_path().unwrap();
+        let _ = fs::remove_file(&pid_path);
 
         // Start foreground mode
         let shutdown = foreground_mode().unwrap();
 
         // PID file should be written
-        let pid = read_pid_file().unwrap();
-        assert_eq!(pid, Some(std::process::id()));
+        let content = fs::read_to_string(&pid_path).unwrap();
+        let pid: u32 = content.trim().parse().unwrap();
+        assert_eq!(pid, std::process::id());
 
         // Shutdown flag should be false initially
         assert!(!shutdown.load(Ordering::SeqCst));
@@ -446,7 +351,7 @@ mod tests {
 
         // Cleanup
         platform::reset_shutdown_flag();
-        remove_pid_file().unwrap();
+        let _ = fs::remove_file(&pid_path);
     }
 
     #[test]

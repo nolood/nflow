@@ -2589,3 +2589,30 @@ Started: Sat Feb  7 03:49:10 PM MSK 2026
   - `run_migrations()` takes both `&Connection` and `&Path` — the path is needed for `backup_db()` which copies the file before applying new migrations
   - Same 11 pre-existing test failures (E2E + mock-claude) — no regressions from this change
 ---
+
+## 2026-02-08 - US-103
+- Wired crash recovery into daemon main.rs foreground_mode startup sequence
+- recovery::recover_session_state() called after migrations and before socket server startup
+- RecoveryReport fields logged at info level via tracing
+- Recovery failure is non-fatal (logs warning, continues startup)
+- Files changed: crates/nflow-daemon/src/main.rs
+- **Learnings for future iterations:**
+  - socket_path and pid_file_path resolved once and reused across recovery + socket server sections (avoid duplicate resolution)
+  - Recovery is between migrations and socket server per the established startup sequence pattern
+  - Recovery errors should be non-fatal to allow daemon to start even if recovery partially fails
+---
+
+## 2026-02-08 - US-104
+- Removed dead code daemon spawning functions from nflow-daemon/src/daemon.rs
+- Removed: spawn_daemon(), spawn_daemon_foreground(), spawn_daemon_with_mode(), is_daemon_running(), read_pid_file(), remove_pid_file()
+- These were duplicated in CLI's daemon_client.rs — the daemon never needs to spawn itself
+- Removed std::process::Command import (only used by spawn functions)
+- Removed test_pid_file_and_daemon_running and test_spawn_daemon_nonexistent_binary tests
+- Updated test_foreground_mode_writes_pid_file_and_sets_shutdown to use direct fs operations
+- Added test_write_pid_file as focused replacement test
+- Files changed: crates/nflow-daemon/src/daemon.rs
+- **Learnings for future iterations:**
+  - CLI and daemon have separate spawn/PID implementations — CLI owns the "spawn daemon" responsibility, daemon owns "daemonize self"
+  - shutdown.rs has its own path-based remove_pid_file(path) — different from daemon.rs's parameterless version
+  - Tests referencing removed functions must be updated or removed; prefer direct fs operations over wrapper functions in tests
+---
