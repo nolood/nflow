@@ -158,8 +158,8 @@
         "Typecheck passes"
       ],
       "priority": 9,
-      "passes": false,
-      "notes": ""
+      "passes": true,
+      "notes": "Already had 50 short_id tests + 21 decomposition tests + 28 config tests + 15 project tests = 114 total (far exceeds min 20). Covers parsing/round-trip/invalid IDs, epic->story->task structure, default values/merge/partial merge, project creation/validation/git detection. All 270 nflow-core tests pass. Clippy clean."
     },
     {
       "id": "US-110",
