@@ -1,4 +1,7 @@
 ## Codebase Patterns
+- Integration tests needing isolated NFLOW_HOME: use create_test_home() → (TempDir guard, PathBuf) with temp .nflow/ dir (0700 perms, logs/ subdir). create_test_db(&nflow_home) → on-disk SQLite with migrations. TempDir guard auto-cleans on drop.
+- Flock mechanism lives in nflow-cli/src/daemon_client.rs (not daemon) — CLI acquires exclusive lock on ~/.nflow/daemon.lock before spawning daemon. Use nix::fcntl::{Flock, FlockArg::LockExclusiveNonblock}.
+- graceful_shutdown() has a 60s agent grace period — test_full_lifecycle_with_agents takes ~70s. For CI, consider #[ignore] attribute or shorter timeouts.
 - platform::send_signal(pid, Signal) returns SendSignalResult {Sent, NoSuchProcess, PermissionDenied} — use instead of raw nix::sys::signal::kill()
 - platform::install_signal_handler(Signal) sets global SHUTDOWN_FLAG AtomicBool; platform::is_shutting_down() reads it — use instead of custom signal handler globals
 - platform::ignore_signal(Signal)/restore_signal(Signal, handler) for temporary signal disposition changes (e.g., daemonization)
@@ -2320,4 +2323,20 @@ Started: Sat Feb  7 03:49:10 PM MSK 2026
 - **Learnings for future iterations:**
   - Most US-097 acceptance criteria were already covered by existing 31 tests; the only gap was the "extra variables ignored" scenario
   - render_template() naturally ignores extra vars because it iterates the template string and only looks up vars when encountering {variable} patterns — extra HashMap entries are never accessed
+---
+
+## 2026-02-08 - US-098
+- What was implemented: 14 daemon lifecycle integration tests covering start/stop, crash recovery, flock exclusion, auto-start, and cleanup
+- Files changed:
+  - crates/nflow-daemon/src/lifecycle_tests.rs (new — 14 integration tests)
+  - crates/nflow-daemon/src/main.rs (added #[cfg(test)] mod lifecycle_tests)
+- **Learnings for future iterations:**
+  - Binary crate integration tests must be internal modules (not tests/ dir) since private modules can't be accessed externally
+  - create_test_home() pattern: tempfile::tempdir() + .nflow/ dir with 0700 perms provides isolation without modifying HOME env var
+  - create_test_db() uses on-disk SQLite (not in-memory) in the temp nflow_home — needed for realistic lifecycle testing
+  - Flock is implemented in CLI crate, not daemon — the daemon doesn't need it, the CLI prevents concurrent daemon spawns
+  - graceful_shutdown() 60s grace period makes test_full_lifecycle_with_agents slow (~70s) — acceptable for integration tests
+  - nix::fcntl::Flock::lock() returns Err((File, Errno)) — destructured as (_file, errno) to check for EAGAIN/EWOULDBLOCK
+  - Cross-process flock testing: spawn bash with `exec 200>"file" && flock -xn 200 && sleep N` pattern
+  - &Path preferred over &PathBuf for function params per clippy ptr_arg lint
 ---

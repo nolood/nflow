@@ -3,6 +3,8 @@ mod db;
 pub mod error;
 pub mod events;
 pub mod handlers;
+#[cfg(test)]
+mod lifecycle_tests;
 pub mod platform;
 mod recovery;
 mod scheduler_loop;

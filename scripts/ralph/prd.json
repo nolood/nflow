@@ -1677,7 +1677,7 @@
         "Tests pass: cargo test -p nflow-daemon lifecycle"
       ],
       "priority": 98,
-      "passes": false,
+      "passes": true,
       "notes": ""
     },
     {
