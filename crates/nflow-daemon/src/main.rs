@@ -25,7 +25,7 @@ use std::env;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tracing::debug;
+use tracing::{debug, info};
 
 use handlers::{create_handler, HandlerState};
 use socket::SocketServerConfig;
@@ -96,7 +96,7 @@ async fn main() {
                 }
             }
 
-            // --- Socket server startup ---
+            // --- Crash recovery ---
             let socket_path = match daemon::socket_path() {
                 Ok(p) => p,
                 Err(e) => {
@@ -104,6 +104,42 @@ async fn main() {
                     std::process::exit(1);
                 }
             };
+            let pid_file = match daemon::pid_file_path() {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("Failed to resolve pid file path: {}", e);
+                    std::process::exit(1);
+                }
+            };
+
+            {
+                let conn = match db::open_connection(&db_path) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        eprintln!("Failed to open database for recovery: {}", e);
+                        std::process::exit(1);
+                    }
+                };
+                match recovery::recover_session_state(&conn, &socket_path, &pid_file) {
+                    Ok(report) => {
+                        info!(
+                            specs_reset = report.specs_reset,
+                            tasks_failed = report.tasks_failed,
+                            stories_needing_completion = report.stories_needing_completion.len(),
+                            agents_adopted = report.agents_adopted.len(),
+                            socket_removed = report.socket_removed,
+                            pid_file_removed = report.pid_file_removed,
+                            "crash recovery complete"
+                        );
+                    }
+                    Err(e) => {
+                        eprintln!("Warning: crash recovery failed: {}", e);
+                        // Non-fatal — continue startup
+                    }
+                }
+            }
+
+            // --- Socket server startup ---
 
             let state = Arc::new(HandlerState {
                 db_path: db_path.clone(),
