@@ -53,6 +53,7 @@
 - TUI sub-view pattern: App.spec_dialogue: Option<SpecDialogueState> — presence indicates sub-view active; handle_key_event checks in_dialogue() before global keys; dialogue keys handled exclusively in handle_dialogue_key()
 - E2E failure tests: set MOCK_CLAUDE_FAIL/VERIFY_FAIL/SLEEP env vars AFTER setup_execution_env() returns (not before), since setup invokes mock-claude for spec/plan generation
 - story short_ids in DB are wave-prefixed ("W1-S1"), task short_ids are bare ("T1") — use .ends_with("S1") not == "S1" when searching
+- Daemon startup sequence in main.rs foreground_mode: foreground_mode() → [migrations] → [recovery] → socket::start_server() → scheduler loop. Socket server runs as tokio::spawn'd task; scheduler loop runs on main task.
 - spawn_agent_for_task() and exec.retry handler must wait for child.wait() and record exit_code — otherwise reaper defaults to exit_code=1 (failure)
 - TUI streaming in event loop: try_read_streaming_line(10ms timeout) polls non-blocking in main loop; streaming state controls whether poll happens; input disabled during Streaming state
 - TUI dialogue message coalescing: add_claude_message() appends to last message if sender matches — avoids fragmenting contiguous text events into separate messages
@@ -2559,4 +2560,20 @@ Started: Sat Feb  7 03:49:10 PM MSK 2026
   - All daemon tests must run with `--test-threads=1` because E2E tests share env vars (HOME, PATH, NFLOW_CLAUDE_BINARY)
   - Don't use `RUSTFLAGS: -Dwarnings` when existing codebase has accumulated clippy warnings across many iterations
   - `cargo build --workspace` builds mock-claude automatically since it's a workspace member
+---
+
+## 2026-02-08 - US-101
+- Wired socket server startup in daemon main.rs foreground_mode()
+- Added imports: std::sync::Arc, handlers::{create_handler, HandlerState}, socket::SocketServerConfig
+- After foreground_mode(), resolves db_path and socket_path, creates HandlerState, creates handler via create_handler(), builds SocketServerConfig with event_bus: None, calls socket::start_server(config)
+- SocketServerHandle stored as _server_handle — dropped on scope exit which triggers shutdown via Drop impl
+- Files changed:
+  - `crates/nflow-daemon/src/main.rs` (socket server wiring)
+  - `scripts/ralph/prd.json` (US-101 passes: true)
+- **Learnings for future iterations:**
+  - E2E tests (e2e_tests.rs) are pre-existing failures — they require mock-claude binary setup via NFLOW_CLAUDE_BINARY env var and specific env, skip with `--skip e2e_tests`
+  - test_plan_generate_with_mock_claude is also pre-existing flaky (mock binary path issues)
+  - test_project_init_and_duplicate can be flaky when run in parallel with all tests (passes alone) — race condition on filesystem paths
+  - The SocketServerHandle Drop impl already sends shutdown signal, so explicit shutdown() call is optional; storing as _server_handle ensures cleanup on scope exit
+  - Socket server pattern: HandlerState{db_path} → create_handler(Arc::new(state)) → SocketServerConfig{socket_path, handler, event_bus: None} → start_server(config)
 ---

@@ -22,9 +22,13 @@ mod shutdown;
 pub mod socket;
 
 use std::env;
+use std::sync::Arc;
 use std::time::Duration;
 
 use tracing::debug;
+
+use handlers::{create_handler, HandlerState};
+use socket::SocketServerConfig;
 
 #[tokio::main]
 async fn main() {
@@ -63,6 +67,40 @@ async fn main() {
                 label,
                 std::process::id()
             );
+
+            // --- Socket server startup ---
+            let db_path = match daemon::db_path() {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("Failed to resolve db path: {}", e);
+                    std::process::exit(1);
+                }
+            };
+            let socket_path = match daemon::socket_path() {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("Failed to resolve socket path: {}", e);
+                    std::process::exit(1);
+                }
+            };
+
+            let state = Arc::new(HandlerState {
+                db_path: db_path.clone(),
+            });
+            let handler = create_handler(state);
+            let config = SocketServerConfig {
+                socket_path: socket_path.clone(),
+                handler,
+                event_bus: None,
+            };
+            let _server_handle = match socket::start_server(config) {
+                Ok(handle) => handle,
+                Err(e) => {
+                    eprintln!("Failed to start socket server: {}", e);
+                    std::process::exit(1);
+                }
+            };
+            eprintln!("socket server listening on {}", socket_path.display());
 
             // --- Scheduler loop on the main task ---
             // Ticks every 2 seconds, serialized with command handling.
