@@ -1,8 +1,15 @@
 ## Codebase Patterns
 - Integration tests needing isolated NFLOW_HOME: use create_test_home() → (TempDir guard, PathBuf) with temp .nflow/ dir (0700 perms, logs/ subdir). create_test_db(&nflow_home) → on-disk SQLite with migrations. TempDir guard auto-cleans on drop.
 - Direct DB insert helpers for command tests: insert_test_project(db_path, name) → Uuid; insert_test_spec(db_path, project_id, name, SpecStatus) → Spec. Bypass streaming commands that need Claude.
+- insert_exec_hierarchy(db_path, project_id, wave, story_status, task_status, verify_status) → (session_id, epic_id, story_id, task_id, verify_id) — creates full approved session + work item tree for exec tests
+- dependencies table: composite PK (blocker_id, blocked_id) — no id or created_at columns. INSERT only needs those two UUIDs.
 - ProjectService::create() always needs git_provider_override: Some(GitProvider::Github) when remote_url is None
 - Protocol integration tests use start_real_server(socket_path, db_path) → creates handler via create_handler(HandlerState{db_path}), starts socket server with real dispatch
+- Mock Claude binary for streaming tests: use NFLOW_CLAUDE_BINARY env var (absolute path) instead of PATH manipulation to avoid race conditions. stream_claude_decompose() checks this env var.
+- When testing plan.generate with with_codebase=false, must create the working_dir (~/.nflow/projects/{name}/specs/) or tokio::process::Command fails with NotFound (misleading — it's about cwd, not binary)
+- Streaming test helper: send_streaming_request() reads lines until done=true with a 30s timeout
+- insert_test_session() creates DecompositionSession with optional claude_session_id for plan.feedback tests
+- decompose.md template uses {specs_content} and {project_name} variables (not {specs})
 - Flock mechanism lives in nflow-cli/src/daemon_client.rs (not daemon) — CLI acquires exclusive lock on ~/.nflow/daemon.lock before spawning daemon. Use nix::fcntl::{Flock, FlockArg::LockExclusiveNonblock}.
 - graceful_shutdown() has a 60s agent grace period — test_full_lifecycle_with_agents takes ~70s. For CI, consider #[ignore] attribute or shorter timeouts.
 - platform::send_signal(pid, Signal) returns SendSignalResult {Sent, NoSuchProcess, PermissionDenied} — use instead of raw nix::sys::signal::kill()
@@ -2384,4 +2391,52 @@ Started: Sat Feb  7 03:49:10 PM MSK 2026
   - Tests using `std::env::set_var("HOME", ...)` must be consolidated into a single test to avoid parallel race conditions (process-global env)
   - insert_test_project() and insert_test_spec() are useful helpers for bypassing streaming commands that need Claude
   - Spec state transitions can be driven through nflow-core model (approve/decompose/delete) before DB insert for setting up test fixtures
+---
+
+## 2026-02-08 - US-101
+- What was implemented: Integration tests for plan commands through the socket protocol
+  - 20 tests covering full plan command flow: plan.generate, plan.show, plan.approve, plan.discard, plan.feedback
+  - plan.generate: missing project name → error, project not found → NOT_FOUND, no approved specs → error, existing draft wave → error, with mock Claude → wave created + work items in DB
+  - plan.show: tree format, dag format, specific wave, no waves → error
+  - plan.approve: latest draft, with auto_execute flag, specific wave, already approved → INVALID_STATE
+  - plan.discard: draft wave, already discarded → INVALID_STATE, no draft wave → error
+  - plan.feedback: missing message → error, no draft wave → error, on approved wave → error
+  - Full lifecycle workflow: show → approve → discard
+  - Mock Claude binary (bash script) outputs stream-json format with deterministic decomposition JSON (1 epic, 2 stories with dependency, 2 impl tasks)
+- Files changed:
+  - `crates/nflow-daemon/src/commands_plan_tests.rs` (new, ~1366 lines)
+  - `crates/nflow-daemon/src/main.rs` (added `#[cfg(test)] mod commands_plan_tests;`)
+  - `crates/nflow-daemon/src/handlers.rs` (added `NFLOW_CLAUDE_BINARY` env var support in `stream_claude_decompose()`)
+  - `prompts/decompose.md` (fixed variable names: `{specs}` → `{specs_content}`, removed `{additional_context}`)
+  - `crates/nflow-claude/src/prompt.rs` (updated test assertion for template variable change)
+- **Learnings for future iterations:**
+  - Mock Claude binary approach: create a bash script that outputs stream-json lines, use NFLOW_CLAUDE_BINARY env var (absolute path) for test injection instead of PATH manipulation (avoids race conditions)
+  - tokio::process::Command with non-existent current_dir returns ErrorKind::NotFound — misleadingly looks like binary not found. Always create the working directory before spawning.
+  - decompose.md template variables must match handler code: handler passes `specs_content` and `project_name` (not `specs` or `additional_context`)
+  - SocketServerHandle::shutdown() is synchronous (not async, no Result) — just call `handle.shutdown()` directly
+  - execution_enabled defaults to true in ProjectService::create(), not false
+---
+
+## 2026-02-08 - US-102
+- What was implemented: Integration tests for execution commands through the socket protocol
+  - 37 async integration tests exercising full command flow: client → socket server → handler → DB → response
+  - exec.run: missing param, project not found, enables execution, DB state verification
+  - exec.pause: missing param, disables execution, run-then-pause round trip
+  - exec.status: missing param, empty project, hierarchical structure (epic→story→task), wave filtering, non-existent wave
+  - exec.stop: missing params, story not found, wrong state, stop by story (no agents), stop by project, wave requires project_name
+  - exec.retry: missing task_id, task not found, task not failed, not-a-task (epic)
+  - exec.skip: missing task_id, task not found, task not failed, marks task done + cancels verify + completes story
+  - exec.continue: missing story_id, story not found, wrong state, not-a-story, cancelled-without-worktree restores to ready/pending
+  - exec.cancel: missing story_id, story not found, wrong state (in_progress), pending story, ready story, warns about dependents
+  - Combined flows: run+status, skip+cancel remaining
+  - Uses mock Claude binary pattern (not needed for error/validation tests)
+- Files changed:
+  - `crates/nflow-daemon/src/commands_exec_tests.rs` (new, ~1100 lines)
+  - `crates/nflow-daemon/src/main.rs` (added `#[cfg(test)] mod commands_exec_tests;`)
+- **Learnings for future iterations:**
+  - dependencies table schema: composite PK (blocker_id, blocked_id), no `id` or `created_at` columns — INSERT requires only those two columns
+  - insert_exec_hierarchy() helper creates full session→epic→story→task→verify hierarchy in one call — reduces boilerplate for exec tests
+  - exec.stop on non-in_progress story returns INVALID_STATE (only in_progress/ready stories can be stopped)
+  - exec.cancel only works on pending/ready stories (not in_progress — use exec.stop for that)
+  - exec.continue on cancelled story without worktree checks blockers to decide ready vs pending
 ---

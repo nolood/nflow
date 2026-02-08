@@ -1726,7 +1726,7 @@
         "Tests pass: cargo test -p nflow-daemon commands_plan"
       ],
       "priority": 101,
-      "passes": false,
+      "passes": true,
       "notes": ""
     },
     {
@@ -1743,7 +1743,7 @@
         "Tests pass: cargo test -p nflow-daemon commands_exec"
       ],
       "priority": 102,
-      "passes": false,
+      "passes": true,
       "notes": ""
     },
     {
