@@ -2311,3 +2311,13 @@ Started: Sat Feb  7 03:49:10 PM MSK 2026
   - Most US-096 acceptance criteria were already covered by existing tests (140 tests); the only gap was the partial line buffering test
   - tokio::time::timeout() is the right pattern for asserting "no event available yet" in async stream tests
 ---
+
+## 2026-02-08 - US-097
+- What was implemented: Added missing "extra variables ignored" test to prompt template rendering test suite
+- The test verifies that a HashMap with extra keys not referenced in the template still renders correctly without errors
+- Files changed:
+  - crates/nflow-claude/src/prompt.rs (added 1 new test: render_template_extra_variables_ignored)
+- **Learnings for future iterations:**
+  - Most US-097 acceptance criteria were already covered by existing 31 tests; the only gap was the "extra variables ignored" scenario
+  - render_template() naturally ignores extra vars because it iterates the template string and only looks up vars when encountering {variable} patterns — extra HashMap entries are never accessed
+---

@@ -325,6 +325,16 @@ mod tests {
     }
 
     #[test]
+    fn render_template_extra_variables_ignored() {
+        let mut vars = HashMap::new();
+        vars.insert("name", "Alice");
+        vars.insert("unused_var", "this should not matter");
+        vars.insert("another_extra", "also irrelevant");
+        let result = render_template("Hello {name}!", &vars).unwrap();
+        assert_eq!(result, "Hello Alice!");
+    }
+
+    #[test]
     fn render_template_variable_value_with_braces() {
         let mut vars = HashMap::new();
         vars.insert("code", "fn main() { println!(\"hello\"); }");
