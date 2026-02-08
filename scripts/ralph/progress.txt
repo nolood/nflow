@@ -2267,3 +2267,19 @@ Started: Sat Feb  7 03:49:10 PM MSK 2026
   - Spec module already had comprehensive happy-path and most invalid-path tests; only edge cases for the deleted terminal state were missing
   - Always check existing test coverage before writing new tests — many "test" stories have already been substantially covered by earlier implementation stories
 ---
+
+## 2026-02-08 - US-094
+- What was implemented: Added 6 explicit acceptance criteria tests for the short ID system in nflow-core
+- Files changed: crates/nflow-core/src/short_id.rs
+- Tests added:
+  - `generate_short_ids_for_3_epics_5_stories_10_tasks` — generates E1-E3, S1-S5, T1-T10
+  - `verify_tasks_get_v_suffix` — auto_generate_verify_tasks produces T1v, T2v
+  - `wave_prefix_display` — display_id produces W1-S1 and W2-T3v
+  - `resolve_wave_prefixed_to_correct_uuid` — W1-S1 resolves to correct UUID
+  - `resolve_bare_id_with_multiple_waves_is_ambiguous` — S1 across 2 waves returns InvalidParams
+  - `resolve_nonexistent_id_returns_not_found` — S99 returns NotFound
+- All 50 short_id tests pass (44 pre-existing + 6 new)
+- **Learnings for future iterations:**
+  - The short_id module already had thorough coverage from US-008; the acceptance criteria tests are mostly explicit naming of scenarios that were already covered by different test names
+  - auto_generate_verify_tasks takes a slice of impl tasks and generates paired verify tasks with "v" suffix
+---

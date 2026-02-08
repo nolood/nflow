@@ -812,6 +812,74 @@ mod tests {
         assert_eq!(ShortIdRegistry::display_id(1, "T1v").to_string(), "W1-T1v");
     }
 
+    // --- US-094 acceptance criteria tests ---
+
+    #[test]
+    fn generate_short_ids_for_3_epics_5_stories_10_tasks() {
+        let mut gen = ShortIdGenerator::new();
+
+        let epics: Vec<String> = (0..3).map(|_| gen.next_epic()).collect();
+        assert_eq!(epics, vec!["E1", "E2", "E3"]);
+
+        let stories: Vec<String> = (0..5).map(|_| gen.next_story()).collect();
+        assert_eq!(stories, vec!["S1", "S2", "S3", "S4", "S5"]);
+
+        let tasks: Vec<String> = (0..10).map(|_| gen.next_task()).collect();
+        assert_eq!(
+            tasks,
+            vec!["T1", "T2", "T3", "T4", "T5", "T6", "T7", "T8", "T9", "T10"]
+        );
+    }
+
+    #[test]
+    fn verify_tasks_get_v_suffix() {
+        let session_id = Uuid::new_v4();
+        let story_id = Uuid::new_v4();
+        let t1 = make_task(story_id, session_id, "T1", 0);
+        let t2 = make_task(story_id, session_id, "T2", 2);
+
+        let verify_tasks = auto_generate_verify_tasks(&[t1, t2]);
+        assert_eq!(verify_tasks.len(), 2);
+        assert_eq!(verify_tasks[0].short_id, "T1v");
+        assert_eq!(verify_tasks[1].short_id, "T2v");
+    }
+
+    #[test]
+    fn wave_prefix_display() {
+        let d1 = ShortIdRegistry::display_id(1, "S1");
+        assert_eq!(d1.to_string(), "W1-S1");
+
+        let d2 = ShortIdRegistry::display_id(2, "T3v");
+        assert_eq!(d2.to_string(), "W2-T3v");
+    }
+
+    #[test]
+    fn resolve_wave_prefixed_to_correct_uuid() {
+        let mut reg = ShortIdRegistry::new();
+        let uuid = Uuid::new_v4();
+        reg.register(1, "S1", uuid);
+
+        assert_eq!(reg.resolve("W1-S1", None).unwrap(), uuid);
+    }
+
+    #[test]
+    fn resolve_bare_id_with_multiple_waves_is_ambiguous() {
+        let mut reg = ShortIdRegistry::new();
+        reg.register(1, "S1", Uuid::new_v4());
+        reg.register(2, "S1", Uuid::new_v4());
+
+        let err = reg.resolve("S1", None).unwrap_err();
+        assert!(matches!(err, NflowError::InvalidParams(_)));
+        assert!(err.to_string().contains("ambiguous"));
+    }
+
+    #[test]
+    fn resolve_nonexistent_id_returns_not_found() {
+        let reg = ShortIdRegistry::new();
+        let err = reg.resolve("S99", None).unwrap_err();
+        assert!(matches!(err, NflowError::NotFound(_)));
+    }
+
     #[test]
     fn multi_wave_resolution() {
         let session_id = Uuid::new_v4();
