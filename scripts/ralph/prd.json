@@ -1626,7 +1626,7 @@
         "Tests pass: cargo test -p nflow-core config"
       ],
       "priority": 95,
-      "passes": false,
+      "passes": true,
       "notes": ""
     },
     {

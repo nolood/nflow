@@ -2283,3 +2283,20 @@ Started: Sat Feb  7 03:49:10 PM MSK 2026
   - The short_id module already had thorough coverage from US-008; the acceptance criteria tests are mostly explicit naming of scenarios that were already covered by different test names
   - auto_generate_verify_tasks takes a slice of impl tasks and generates paired verify tasks with "v" suffix
 ---
+
+## 2026-02-08 - US-095
+- What was implemented: Unit tests — config merging in nflow-core
+  - `resolve_defaults_only_returns_all_default_values` — resolve() with all-empty PartialConfigs returns Config::default()
+  - `resolve_global_overrides_one_key_others_default` — global sets max_parallel=10, all other fields remain default
+  - `resolve_project_overrides_global_value` — project overrides global's max_parallel, global's log_level preserved
+  - `resolve_env_overrides_all_layers` — env vars override both global and project values for max_parallel and log_level
+  - `validate_rejects_max_parallel_zero` — validation rejects max_parallel=0 with ValidationError
+  - `validate_rejects_invalid_git_provider` — validation rejects "bitbucket" with ValidationError
+- 6 new tests added (28 total config tests, 270 total nflow-core tests)
+- Files changed:
+  - crates/nflow-core/src/config.rs (added 6 new US-095 tests)
+- **Learnings for future iterations:**
+  - The config module already had extensive test coverage; US-095 AC tests are explicit naming of scenarios that were already partially covered under different test names
+  - resolve() is the primary layered merge function: defaults → global → project → env
+  - Use Config { field: value, ..Config::default() } struct syntax for creating test configs with one override
+---

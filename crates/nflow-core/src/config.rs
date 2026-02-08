@@ -402,4 +402,96 @@ mod tests {
         let config = merge(Config::default(), overlay);
         assert!(validate(&config).is_err());
     }
+
+    // --- US-095: config merging unit tests ---
+
+    #[test]
+    fn resolve_defaults_only_returns_all_default_values() {
+        let config = resolve(
+            PartialConfig::default(),
+            PartialConfig::default(),
+            PartialConfig::default(),
+        );
+        let defaults = Config::default();
+        assert_eq!(config, defaults);
+    }
+
+    #[test]
+    fn resolve_global_overrides_one_key_others_default() {
+        let global = PartialConfig {
+            max_parallel: Some(10),
+            ..Default::default()
+        };
+        let config = resolve(global, PartialConfig::default(), PartialConfig::default());
+        assert_eq!(config.max_parallel, 10);
+        // All other fields remain default
+        let defaults = Config::default();
+        assert_eq!(config.git_provider, defaults.git_provider);
+        assert_eq!(config.base_branch, defaults.base_branch);
+        assert_eq!(config.cleanup_worktrees, defaults.cleanup_worktrees);
+        assert_eq!(config.max_turns_per_task, defaults.max_turns_per_task);
+        assert_eq!(config.auto_execute, defaults.auto_execute);
+        assert_eq!(config.max_time_per_task, defaults.max_time_per_task);
+        assert_eq!(config.log_level, defaults.log_level);
+        assert_eq!(config.branch_template, defaults.branch_template);
+        assert_eq!(config.worktree_dir, defaults.worktree_dir);
+    }
+
+    #[test]
+    fn resolve_project_overrides_global_value() {
+        let global = PartialConfig {
+            max_parallel: Some(10),
+            log_level: Some("debug".into()),
+            ..Default::default()
+        };
+        let project = PartialConfig {
+            max_parallel: Some(4),
+            ..Default::default()
+        };
+        let config = resolve(global, project, PartialConfig::default());
+        // project overrides global for max_parallel
+        assert_eq!(config.max_parallel, 4);
+        // global still applies for log_level (project didn't set it)
+        assert_eq!(config.log_level, "debug");
+    }
+
+    #[test]
+    fn resolve_env_overrides_all_layers() {
+        let global = PartialConfig {
+            max_parallel: Some(10),
+            log_level: Some("debug".into()),
+            ..Default::default()
+        };
+        let project = PartialConfig {
+            max_parallel: Some(4),
+            log_level: Some("warn".into()),
+            ..Default::default()
+        };
+        let env =
+            partial_config_from_env(&[("NFLOW_MAX_PARALLEL", "1"), ("NFLOW_LOG_LEVEL", "error")]);
+        let config = resolve(global, project, env);
+        // env overrides both global and project
+        assert_eq!(config.max_parallel, 1);
+        assert_eq!(config.log_level, "error");
+    }
+
+    #[test]
+    fn validate_rejects_max_parallel_zero() {
+        let config = Config {
+            max_parallel: 0,
+            ..Config::default()
+        };
+        let err = validate(&config).unwrap_err();
+        assert!(matches!(err, NflowError::ValidationError(_)));
+    }
+
+    #[test]
+    fn validate_rejects_invalid_git_provider() {
+        let config = Config {
+            git_provider: "bitbucket".into(),
+            ..Config::default()
+        };
+        let err = validate(&config).unwrap_err();
+        assert!(matches!(err, NflowError::ValidationError(_)));
+    }
 }
