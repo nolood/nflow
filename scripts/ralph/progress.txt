@@ -2440,3 +2440,28 @@ Started: Sat Feb  7 03:49:10 PM MSK 2026
   - exec.cancel only works on pending/ready stories (not in_progress — use exec.stop for that)
   - exec.continue on cancelled story without worktree checks blockers to decide ready vs pending
 ---
+
+## 2026-02-08 - US-103
+- What was implemented: Mock Claude binary for E2E tests as a standalone Rust crate
+  - New `crates/mock-claude/` crate with `mock-claude` binary
+  - Parses all CLI args that ClaudeRunner::spawn() passes (-p, --append-system-prompt-file, --resume, --cwd, --max-turns, --allowedTools, --output-format, --verbose, --include-partial-messages)
+  - Mode detection from prompt content and system prompt file name/content:
+    - Spec mode: outputs AskUserQuestion events, writes spec file on --resume
+    - Decompose mode: returns valid JSON DAG wrapped in markdown code fence
+    - Impl task mode: creates git commit with correct [short_id] message format
+    - Verify task mode: outputs "VERIFICATION PASSED" in result
+  - Supports --resume flag for session chaining (spec Q&A, decompose feedback)
+  - Configurable failure simulation via env vars: MOCK_CLAUDE_FAIL, MOCK_CLAUDE_NO_COMMIT, MOCK_CLAUDE_WRONG_MESSAGE, MOCK_CLAUDE_EXIT_CODE, MOCK_CLAUDE_VERIFY_FAIL, MOCK_CLAUDE_SPEC_COMPLETE, MOCK_CLAUDE_SESSION_ID, MOCK_CLAUDE_DECOMPOSE_JSON
+  - All stream-json output events match the format expected by nflow-claude's StreamParser
+  - 12 unit tests covering arg parsing, mode detection, short ID extraction, JSON validity
+- Files changed:
+  - `Cargo.toml` (added mock-claude to workspace members)
+  - `crates/mock-claude/Cargo.toml` (new crate)
+  - `crates/mock-claude/src/main.rs` (full mock binary implementation with tests)
+- **Learnings for future iterations:**
+  - Mock Claude binary detects mode from both prompt text and system_prompt_file name — file name is more reliable (spec_session.md, decompose.md, task_execution.md, verify_task.md)
+  - stream-json Result event must include both "result" (text) and "session_id" fields for the StreamParser to track sessions
+  - Decompose output must be wrapped in ```json ... ``` code fence — the handler extracts JSON from code fences
+  - extract_commit_info() looks for `[branch hash] message` pattern in tool results — mock impl task must emit a ToolResult with git commit output format
+  - is_valid_short_id validates W{n}-{prefix}{n}[v] pattern — wave number must be non-empty digits (vacuous truth on empty iterators means explicit !is_empty() check needed)
+---

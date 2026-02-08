@@ -6,6 +6,7 @@ members = [
     "crates/nflow-daemon",
     "crates/nflow-cli",
     "crates/nflow-tui",
+    "crates/mock-claude",
 ]
 resolver = "2"
 
