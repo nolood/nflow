@@ -1,5 +1,3 @@
-use std::collections::HashMap;
-
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, Row};
 use uuid::Uuid;
@@ -295,29 +293,6 @@ pub fn delete_work_items_by_session(conn: &Connection, session_id: &Uuid) -> Res
         params![session_id.to_string()],
     )?;
     Ok(())
-}
-
-pub fn count_tasks_by_status(
-    conn: &Connection,
-    story_id: &Uuid,
-) -> Result<HashMap<WorkItemStatus, u32>> {
-    let mut stmt = conn.prepare(
-        "SELECT status, COUNT(*) as cnt
-         FROM work_items
-         WHERE parent_id = ?1 AND item_type = 'task'
-         GROUP BY status",
-    )?;
-    let rows = stmt.query_map(params![story_id.to_string()], |row| {
-        let status_str: String = row.get("status")?;
-        let count: u32 = row.get("cnt")?;
-        Ok((status_from_str(&status_str), count))
-    })?;
-    let mut map = HashMap::new();
-    for row in rows {
-        let (status, count) = row?;
-        map.insert(status, count);
-    }
-    Ok(map)
 }
 
 /// Count stories for a project (across all decomposition sessions).
@@ -941,72 +916,6 @@ mod tests {
         assert!(items1.is_empty());
         let items2 = list_work_items_by_session(&conn, &sid2).unwrap();
         assert_eq!(items2.len(), 1);
-    }
-
-    // --- count_tasks_by_status ---
-
-    #[test]
-    fn test_count_tasks_by_status() {
-        let conn = test_conn();
-        let pid = make_project(&conn);
-        let sid = make_session(&conn, pid);
-        let epic = insert_epic(&conn, sid);
-        let story = make_story(epic.id, sid, "S1", 0);
-        insert_work_item(&conn, &story).unwrap();
-
-        let t1 = make_task(story.id, sid, "T1", 0);
-        let t2 = make_task(story.id, sid, "T2", 2);
-        let t3 = make_task(story.id, sid, "T3", 4);
-        insert_work_item(&conn, &t1).unwrap();
-        insert_work_item(&conn, &t2).unwrap();
-        insert_work_item(&conn, &t3).unwrap();
-
-        // Update some statuses
-        update_work_item_status(&conn, &t1.id, WorkItemStatus::Done).unwrap();
-        update_work_item_status(&conn, &t2.id, WorkItemStatus::InProgress).unwrap();
-        // t3 stays pending
-
-        let counts = count_tasks_by_status(&conn, &story.id).unwrap();
-        assert_eq!(counts.get(&WorkItemStatus::Done), Some(&1));
-        assert_eq!(counts.get(&WorkItemStatus::InProgress), Some(&1));
-        assert_eq!(counts.get(&WorkItemStatus::Pending), Some(&1));
-        assert!(counts.get(&WorkItemStatus::Failed).is_none());
-    }
-
-    #[test]
-    fn test_count_tasks_by_status_empty() {
-        let conn = test_conn();
-        let pid = make_project(&conn);
-        let sid = make_session(&conn, pid);
-        let epic = insert_epic(&conn, sid);
-        let story = make_story(epic.id, sid, "S1", 0);
-        insert_work_item(&conn, &story).unwrap();
-
-        let counts = count_tasks_by_status(&conn, &story.id).unwrap();
-        assert!(counts.is_empty());
-    }
-
-    #[test]
-    fn test_count_tasks_by_status_excludes_non_tasks() {
-        let conn = test_conn();
-        let pid = make_project(&conn);
-        let sid = make_session(&conn, pid);
-        let epic = insert_epic(&conn, sid);
-        let story = make_story(epic.id, sid, "S1", 0);
-        insert_work_item(&conn, &story).unwrap();
-
-        // Add a child story under the story (unusual but tests the filter)
-        let child_story = make_story(story.id, sid, "S1.1", 0);
-        insert_work_item(&conn, &child_story).unwrap();
-
-        // Add a task
-        let task = make_task(story.id, sid, "T1", 1);
-        insert_work_item(&conn, &task).unwrap();
-
-        let counts = count_tasks_by_status(&conn, &story.id).unwrap();
-        // Only the task should be counted
-        assert_eq!(counts.get(&WorkItemStatus::Pending), Some(&1));
-        assert_eq!(counts.len(), 1);
     }
 
     // --- verify task kind roundtrip ---

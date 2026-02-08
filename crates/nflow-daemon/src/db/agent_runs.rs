@@ -204,25 +204,6 @@ pub fn find_running_agent_runs_for_story(
     Ok(runs)
 }
 
-/// Find running agent runs for tasks within a specific wave (decomposition session).
-pub fn find_running_agent_runs_by_session(
-    conn: &Connection,
-    session_id: &Uuid,
-) -> Result<Vec<AgentRun>> {
-    let mut stmt = conn.prepare(
-        "SELECT ar.id, ar.work_item_id, ar.pid, ar.session_id, ar.pid_start_time, ar.status, ar.exit_code, ar.log_path, ar.error_message, ar.started_at, ar.finished_at
-         FROM agent_runs ar
-         JOIN work_items w ON ar.work_item_id = w.id
-         WHERE ar.status = 'running' AND w.decomposition_session_id = ?1",
-    )?;
-    let rows = stmt.query_map(params![session_id.to_string()], row_to_agent_run)?;
-    let mut runs = Vec::new();
-    for row in rows {
-        runs.push(row?);
-    }
-    Ok(runs)
-}
-
 /// Update the Claude session_id on an agent run (stored after parsing stream output).
 pub fn update_agent_run_session_id(conn: &Connection, id: &Uuid, session_id: &str) -> Result<()> {
     conn.execute(

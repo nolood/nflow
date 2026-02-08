@@ -217,10 +217,12 @@ async fn main() {
                 Ok(conn) => {
                     let report = shutdown::graceful_shutdown(&conn, &socket_path, &pid_file);
                     eprintln!(
-                        "shutdown complete: {} agents finished naturally, {} sigtermed, {} sigkilled",
+                        "shutdown complete: {} agents finished naturally, {} sigtermed, {} sigkilled, socket_removed={}, pid_file_removed={}",
                         report.agents_finished_naturally,
                         report.agents_sigtermed,
-                        report.agents_sigkilled
+                        report.agents_sigkilled,
+                        report.socket_removed,
+                        report.pid_file_removed,
                     );
                 }
                 Err(e) => {

@@ -5210,7 +5210,7 @@ fn handle_worktree_clean(req: Request, state: &HandlerState) -> Response {
 /// Receives: { project, older_than?, all?, dry_run? }
 /// older_than: duration string like "7d", "24h", "30m"
 /// Returns: { files: [{ path, size }], count, total_size }
-fn handle_cleanup_logs(req: Request, state: &HandlerState) -> Response {
+fn handle_cleanup_logs(req: Request, _state: &HandlerState) -> Response {
     let id = req.id.clone();
 
     let project_name = match req.params.get("project").and_then(|v| v.as_str()) {

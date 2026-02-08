@@ -108,26 +108,6 @@ pub fn list_specs_by_project(conn: &Connection, project_id: &Uuid) -> Result<Vec
     Ok(specs)
 }
 
-pub fn list_specs_by_status(
-    conn: &Connection,
-    project_id: &Uuid,
-    status: SpecStatus,
-) -> Result<Vec<Spec>> {
-    let mut stmt = conn.prepare(
-        "SELECT id, project_id, name, file_path, status, session_active, claude_session_id, created_at, updated_at
-         FROM specs WHERE project_id = ?1 AND status = ?2 ORDER BY name",
-    )?;
-    let rows = stmt.query_map(
-        params![project_id.to_string(), spec_status_to_str(status)],
-        row_to_spec,
-    )?;
-    let mut specs = Vec::new();
-    for row in rows {
-        specs.push(row?);
-    }
-    Ok(specs)
-}
-
 pub fn update_spec_status(conn: &Connection, id: &Uuid, status: SpecStatus) -> Result<()> {
     conn.execute(
         "UPDATE specs SET status = ?1, updated_at = ?2 WHERE id = ?3",
@@ -202,14 +182,6 @@ pub fn has_active_spec_session(conn: &Connection, project_id: &Uuid) -> Result<b
         |row| row.get(0),
     )?;
     Ok(active)
-}
-
-pub fn reset_active_sessions(conn: &Connection, project_id: &Uuid) -> Result<u64> {
-    let changed = conn.execute(
-        "UPDATE specs SET session_active = 0, updated_at = ?1 WHERE project_id = ?2 AND session_active = 1",
-        params![Utc::now().to_rfc3339(), project_id.to_string()],
-    )?;
-    Ok(changed as u64)
 }
 
 #[cfg(test)]
@@ -296,35 +268,6 @@ mod tests {
         let pid = make_project(&conn);
         let specs = list_specs_by_project(&conn, &pid).unwrap();
         assert!(specs.is_empty());
-    }
-
-    #[test]
-    fn test_list_specs_by_status() {
-        let conn = test_conn();
-        let pid = make_project(&conn);
-
-        let draft = make_spec(pid, "draft-spec");
-        insert_spec(&conn, &draft).unwrap();
-
-        let mut approved = make_spec(pid, "approved-spec");
-        approved.status = SpecStatus::Approved;
-        insert_spec(&conn, &approved).unwrap();
-
-        let mut decomposed = make_spec(pid, "decomposed-spec");
-        decomposed.status = SpecStatus::Decomposed;
-        insert_spec(&conn, &decomposed).unwrap();
-
-        let drafts = list_specs_by_status(&conn, &pid, SpecStatus::Draft).unwrap();
-        assert_eq!(drafts.len(), 1);
-        assert_eq!(drafts[0].name, "draft-spec");
-
-        let approveds = list_specs_by_status(&conn, &pid, SpecStatus::Approved).unwrap();
-        assert_eq!(approveds.len(), 1);
-        assert_eq!(approveds[0].name, "approved-spec");
-
-        let decomposeds = list_specs_by_status(&conn, &pid, SpecStatus::Decomposed).unwrap();
-        assert_eq!(decomposeds.len(), 1);
-        assert_eq!(decomposeds[0].name, "decomposed-spec");
     }
 
     #[test]
@@ -480,80 +423,6 @@ mod tests {
         let unassigned = find_unassigned_approved_specs(&conn, &pid).unwrap();
         assert_eq!(unassigned.len(), 1);
         assert_eq!(unassigned[0].name, "free-spec");
-    }
-
-    #[test]
-    fn test_reset_active_sessions() {
-        let conn = test_conn();
-        let pid = make_project(&conn);
-
-        let mut spec1 = make_spec(pid, "active-1");
-        spec1.session_active = true;
-        insert_spec(&conn, &spec1).unwrap();
-
-        let mut spec2 = make_spec(pid, "active-2");
-        spec2.session_active = true;
-        insert_spec(&conn, &spec2).unwrap();
-
-        let spec3 = make_spec(pid, "inactive");
-        insert_spec(&conn, &spec3).unwrap();
-
-        let count = reset_active_sessions(&conn, &pid).unwrap();
-        assert_eq!(count, 2);
-
-        // All should now be inactive
-        let specs = list_specs_by_project(&conn, &pid).unwrap();
-        for spec in &specs {
-            assert!(!spec.session_active);
-        }
-    }
-
-    #[test]
-    fn test_reset_active_sessions_none_active() {
-        let conn = test_conn();
-        let pid = make_project(&conn);
-
-        let spec = make_spec(pid, "inactive");
-        insert_spec(&conn, &spec).unwrap();
-
-        let count = reset_active_sessions(&conn, &pid).unwrap();
-        assert_eq!(count, 0);
-    }
-
-    #[test]
-    fn test_reset_active_sessions_scoped_to_project() {
-        let conn = test_conn();
-        let pid1 = make_project(&conn);
-
-        // Create a second project
-        let now = Utc::now();
-        let project2 = Project {
-            id: Uuid::new_v4(),
-            name: "other-project".to_string(),
-            path: "/home/user/other".to_string(),
-            base_branch: "main".to_string(),
-            git_provider: GitProvider::Github,
-            execution_enabled: true,
-            created_at: now,
-            updated_at: now,
-        };
-        insert_project(&conn, &project2).unwrap();
-
-        let mut spec1 = make_spec(pid1, "p1-active");
-        spec1.session_active = true;
-        insert_spec(&conn, &spec1).unwrap();
-
-        let mut spec2 = make_spec(project2.id, "p2-active");
-        spec2.session_active = true;
-        insert_spec(&conn, &spec2).unwrap();
-
-        // Reset only project 1
-        let count = reset_active_sessions(&conn, &pid1).unwrap();
-        assert_eq!(count, 1);
-
-        // Project 2's spec should still be active
-        let p2_specs = list_specs_by_project(&conn, &project2.id).unwrap();
-        assert!(p2_specs[0].session_active);
     }
 
     #[test]

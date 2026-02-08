@@ -10,16 +10,11 @@ use crate::db::agent_runs::{
 };
 use crate::db::work_items::update_work_item_status;
 use crate::db::Result;
-use crate::platform::{self, ProcessState};
+use crate::platform::ProcessState;
 use nflow_core::work_item::WorkItemStatus;
 
 // Re-export platform functions for backwards compatibility with existing consumers.
-pub use crate::platform::{get_pid_start_time, is_process_alive, verify_process};
-
-/// Alias for backwards compatibility — prefer `get_pid_start_time`.
-pub fn read_process_start_time(pid: u32) -> Option<i64> {
-    platform::get_pid_start_time(pid)
-}
+pub use crate::platform::{is_process_alive, verify_process};
 
 /// Result of checking a single stale agent run.
 #[derive(Debug, PartialEq, Eq)]
