@@ -1578,7 +1578,7 @@
         "Tests pass: cargo test -p nflow-core work_item"
       ],
       "priority": 92,
-      "passes": false,
+      "passes": true,
       "notes": ""
     },
     {

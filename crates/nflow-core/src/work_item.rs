@@ -1385,6 +1385,41 @@ mod tests {
         assert_eq!(verify_tasks[0].status, WorkItemStatus::Done);
     }
 
+    // --- Additional invalid transitions: cancelled -> done ---
+
+    #[test]
+    fn story_complete_from_cancelled_fails() {
+        let session_id = Uuid::new_v4();
+        let epic = make_epic(session_id);
+        let mut story = make_story(epic.id, session_id);
+
+        story.story_cancel().unwrap();
+        let err = story.story_complete().unwrap_err();
+        assert!(matches!(err, NflowError::InvalidTransition { .. }));
+    }
+
+    #[test]
+    fn task_complete_from_cancelled_fails() {
+        let session_id = Uuid::new_v4();
+        let story_id = Uuid::new_v4();
+        let mut task = make_impl_task(story_id, session_id, "T1", 0);
+
+        task.task_cancel().unwrap();
+        let err = task.task_complete(None).unwrap_err();
+        assert!(matches!(err, NflowError::InvalidTransition { .. }));
+    }
+
+    #[test]
+    fn task_skip_from_cancelled_fails() {
+        let session_id = Uuid::new_v4();
+        let story_id = Uuid::new_v4();
+        let mut task = make_impl_task(story_id, session_id, "T1", 0);
+
+        task.task_cancel().unwrap();
+        let err = task.task_skip().unwrap_err();
+        assert!(matches!(err, NflowError::InvalidTransition { .. }));
+    }
+
     // --- Task timestamp updates ---
 
     #[test]

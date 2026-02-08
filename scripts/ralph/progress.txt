@@ -2240,3 +2240,17 @@ Started: Sat Feb  7 03:49:10 PM MSK 2026
   - For deterministic wave ordering tests, use fixed UUIDs via Uuid::parse_str with known lexicographic ordering
   - propagate_epic_status() in work_item module handles materialization; scheduler just detects diffs
 ---
+
+## 2026-02-08 - US-092
+- What was implemented: Added missing unit tests for cancelled->done invalid transitions in work item state machines
+- Files changed: crates/nflow-core/src/work_item.rs
+- Tests added:
+  - `story_complete_from_cancelled_fails` — cancelled story cannot transition to done
+  - `task_complete_from_cancelled_fails` — cancelled task cannot transition to done via complete
+  - `task_skip_from_cancelled_fails` — cancelled task cannot transition to done via skip
+- All 70 work_item tests pass (67 pre-existing + 3 new)
+- **Learnings for future iterations:**
+  - Most work_item state machine tests were already implemented in earlier stories (US-004, US-005)
+  - The specific gap was cancelled->done invalid transition tests required by AC3
+  - Work item module already has comprehensive coverage; future test stories should check existing tests first
+---
