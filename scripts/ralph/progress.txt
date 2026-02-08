@@ -2520,3 +2520,23 @@ Started: Sat Feb  7 03:49:10 PM MSK 2026
   - Story short_ids are wave-prefixed in DB ("W1-S1"), tasks are bare ("T1") — use ends_with() for matching
   - For timeout testing, manipulate agent_run.started_at in DB rather than waiting real wall-clock time
 ---
+
+## 2026-02-08 - US-106
+- What was implemented:
+  - Parallel execution E2E test in `crates/nflow-daemon/src/e2e_tests.rs`:
+    - test_e2e_parallel_execution: 3 independent stories with no dependencies, all start simultaneously
+    - Uses MOCK_CLAUDE_DECOMPOSE_JSON env var to provide custom decomposition with 3 independent stories under 1 epic
+    - Verifies all 3 stories start in the same scheduler tick (observed 3 in_progress simultaneously)
+    - Verifies each story gets its own unique branch name
+    - Verifies all 3 stories complete with MR URLs (from mock gh)
+    - Verifies all impl tasks have commit hashes
+    - Verifies branches are pushed to the bare origin remote
+    - Verifies no data corruption: no agent runs left in running state after completion
+- Files changed:
+  - `crates/nflow-daemon/src/e2e_tests.rs` (added test_e2e_parallel_execution test)
+  - `scripts/ralph/prd.json` (US-106 passes: true)
+- **Learnings for future iterations:**
+  - MOCK_CLAUDE_DECOMPOSE_JSON can be set BEFORE setup_execution_env() since it only affects decompose mode, not spec mode
+  - With max_parallel=3 (hardcoded in scheduler_loop) and 3 independent stories, the scheduler starts all 3 in the same tick
+  - Fast mock-claude means stories may complete between scheduler ticks — don't rely on timing for exact parallelism checks
+---

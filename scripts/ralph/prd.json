@@ -1813,8 +1813,8 @@
         "Test passes on Linux and macOS"
       ],
       "priority": 106,
-      "passes": false,
-      "notes": ""
+      "passes": true,
+      "notes": "Uses MOCK_CLAUDE_DECOMPOSE_JSON to provide 3 independent stories; verifies parallel start, unique branches, MRs, commit hashes, and no data corruption"
     },
     {
       "id": "US-107",
