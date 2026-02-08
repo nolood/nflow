@@ -3392,10 +3392,12 @@ fn handle_exec_retry(req: Request, state: &HandlerState) -> Response {
         return Response::error(id, &format!("database error: {}", e));
     }
 
-    // Spawn background task to pipe stdout to log file
+    // Spawn background task to pipe stdout to log file and wait for child exit
     let mut stdout = process.stdout;
     let _stderr = process.stderr;
-    let _child = process.child;
+    let mut child = process.child;
+    let retry_agent_run_id = agent_run.id;
+    let retry_db_path = state.db_path.clone();
 
     tokio::spawn(async move {
         let log_file = match tokio::fs::OpenOptions::new()
@@ -3414,6 +3416,18 @@ fn handle_exec_retry(req: Request, state: &HandlerState) -> Response {
             let _ = writer.write_all(line.as_bytes()).await;
             let _ = writer.write_all(b"\n").await;
             let _ = writer.flush().await;
+        }
+
+        // Wait for child to exit and capture exit code
+        if let Ok(status) = child.wait().await {
+            let exit_code = status.code();
+            if let Ok(conn) = db::open_connection(&retry_db_path) {
+                let _ = db::agent_runs::update_agent_run_exit_code(
+                    &conn,
+                    &retry_agent_run_id,
+                    exit_code,
+                );
+            }
         }
     });
 
@@ -4707,10 +4721,12 @@ fn spawn_agent_for_task(
         return Err(format!("database error: {}", e));
     }
 
-    // Spawn background task to pipe stdout to log file
+    // Spawn background task to pipe stdout to log file and wait for child exit
     let mut stdout = process.stdout;
     let _stderr = process.stderr;
-    let _child = process.child;
+    let mut child = process.child;
+    let agent_run_id = agent_run.id;
+    let db_path = conn.path().map(|p| PathBuf::from(p));
 
     tokio::spawn(async move {
         let log_file = match tokio::fs::OpenOptions::new()
@@ -4729,6 +4745,17 @@ fn spawn_agent_for_task(
             let _ = writer.write_all(line.as_bytes()).await;
             let _ = writer.write_all(b"\n").await;
             let _ = writer.flush().await;
+        }
+
+        // Wait for child to exit and capture exit code
+        if let Ok(status) = child.wait().await {
+            let exit_code = status.code();
+            if let Some(ref db_path) = db_path {
+                if let Ok(conn) = db::open_connection(db_path) {
+                    let _ =
+                        db::agent_runs::update_agent_run_exit_code(&conn, &agent_run_id, exit_code);
+                }
+            }
         }
     });
 

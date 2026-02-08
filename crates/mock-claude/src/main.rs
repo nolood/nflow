@@ -25,6 +25,7 @@
 //! - `MOCK_CLAUDE_SPEC_COMPLETE`: If set to "1", write the spec file (completing the session)
 //! - `MOCK_CLAUDE_SESSION_ID`: Override session ID (default: auto-generated)
 //! - `MOCK_CLAUDE_DECOMPOSE_JSON`: Override decomposition JSON output
+//! - `MOCK_CLAUDE_SLEEP`: Sleep for N seconds before producing output (for timeout testing)
 
 use std::env;
 use std::fs;
@@ -45,6 +46,17 @@ fn main() {
             .and_then(|v| v.parse().ok())
             .unwrap_or(1);
         process::exit(code);
+    }
+
+    // Sleep if requested (for timeout testing)
+    if let Ok(secs) = env::var("MOCK_CLAUDE_SLEEP") {
+        if let Ok(duration) = secs.parse::<u64>() {
+            emit_text_delta(&format!(
+                "Sleeping for {}s (mock timeout test)...",
+                duration
+            ));
+            std::thread::sleep(std::time::Duration::from_secs(duration));
+        }
     }
 
     let session_id = env::var("MOCK_CLAUDE_SESSION_ID")
