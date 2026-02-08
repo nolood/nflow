@@ -177,8 +177,8 @@
         "cargo test passes"
       ],
       "priority": 10,
-      "passes": false,
-      "notes": ""
+      "passes": true,
+      "notes": "3 binary E2E tests: socket lifecycle (spawn→handshake→init→list→SIGTERM→cleanup), database initialization, multiple concurrent clients. All pass within 6s. Uses std::os::unix::net::UnixStream (sync) for simplicity."
     },
     {
       "id": "US-111",

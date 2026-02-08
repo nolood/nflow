@@ -1,4 +1,6 @@
 #[cfg(test)]
+mod binary_e2e_tests;
+#[cfg(test)]
 mod commands_exec_tests;
 #[cfg(test)]
 mod commands_plan_tests;
