@@ -4,7 +4,7 @@ You are decomposing a software specification into an implementation plan.
 
 ## Specifications
 
-{specs}
+{specs_content}
 
 ## Instructions
 
@@ -12,5 +12,3 @@ You are decomposing a software specification into an implementation plan.
 - Each story should be independently implementable
 - Define dependencies between stories where needed
 - Output the plan as a JSON structure
-
-{additional_context}

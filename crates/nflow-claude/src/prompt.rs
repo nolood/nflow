@@ -134,7 +134,7 @@ mod tests {
     fn embedded_decompose_template_exists() {
         assert!(!EMBEDDED_DECOMPOSE.is_empty());
         assert!(EMBEDDED_DECOMPOSE.contains("{project_name}"));
-        assert!(EMBEDDED_DECOMPOSE.contains("{specs}"));
+        assert!(EMBEDDED_DECOMPOSE.contains("{specs_content}"));
     }
 
     #[test]

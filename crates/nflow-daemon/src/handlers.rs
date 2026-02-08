@@ -1605,8 +1605,11 @@ async fn stream_claude_decompose(
     spec_ids: Vec<uuid::Uuid>,
     db_path: &Path,
 ) {
-    // Spawn Claude process
-    let runner = nflow_claude::runner::ClaudeRunner::default();
+    // Spawn Claude process (supports NFLOW_CLAUDE_BINARY env override for testing)
+    let runner = match std::env::var("NFLOW_CLAUDE_BINARY") {
+        Ok(bin) => nflow_claude::runner::ClaudeRunner::with_binary(bin),
+        Err(_) => nflow_claude::runner::ClaudeRunner::default(),
+    };
     let process = match runner.spawn(&run_config) {
         Ok(p) => p,
         Err(e) => {
