@@ -92,13 +92,13 @@ pub fn build_mr_context(
 
 /// Build context variables for the spec_session.md template.
 ///
-/// Variables: project_name, project_path, additional_context.
+/// Variables: project_name, project_path, spec_file_path, additional_context.
 pub fn build_spec_context(spec: &Spec, project: &Project) -> HashMap<String, String> {
     let mut vars = HashMap::new();
     vars.insert("project_name".to_string(), project.name.clone());
     vars.insert("project_path".to_string(), project.path.clone());
+    vars.insert("spec_file_path".to_string(), spec.file_path.clone());
     vars.insert("additional_context".to_string(), String::new());
-    let _ = spec; // spec available for future extensions
     vars
 }
 
@@ -396,6 +396,7 @@ mod tests {
 
         assert_eq!(ctx["project_name"], "test-project");
         assert_eq!(ctx["project_path"], "/home/user/test-project");
+        assert_eq!(ctx["spec_file_path"], "specs/auth.md");
         assert_eq!(ctx["additional_context"], "");
     }
 

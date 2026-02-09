@@ -21,8 +21,8 @@ pub fn poll_event(timeout: Duration) -> std::io::Result<Option<Event>> {
 pub enum ViewAction {
     /// No action needed.
     None,
-    /// Request to create a new spec.
-    SpecNew,
+    /// Request to create a new spec (with the user-provided name).
+    SpecNew(String),
     /// Request to approve the selected spec.
     SpecApprove,
     /// Request to delete the selected spec.
@@ -103,6 +103,12 @@ pub fn handle_key_event(app: &mut App, key: KeyEvent) -> (bool, ViewAction) {
     // If in dialogue mode, handle dialogue keys exclusively
     if app.in_dialogue() {
         let action = handle_dialogue_key(app, key);
+        return (true, action);
+    }
+
+    // If in spec name input popup, handle exclusively
+    if app.spec_name_input.is_some() {
+        let action = handle_spec_name_input_key(app, key);
         return (true, action);
     }
 
@@ -772,6 +778,39 @@ fn handle_logs_detail_key(app: &mut App, key: KeyEvent) -> ViewAction {
     }
 }
 
+/// Handle key events in the spec name input popup.
+fn handle_spec_name_input_key(app: &mut App, key: KeyEvent) -> ViewAction {
+    let input = match &mut app.spec_name_input {
+        Some(s) => s,
+        None => return ViewAction::None,
+    };
+
+    match key.code {
+        KeyCode::Esc => {
+            app.close_spec_name_input();
+            ViewAction::None
+        }
+        KeyCode::Enter => {
+            let name = input.input.trim().to_string();
+            app.close_spec_name_input();
+            if name.is_empty() {
+                ViewAction::None
+            } else {
+                ViewAction::SpecNew(name)
+            }
+        }
+        KeyCode::Backspace => {
+            input.input.pop();
+            ViewAction::None
+        }
+        KeyCode::Char(c) => {
+            input.input.push(c);
+            ViewAction::None
+        }
+        _ => ViewAction::None,
+    }
+}
+
 /// Handle key events in the Specs list view.
 fn handle_specs_key(app: &mut App, key: KeyEvent) -> ViewAction {
     // Get the active filter query (editing query if editing, otherwise applied query)
@@ -792,8 +831,24 @@ fn handle_specs_key(app: &mut App, key: KeyEvent) -> ViewAction {
             ViewAction::None
         }
 
+        // Enter: open spec (resume dialogue if draft, view content otherwise)
+        KeyCode::Enter => {
+            let status = app
+                .specs_list
+                .selected_item()
+                .map(|item| item.status.clone());
+            match status.as_deref() {
+                Some("draft") => ViewAction::SpecResume,
+                Some(_) => ViewAction::SpecView,
+                None => ViewAction::None,
+            }
+        }
+
         // Actions
-        KeyCode::Char('n') => ViewAction::SpecNew,
+        KeyCode::Char('n') => {
+            app.open_spec_name_input();
+            ViewAction::None
+        }
         KeyCode::Char('a') => ViewAction::SpecApprove,
         KeyCode::Char('d') => ViewAction::SpecDelete,
         KeyCode::Char('v') => ViewAction::SpecView,
@@ -1029,11 +1084,37 @@ mod tests {
     }
 
     #[test]
-    fn test_specs_n_returns_spec_new_action() {
+    fn test_specs_n_opens_name_input() {
         let mut app = app_with_specs();
         let (cont, action) = handle_key_event(&mut app, make_key(KeyCode::Char('n')));
         assert!(cont);
-        assert_eq!(action, ViewAction::SpecNew);
+        assert_eq!(action, ViewAction::None);
+        assert!(app.spec_name_input.is_some());
+    }
+
+    #[test]
+    fn test_spec_name_input_submit() {
+        let mut app = app_with_specs();
+        app.open_spec_name_input();
+        // Type "auth"
+        for c in "auth".chars() {
+            handle_key_event(&mut app, make_key(KeyCode::Char(c)));
+        }
+        assert_eq!(app.spec_name_input.as_ref().unwrap().input, "auth");
+        // Press Enter
+        let (_, action) = handle_key_event(&mut app, make_key(KeyCode::Enter));
+        assert_eq!(action, ViewAction::SpecNew("auth".to_string()));
+        assert!(app.spec_name_input.is_none());
+    }
+
+    #[test]
+    fn test_spec_name_input_cancel() {
+        let mut app = app_with_specs();
+        app.open_spec_name_input();
+        handle_key_event(&mut app, make_key(KeyCode::Char('x')));
+        let (_, action) = handle_key_event(&mut app, make_key(KeyCode::Esc));
+        assert_eq!(action, ViewAction::None);
+        assert!(app.spec_name_input.is_none());
     }
 
     #[test]

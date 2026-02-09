@@ -83,20 +83,13 @@ impl ProjectService {
             ));
         }
 
-        // Detect git provider: manual override > auto-detection from remote URL
+        // Detect git provider: manual override > auto-detection from remote URL > default (github)
         let git_provider = if let Some(provider) = params.git_provider_override {
             provider
         } else if let Some(ref url) = params.remote_url {
-            GitProvider::detect_from_remote(url).ok_or_else(|| {
-                NflowError::ValidationError(format!(
-                    "cannot detect git provider from remote URL '{}'; provide an explicit override",
-                    url
-                ))
-            })?
+            GitProvider::detect_from_remote(url).unwrap_or(GitProvider::Github)
         } else {
-            return Err(NflowError::ValidationError(
-                "either remote_url or git_provider_override must be provided".into(),
-            ));
+            GitProvider::Github
         };
 
         // Detect base branch from HEAD ref or default to "main"
@@ -245,7 +238,7 @@ mod tests {
     }
 
     #[test]
-    fn create_project_unknown_remote_no_override_fails() {
+    fn create_project_unknown_remote_defaults_to_github() {
         let params = CreateProjectParams {
             name: "my-proj".into(),
             path: "/some/path".into(),
@@ -254,12 +247,12 @@ mod tests {
             head_ref: None,
         };
 
-        let err = ProjectService::create(params, no_existing_names).unwrap_err();
-        assert!(matches!(err, NflowError::ValidationError(_)));
+        let project = ProjectService::create(params, no_existing_names).unwrap();
+        assert_eq!(project.git_provider, GitProvider::Github);
     }
 
     #[test]
-    fn create_project_no_remote_no_override_fails() {
+    fn create_project_no_remote_no_override_defaults_to_github() {
         let params = CreateProjectParams {
             name: "my-proj".into(),
             path: "/some/path".into(),
@@ -268,8 +261,8 @@ mod tests {
             head_ref: None,
         };
 
-        let err = ProjectService::create(params, no_existing_names).unwrap_err();
-        assert!(matches!(err, NflowError::ValidationError(_)));
+        let project = ProjectService::create(params, no_existing_names).unwrap();
+        assert_eq!(project.git_provider, GitProvider::Github);
     }
 
     #[test]

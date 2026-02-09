@@ -1,0 +1,26 @@
+## Codebase Patterns
+- Integration tests needing isolated NFLOW_HOME: use create_test_home() → (TempDir guard, PathBuf) with temp .nflow/ dir (0700 perms, logs/ subdir). create_test_db(&nflow_home) → on-disk SQLite with migrations. TempDir guard auto-cleans on drop.
+- Direct DB insert helpers for command tests: insert_test_project(db_path, name) → Uuid; insert_test_spec(db_path, project_id, name, SpecStatus) → Spec. Bypass streaming commands that need Claude.
+- insert_exec_hierarchy(db_path, project_id, wave, story_status, task_status, verify_status) → (session_id, epic_id, story_id, task_id, verify_id) — creates full approved session + work item tree for exec tests
+- dependencies table: composite PK (blocker_id, blocked_id) — no id or created_at columns. INSERT only needs those two UUIDs.
+- ProjectService::create() always needs git_provider_override: Some(GitProvider::Github) when remote_url is None
+- Protocol integration tests use start_real_server(socket_path, db_path) → creates handler via create_handler(HandlerState{db_path}), starts socket server with real dispatch
+- Mock Claude binary for streaming tests: use NFLOW_CLAUDE_BINARY env var (absolute path) instead of PATH manipulation to avoid race conditions. stream_claude_decompose() checks this env var.
+- When testing plan.generate with with_codebase=false, must create the working_dir (~/.nflow/projects/{name}/specs/) or tokio::process::Command fails with NotFound (misleading — it's about cwd, not binary)
+- Streaming test helper: send_streaming_request() reads lines until done=true with a 30s timeout
+- insert_test_session() creates DecompositionSession with optional claude_session_id for plan.feedback tests
+- decompose.md template uses {specs_content} and {project_name} variables (not {specs})
+- Flock mechanism lives in nflow-cli/src/daemon_client.rs (not daemon) — CLI acquires exclusive lock on ~/.nflow/daemon.lock before spawning daemon. Use nix::fcntl::{Flock, FlockArg::LockExclusiveNonblock}.
+- graceful_shutdown() has a 60s agent grace period — test_full_lifecycle_with_agents takes ~70s. For CI, consider #[ignore] attribute or shorter timeouts.
+- platform::send_signal(pid, Signal) returns SendSignalResult {Sent, NoSuchProcess, PermissionDenied} — use instead of raw nix::sys::signal::kill()
+- platform::install_signal_handler(Signal) sets global SHUTDOWN_FLAG AtomicBool; platform::is_shutting_down() reads it — use instead of custom signal handler globals
+- platform::ignore_signal(Signal)/restore_signal(Signal, handler) for temporary signal disposition changes (e.g., daemonization)
+- format::init(no_color) sets global NO_COLOR AtomicBool; also checks NO_COLOR env var and libc::isatty() for pipe detection
+- format::format_response(data, command) dispatches by JSON shape (epics→tree, adjacency→DAG, waves→status); format::format_error() classifies by prefix (NOT_FOUND/ALREADY_EXISTS/INVALID_STATE/INVALID_PARAMS) and adds hint suggestions
+- SocketClient::connect_to(path) for tests; SocketClient::connect() uses socket_path() (supports NFLOW_SOCKET env override) for production
+- CRITICAL BUG: daemon main.rs never calls socket::start_server() — socket server code exists in socket.rs but is only invoked in tests. Fix: add ~10 lines to foreground_mode() modeled on e2e_tests.rs:56-67
+- CRITICAL BUG: daemon never calls db::run_migrations() in production — schema only applied in test helpers
+- CRITICAL BUG: daemon never calls recovery::recover_session_state() in production — full recovery system (1068 lines) exists but is disconnected
+
+---
+

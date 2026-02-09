@@ -1,0 +1,205 @@
+{
+  "project": "nflow",
+  "branchName": "ralph/daemon-full-activation",
+  "description": "Daemon Full Activation — wire socket server, migrations, crash recovery in main.rs; clean up all 32 dead code warnings; fix failing test; add nflow-core unit tests; verify all 33 CLI commands work end-to-end.",
+  "userStories": [
+    {
+      "id": "US-101",
+      "title": "Wire socket server startup in daemon main.rs",
+      "description": "As a developer, I want the daemon to create and listen on a Unix socket so that CLI commands can communicate with it.",
+      "acceptanceCriteria": [
+        "main.rs foreground_mode() calls socket::start_server() after initialization — modeled on e2e_tests.rs:56-67",
+        "HandlerState created with db_path from daemon::db_path()",
+        "create_handler(state) called to create command dispatcher",
+        "SocketServerConfig created with socket_path from daemon::socket_path(), handler, and event_bus: None",
+        "Socket created at ~/.nflow/nflow.sock with permissions 0o600",
+        "SocketServerHandle stored and used for graceful shutdown",
+        "cargo test passes",
+        "cargo clippy passes"
+      ],
+      "priority": 1,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-102",
+      "title": "Wire database migrations on daemon start",
+      "description": "As a developer, I want migrations to run automatically when the daemon starts so that the schema is always up to date.",
+      "acceptanceCriteria": [
+        "db::run_migrations() called in foreground_mode() after opening DB connection",
+        "Migration 001_init.sql applied on first start (creates all tables)",
+        "Re-running daemon does not re-apply migrations (idempotent)",
+        "MIGRATIONS constant in db/mod.rs is no longer dead code",
+        "DbError::Migration variant is no longer dead code",
+        "current_version() and backup_db() are no longer dead code",
+        "cargo test passes",
+        "cargo clippy passes"
+      ],
+      "priority": 2,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-103",
+      "title": "Wire crash recovery on daemon start",
+      "description": "As a developer, I want the daemon to recover from previous crashes on startup so that stale state does not block execution.",
+      "acceptanceCriteria": [
+        "recovery::recover_session_state() called in foreground_mode() after migrations, before socket server",
+        "Stale agents (dead PIDs) marked as failed in DB",
+        "Orphaned in-progress tasks marked as failed",
+        "Active spec sessions reset",
+        "Stale socket and PID files cleaned up",
+        "RecoveryReport logged at info level",
+        "All recovery functions in recovery.rs are no longer dead code warnings",
+        "cargo test passes",
+        "cargo clippy passes"
+      ],
+      "priority": 3,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-104",
+      "title": "Clean up dead code — daemon spawning functions",
+      "description": "As a developer, I want to eliminate dead code warnings for daemon spawn and PID functions so that the codebase is clean.",
+      "acceptanceCriteria": [
+        "spawn_daemon(), spawn_daemon_foreground(), spawn_daemon_with_mode() — either wired into CLI daemon_client.rs for 'nflow daemon start' or removed",
+        "is_daemon_running() — wired into CLI or removed",
+        "read_pid_file(), remove_pid_file() — wired into usage or removed",
+        "If functions moved to nflow-cli, update Cargo.toml dependencies",
+        "If functions made pub and used cross-crate, verify they are actually called",
+        "cargo build shows 0 warnings for daemon.rs",
+        "cargo test passes",
+        "cargo clippy passes"
+      ],
+      "priority": 4,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-105",
+      "title": "Clean up dead code — DB queries, handlers, imports",
+      "description": "As a developer, I want to eliminate all remaining dead code warnings across the daemon crate.",
+      "acceptanceCriteria": [
+        "list_specs_by_status() — wired into spec.list handler as optional filter or removed",
+        "reset_active_sessions() — wired into recovery or removed",
+        "count_tasks_by_status() — wired into exec.status handler or removed",
+        "find_running_agent_runs_by_session() — wired into usage or removed",
+        "read_process_start_time() in recovery.rs — consolidated with platform::get_pid_start_time() or removed",
+        "Unused state parameter in handle_cleanup_logs() — used or renamed to _state",
+        "Unused import get_pid_start_time in recovery.rs — removed",
+        "cargo build 2>&1 | grep 'warning:' | wc -l equals 0",
+        "cargo test passes",
+        "cargo clippy passes"
+      ],
+      "priority": 5,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-106",
+      "title": "Fix failing test test_acquire_lock_contention",
+      "description": "As a developer, I want the lock contention test to pass reliably so that CI is green.",
+      "acceptanceCriteria": [
+        "test_acquire_lock_contention in daemon_client.rs passes consistently",
+        "Timing assertion relaxed: use elapsed >= 200ms instead of >= 400ms, or use polling-based check instead of strict timing",
+        "Test works on fast machines and in CI environments",
+        "cargo test -p nflow-cli shows 0 failures",
+        "cargo test (full workspace) shows 0 failures"
+      ],
+      "priority": 6,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-107",
+      "title": "Unit tests for nflow-core — DAG and scheduler",
+      "description": "As a developer, I want unit tests for DAG and scheduler logic in nflow-core so that core algorithms are verified at the source.",
+      "acceptanceCriteria": [
+        "Tests for dag.rs: empty DAG, single node, linear chain, diamond dependency, cycle detection, topological sort order",
+        "Tests for scheduler.rs: pick ready tasks with no deps, respect max_parallel, skip blocked tasks, handle all-done state",
+        "All tests in crates/nflow-core/src/ (not daemon integration tests)",
+        "Minimum 15 tests across dag.rs and scheduler.rs",
+        "cargo test -p nflow-core passes",
+        "Typecheck passes"
+      ],
+      "priority": 7,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-108",
+      "title": "Unit tests for nflow-core — state machines",
+      "description": "As a developer, I want unit tests for work item and spec state machines in nflow-core.",
+      "acceptanceCriteria": [
+        "Tests for work_item.rs: valid transitions (pending->in_progress->done, pending->in_progress->failed), invalid transitions rejected, verify task state machine",
+        "Tests for spec.rs: draft->approved, approved->decomposed, approved->draft (reopen), invalid transitions rejected, session_active toggling",
+        "All tests in crates/nflow-core/src/",
+        "Minimum 15 tests across work_item.rs and spec.rs",
+        "cargo test -p nflow-core passes",
+        "Typecheck passes"
+      ],
+      "priority": 8,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-109",
+      "title": "Unit tests for nflow-core — IDs, decomposition, config, project",
+      "description": "As a developer, I want unit tests for short IDs, decomposition, config, and project models in nflow-core.",
+      "acceptanceCriteria": [
+        "Tests for short_id.rs: parse E1/S1/T1/T1v, round-trip format/parse, invalid IDs rejected, wave-prefixed IDs (W1-S1)",
+        "Tests for decomposition.rs: validate epic->story->task structure, reject missing stories, reject orphan tasks",
+        "Tests for config.rs: default values, merge override, partial merge",
+        "Tests for project.rs: create with valid fields, reject empty name, git provider detection from URL",
+        "All tests in crates/nflow-core/src/",
+        "Minimum 20 tests across these modules",
+        "cargo test -p nflow-core passes",
+        "Typecheck passes"
+      ],
+      "priority": 9,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-110",
+      "title": "E2E test — real daemon binary socket lifecycle",
+      "description": "As a developer, I want an E2E test that starts the actual nflow-daemon binary and verifies socket communication works.",
+      "acceptanceCriteria": [
+        "Test spawns nflow-daemon binary as child process with NFLOW_HOME set to temp directory",
+        "Polls for socket file creation with 10s timeout",
+        "Performs NDJSON handshake (protocol_version: 1)",
+        "Sends project.init command and receives success response",
+        "Sends project.list and sees the created project in response",
+        "Sends SIGTERM to daemon, verifies socket file removed and PID file removed",
+        "Test uses tempdir for full isolation",
+        "Test passes within 30 seconds",
+        "cargo test passes"
+      ],
+      "priority": 10,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-111",
+      "title": "Verify all CLI commands work with running daemon",
+      "description": "As a developer, I want to verify that every CLI command group produces correct results when connected to a running daemon.",
+      "acceptanceCriteria": [
+        "Test starts daemon with temp NFLOW_HOME",
+        "project group: init succeeds, projects list shows project, project delete removes it",
+        "spec group: spec list returns empty for new project, spec approve on nonexistent returns NOT_FOUND error",
+        "plan group: plan show on project with no plans returns appropriate message",
+        "exec group: exec status on project with no execution returns appropriate message",
+        "worktree group: worktree list returns empty for new project",
+        "config group: config show returns valid config, config set updates value",
+        "cleanup group: cleanup --logs succeeds",
+        "All error responses have proper status='error' and descriptive messages",
+        "Test passes within 30 seconds",
+        "cargo test passes"
+      ],
+      "priority": 11,
+      "passes": false,
+      "notes": ""
+    }
+  ]
+}

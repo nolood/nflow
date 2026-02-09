@@ -42,10 +42,25 @@ async fn run(cli: Cli) -> error::Result<()> {
 
     match cli.command {
         // --- Daemon commands (local, no socket needed) ---
-        Commands::Daemon(DaemonCommand::Start { foreground: _ }) => {
-            ensure_daemon()?;
-            println!("daemon started");
-            Ok(())
+        Commands::Daemon(DaemonCommand::Start { foreground }) => {
+            if foreground {
+                // Foreground mode: exec into nflow-daemon, replacing this process
+                use std::os::unix::process::CommandExt;
+                let daemon_binary = daemon_client::find_daemon_binary()?;
+                let err = std::process::Command::new(&daemon_binary)
+                    .env("NFLOW_DAEMON_MODE", "foreground")
+                    .exec();
+                // exec() only returns on error
+                Err(CliError::Io(std::io::Error::other(format!(
+                    "failed to exec {}: {}",
+                    daemon_binary.display(),
+                    err
+                ))))
+            } else {
+                ensure_daemon()?;
+                println!("daemon started");
+                Ok(())
+            }
         }
         Commands::Daemon(DaemonCommand::Stop) => {
             let pid = daemon_stop()?;

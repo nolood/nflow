@@ -128,7 +128,7 @@ fn spawn_daemon() -> Result<u32> {
 
 /// Find the nflow-daemon binary. First checks next to the current executable,
 /// then falls back to "nflow-daemon" in PATH.
-fn find_daemon_binary() -> Result<PathBuf> {
+pub fn find_daemon_binary() -> Result<PathBuf> {
     if let Ok(exe) = env::current_exe() {
         if let Some(dir) = exe.parent() {
             let candidate = dir.join("nflow-daemon");
