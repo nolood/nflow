@@ -13,6 +13,9 @@ Started: Wed Feb 11 06:57:15 PM MSK 2026
 - `HandlerState` has `pipeline_signals: PipelineSignals` field — must be initialized with `Arc::new(Mutex::new(HashMap::new()))` in all constructors/tests
 - For async signaling between handlers and executor tasks, use `tokio::sync::watch` channels keyed by pipeline_run_id in the shared `pipeline_signals` map
 - When updating test files that construct `HandlerState`, all 5 test modules (protocol, e2e, commands_exec, commands_plan, commands_project_spec) must be updated
+- Auto-answerer uses `extract_pipeline_json_from_text()` (same as stage output parsing) to extract JSON from Claude's response
+- `RunConfig::for_pipeline_auto_answer` limits to Read/Glob/Grep with max_turns=10 — no write/edit/bash access
+- `auto_answer_question()` in handlers.rs is the full-flow function: spawn agent → parse → save to DB → emit event
 
 ---
 
@@ -79,4 +82,25 @@ Started: Wed Feb 11 06:57:15 PM MSK 2026
   - Prompts are embedded at compile time — changing a prompt file triggers recompilation of nflow-claude crate
   - The PIPELINE_QUESTIONS marker is what the daemon will use to detect and parse questions from stream output (US-011 will implement the parser)
   - Keep prompt changes backward-compatible — the plan JSON output format at the end is unchanged
+---
+
+## 2026-02-11 - US-010
+- Created `prompts/pipeline_auto_answer.md` prompt template with `{question}` and `{context}` variables
+- Prompt instructs agent to search codebase with Read/Glob/Grep and output structured JSON: `{ "answer": "...", "confidence": "high|medium|low", "sources": ["..."] }`
+- Added `RunConfig::for_pipeline_auto_answer` in `nflow-claude/src/runner.rs` — allowedTools: Read,Glob,Grep; max_turns: 10
+- Registered `pipeline_auto_answer` template in `nflow-claude/src/prompt.rs` (embedded at compile time)
+- Added auto-answerer spawning logic in `nflow-daemon/src/handlers.rs`:
+  - `AutoAnswerOutput` struct for parsing agent response JSON
+  - `build_auto_answer_prompt()` — loads and renders the auto_answer template
+  - `spawn_auto_answerer()` — spawns Claude process with 60-second timeout, parses JSON output, falls back to default answer
+  - `auto_answer_question()` — full-flow function: spawn agent → parse → save to DB via `answer_question()` with answered_by='auto-agent' → emit `PipelineQuestionAnswered` event
+- Added tests: prompt template existence test, RunConfig tools/limits tests
+- Files changed: prompts/pipeline_auto_answer.md, crates/nflow-claude/src/prompt.rs, crates/nflow-claude/src/runner.rs, crates/nflow-daemon/src/handlers.rs
+- All tests pass: 554 daemon, 782+ non-daemon
+- `cargo build --workspace` succeeds, `cargo clippy --workspace --all-targets` passes (no new warnings)
+- **Learnings for future iterations:**
+  - `extract_pipeline_json_from_text()` is reusable for any agent output that embeds JSON — auto-answerer uses it too
+  - The `auto_answer_question()` function is designed to be called from US-011's question detection/routing logic
+  - Auto-answerer fallback is intentionally generous — if raw text is short enough (<2000 chars), it's used as the answer; otherwise the static fallback is used
+  - Note: agent_runs record creation for auto-answerer is deferred to US-011 where the actual invocation context (pipeline_run_id, etc.) is available in the executor loop
 ---

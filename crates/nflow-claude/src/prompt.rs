@@ -12,6 +12,8 @@ const EMBEDDED_MR_BODY: &str = include_str!("../../../prompts/mr_body.md");
 const EMBEDDED_PIPELINE_PLAN: &str = include_str!("../../../prompts/pipeline_plan.md");
 const EMBEDDED_PIPELINE_IMPLEMENT: &str = include_str!("../../../prompts/pipeline_implement.md");
 const EMBEDDED_PIPELINE_REVIEW: &str = include_str!("../../../prompts/pipeline_review.md");
+const EMBEDDED_PIPELINE_AUTO_ANSWER: &str =
+    include_str!("../../../prompts/pipeline_auto_answer.md");
 
 /// Known template names.
 const KNOWN_TEMPLATES: &[(&str, &str)] = &[
@@ -23,6 +25,7 @@ const KNOWN_TEMPLATES: &[(&str, &str)] = &[
     ("pipeline_plan", EMBEDDED_PIPELINE_PLAN),
     ("pipeline_implement", EMBEDDED_PIPELINE_IMPLEMENT),
     ("pipeline_review", EMBEDDED_PIPELINE_REVIEW),
+    ("pipeline_auto_answer", EMBEDDED_PIPELINE_AUTO_ANSWER),
 ];
 
 /// Get the embedded template content for a given template name.
@@ -162,6 +165,13 @@ mod tests {
         assert!(!EMBEDDED_MR_BODY.is_empty());
         assert!(EMBEDDED_MR_BODY.contains("{story_id}"));
         assert!(EMBEDDED_MR_BODY.contains("{tasks_list}"));
+    }
+
+    #[test]
+    fn embedded_pipeline_auto_answer_template_exists() {
+        assert!(!EMBEDDED_PIPELINE_AUTO_ANSWER.is_empty());
+        assert!(EMBEDDED_PIPELINE_AUTO_ANSWER.contains("{question}"));
+        assert!(EMBEDDED_PIPELINE_AUTO_ANSWER.contains("{context}"));
     }
 
     // --- load_template tests ---

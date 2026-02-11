@@ -5971,6 +5971,169 @@ fn parse_duration_secs(s: &str) -> Option<u64> {
 /// Extract JSON from text produced by Claude.
 ///
 /// Looks for ```json code blocks first, then falls back to finding raw JSON objects.
+/// Parsed output from the auto-answerer agent.
+#[derive(Debug, Clone, serde::Deserialize)]
+struct AutoAnswerOutput {
+    answer: String,
+    #[allow(dead_code)]
+    confidence: Option<String>,
+    #[allow(dead_code)]
+    sources: Option<Vec<String>>,
+}
+
+const AUTO_ANSWER_FALLBACK: &str =
+    "Proceed with your best judgment based on codebase analysis";
+
+/// Build the prompt for the auto-answerer agent.
+fn build_auto_answer_prompt(question: &str, context: &str) -> Result<String, String> {
+    let nflow_home = crate::daemon::nflow_home().map_err(|e| format!("{}", e))?;
+    let override_dir = nflow_home.join("prompts");
+    let override_path = if override_dir.is_dir() {
+        Some(override_dir)
+    } else {
+        None
+    };
+
+    let template =
+        nflow_claude::prompt::load_template("pipeline_auto_answer", override_path.as_deref())
+            .map_err(|e| format!("failed to load auto_answer template: {}", e))?;
+
+    let mut vars: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
+    vars.insert("question", question);
+    vars.insert("context", context);
+
+    nflow_claude::prompt::render_template(&template, &vars)
+        .map_err(|e| format!("failed to render auto_answer template: {}", e))
+}
+
+/// Spawn an auto-answerer agent to answer a single pipeline question.
+///
+/// Returns the answer string. Falls back to a default answer on failure or timeout.
+async fn spawn_auto_answerer(
+    question: &str,
+    context: &str,
+    project_path: &str,
+) -> String {
+    let prompt = match build_auto_answer_prompt(question, context) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!("auto-answerer prompt build failed: {}", e);
+            return AUTO_ANSWER_FALLBACK.to_string();
+        }
+    };
+
+    let mut run_config = nflow_claude::runner::RunConfig::for_pipeline_auto_answer(prompt);
+    run_config.working_dir = Some(PathBuf::from(project_path));
+
+    let runner = match std::env::var("NFLOW_CLAUDE_BINARY") {
+        Ok(bin) => nflow_claude::runner::ClaudeRunner::with_binary(bin),
+        Err(_) => nflow_claude::runner::ClaudeRunner::new(),
+    };
+
+    let process = match runner.spawn(&run_config) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!("auto-answerer spawn failed: {}", e);
+            return AUTO_ANSWER_FALLBACK.to_string();
+        }
+    };
+
+    let mut parser = nflow_claude::stream::StreamParser::new(process.stdout);
+    let mut child = process.child;
+    let mut result_text = String::new();
+
+    // 60 second timeout for the auto-answerer
+    let timeout_duration = std::time::Duration::from_secs(60);
+    let read_result = tokio::time::timeout(timeout_duration, async {
+        loop {
+            match parser.next_event().await {
+                Ok(Some(event)) => {
+                    if let nflow_claude::stream::StreamEvent::Result { text, .. } = event {
+                        result_text = text;
+                    }
+                }
+                Ok(None) => break,
+                Err(_) => break,
+            }
+        }
+    })
+    .await;
+
+    if read_result.is_err() {
+        // Timeout — kill the process
+        tracing::warn!("auto-answerer timed out after 60s");
+        let _ = child.kill().await;
+        return AUTO_ANSWER_FALLBACK.to_string();
+    }
+
+    let _ = child.wait().await;
+
+    // Parse the auto-answer JSON from the result text
+    if let Some(json_str) = extract_pipeline_json_from_text(&result_text) {
+        if let Ok(output) = serde_json::from_str::<AutoAnswerOutput>(&json_str) {
+            if !output.answer.is_empty() {
+                return output.answer;
+            }
+        }
+    }
+
+    // Fallback: use the raw text if it's reasonable, otherwise default
+    if !result_text.trim().is_empty() && result_text.len() < 2000 {
+        result_text.trim().to_string()
+    } else {
+        AUTO_ANSWER_FALLBACK.to_string()
+    }
+}
+
+/// Automatically answer a pipeline question using an auto-answerer agent.
+///
+/// Spawns a Claude agent to search the codebase, parses the answer,
+/// stores it in the DB, and emits a PipelineQuestionAnswered event.
+pub async fn auto_answer_question(
+    db_path: &Path,
+    event_bus: &Option<crate::events::SharedEventBus>,
+    pipeline_run_id: uuid::Uuid,
+    question_id: uuid::Uuid,
+    question: &str,
+    context: Option<&str>,
+    project_path: &str,
+) {
+    let ctx = context.unwrap_or("No additional context provided");
+    let answer = spawn_auto_answerer(question, ctx, project_path).await;
+
+    // Save answer to DB
+    if let Ok(conn) = db::open_connection(db_path) {
+        match db::pipeline::answer_question(&conn, &question_id, &answer, "auto-agent") {
+            Ok(true) => {
+                tracing::info!(
+                    "auto-answerer answered question {} for pipeline {}",
+                    question_id,
+                    pipeline_run_id
+                );
+            }
+            Ok(false) => {
+                tracing::warn!(
+                    "auto-answerer: question {} not found or already answered",
+                    question_id
+                );
+            }
+            Err(e) => {
+                tracing::warn!("auto-answerer: failed to save answer: {}", e);
+            }
+        }
+    }
+
+    // Emit event
+    if let Some(bus) = event_bus {
+        bus.broadcast(crate::events::Event::PipelineQuestionAnswered {
+            pipeline_run_id: pipeline_run_id.to_string(),
+            question_id: question_id.to_string(),
+            answer,
+            answered_by: "auto-agent".to_string(),
+        });
+    }
+}
+
 fn extract_pipeline_json_from_text(text: &str) -> Option<String> {
     // Try ```json blocks first
     if let Some(start) = text.find("```json") {

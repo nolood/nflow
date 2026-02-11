@@ -167,6 +167,17 @@ impl RunConfig {
             ..Self::base(prompt)
         }
     }
+
+    /// Config for pipeline auto-answerer agent.
+    ///
+    /// allowedTools: Read, Glob, Grep; max_turns: 10
+    pub fn for_pipeline_auto_answer(prompt: String) -> Self {
+        Self {
+            allowed_tools: vec!["Read".to_string(), "Glob".to_string(), "Grep".to_string()],
+            max_turns: Some(10),
+            ..Self::base(prompt)
+        }
+    }
 }
 
 /// Output format for the Claude CLI.
@@ -606,6 +617,24 @@ mod tests {
         let config = RunConfig::for_verify_task("verify".into());
         assert!(!config.allowed_tools.contains(&"Write".to_string()));
         assert!(!config.allowed_tools.contains(&"Edit".to_string()));
+    }
+
+    #[test]
+    fn for_pipeline_auto_answer_tools_and_limits() {
+        let config = RunConfig::for_pipeline_auto_answer("answer question".into());
+        assert_eq!(config.prompt, "answer question");
+        assert_eq!(config.allowed_tools, vec!["Read", "Glob", "Grep"]);
+        assert_eq!(config.max_turns, Some(10));
+        assert!(config.verbose);
+        assert!(config.include_partial_messages);
+    }
+
+    #[test]
+    fn for_pipeline_auto_answer_no_write_or_edit_or_bash() {
+        let config = RunConfig::for_pipeline_auto_answer("q".into());
+        assert!(!config.allowed_tools.contains(&"Write".to_string()));
+        assert!(!config.allowed_tools.contains(&"Edit".to_string()));
+        assert!(!config.allowed_tools.contains(&"Bash".to_string()));
     }
 
     #[test]
