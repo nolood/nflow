@@ -4,6 +4,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, BufReader};
 
 use crate::error::{CliError, Result};
+use crate::format;
 use crate::socket_client::{ResponseStatus, SocketClient};
 
 /// Handle a streaming log follow session (`nflow log <task> -f`).
@@ -49,20 +50,36 @@ pub async fn handle_log_follow(
     Ok(())
 }
 
+/// Check if stdin is a terminal (for interactive mode detection).
+fn stdin_is_tty() -> bool {
+    unsafe { libc::isatty(libc::STDIN_FILENO) != 0 }
+}
+
 /// Handle a streaming pipeline start session (`nflow pipeline start`).
 ///
-/// Streams pipeline progress events to stdout. Stops on:
-/// - Pipeline completion (`done: true`)
-/// - Ctrl+C (graceful exit)
-/// - Daemon error
+/// Streams pipeline progress events to stdout. In manual mode with a tty stdin,
+/// questions and approval gates are handled interactively:
+/// - PipelineQuestion events prompt the user for answers
+/// - WaitingForApproval/WaitingForFinalApproval prompt for approve/reject
+///
+/// If stdin is not a tty, interactive prompts are skipped (non-interactive fallback).
 pub async fn handle_pipeline_stream(
     client: &mut SocketClient,
     params: serde_json::Value,
     cancelled: Arc<AtomicBool>,
 ) -> Result<()> {
+    let is_manual = params
+        .get("mode")
+        .and_then(|v| v.as_str())
+        .unwrap_or("auto")
+        == "manual";
+    let interactive = is_manual && stdin_is_tty();
+
     let mut reader = client
         .send_streaming_command("pipeline.start", params)
         .await?;
+
+    let mut pipeline_run_id: Option<String> = None;
 
     while let Some(line) = reader.next_line().await? {
         if cancelled.load(Ordering::Relaxed) {
@@ -79,7 +96,156 @@ pub async fn handle_pipeline_stream(
             return Err(CliError::Socket(msg.to_string()));
         }
 
-        crate::format::format_pipeline_event(&line.data);
+        // Track pipeline_run_id from events
+        if let Some(id) = line.data.get("pipeline_run_id").and_then(|v| v.as_str()) {
+            pipeline_run_id = Some(id.to_string());
+        }
+
+        let event_type = line.data.get("type").and_then(|v| v.as_str()).unwrap_or("");
+
+        if interactive && event_type == "pipeline_question" {
+            // Interactive question handling
+            let question = line
+                .data
+                .get("question")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let context = line.data.get("context").and_then(|v| v.as_str());
+            let question_id = line
+                .data
+                .get("question_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let run_id = line
+                .data
+                .get("pipeline_run_id")
+                .and_then(|v| v.as_str())
+                .or(pipeline_run_id.as_deref())
+                .unwrap_or("");
+
+            println!("\nQuestion: {}", question);
+            if let Some(ctx) = context {
+                if !ctx.is_empty() {
+                    println!("Context: {}", ctx);
+                }
+            }
+
+            let answer = read_user_input_with_prompt("Your answer: ", cancelled.clone()).await?;
+            match answer {
+                Some(text) => {
+                    // Send pipeline.answer command
+                    let answer_params = serde_json::json!({
+                        "pipeline_run_id": run_id,
+                        "question_id": question_id,
+                        "answer": text,
+                    });
+                    // Use a separate connection for the answer command
+                    let mut answer_client = SocketClient::connect().await?;
+                    let resp = answer_client
+                        .send_command("pipeline.answer", answer_params)
+                        .await?;
+                    if resp.status == ResponseStatus::Error {
+                        let msg = resp
+                            .data
+                            .get("message")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("failed to submit answer");
+                        eprintln!("warning: {}", msg);
+                    }
+                }
+                None => {
+                    // User cancelled — continue streaming without answering
+                    eprintln!("(skipped question)");
+                }
+            }
+        } else if interactive
+            && (event_type == "waiting_for_approval"
+                || event_type == "waiting_for_final_approval")
+        {
+            let run_id = line
+                .data
+                .get("pipeline_run_id")
+                .and_then(|v| v.as_str())
+                .or(pipeline_run_id.as_deref())
+                .unwrap_or("");
+
+            let label = if event_type == "waiting_for_approval" {
+                "Plan"
+            } else {
+                "Final result"
+            };
+
+            // Print the plan/summary if available
+            if let Some(summary) = line.data.get("plan_summary").and_then(|v| v.as_str()) {
+                println!("\n{}", summary);
+            } else if let Some(summary) = line.data.get("summary").and_then(|v| v.as_str()) {
+                println!("\n{}", summary);
+            }
+
+            println!("\n{} ready for review.", label);
+            let answer =
+                read_user_input_with_prompt("Approve? (y/n/feedback): ", cancelled.clone())
+                    .await?;
+            match answer {
+                Some(text) => {
+                    let trimmed = text.trim().to_lowercase();
+                    let mut cmd_client = SocketClient::connect().await?;
+                    if trimmed == "y" || trimmed == "yes" {
+                        let approve_params =
+                            serde_json::json!({ "pipeline_run_id": run_id });
+                        let resp = cmd_client
+                            .send_command("pipeline.approve", approve_params)
+                            .await?;
+                        if resp.status == ResponseStatus::Ok {
+                            println!("{} approved.", label);
+                        } else {
+                            let msg = resp
+                                .data
+                                .get("message")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("failed to approve");
+                            eprintln!("error: {}", msg);
+                        }
+                    } else {
+                        // Treat as rejection with feedback
+                        let feedback = if trimmed == "n" || trimmed == "no" {
+                            // Prompt for feedback
+                            let fb = read_user_input_with_prompt(
+                                "Feedback: ",
+                                cancelled.clone(),
+                            )
+                            .await?;
+                            fb.unwrap_or_default()
+                        } else {
+                            // The text itself is the feedback
+                            text
+                        };
+                        let reject_params = serde_json::json!({
+                            "pipeline_run_id": run_id,
+                            "feedback": feedback,
+                        });
+                        let resp = cmd_client
+                            .send_command("pipeline.reject", reject_params)
+                            .await?;
+                        if resp.status == ResponseStatus::Ok {
+                            println!("{} rejected.", label);
+                        } else {
+                            let msg = resp
+                                .data
+                                .get("message")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("failed to reject");
+                            eprintln!("error: {}", msg);
+                        }
+                    }
+                }
+                None => {
+                    eprintln!("(skipped approval)");
+                }
+            }
+        } else {
+            format::format_pipeline_event(&line.data);
+        }
 
         if line.done {
             break;
@@ -220,6 +386,36 @@ pub async fn handle_spec_dialogue(
     }
 
     Ok(())
+}
+
+/// Read a line of input from the user via stdin with a custom prompt.
+///
+/// Returns `None` on EOF (Ctrl+D) or if cancelled (Ctrl+C).
+async fn read_user_input_with_prompt(
+    prompt: &str,
+    cancelled: Arc<AtomicBool>,
+) -> Result<Option<String>> {
+    eprint!("{}", prompt);
+
+    let stdin = tokio::io::stdin();
+    let mut reader = BufReader::new(stdin);
+    let mut line = String::new();
+
+    tokio::select! {
+        result = reader.read_line(&mut line) => {
+            match result {
+                Ok(0) => Ok(None), // EOF (Ctrl+D)
+                Ok(_) => {
+                    let trimmed = line.trim_end_matches('\n').trim_end_matches('\r');
+                    Ok(Some(trimmed.to_string()))
+                }
+                Err(e) => Err(CliError::Io(e)),
+            }
+        }
+        _ = wait_for_cancel(cancelled) => {
+            Ok(None)
+        }
+    }
 }
 
 /// Read a line of input from the user via stdin.

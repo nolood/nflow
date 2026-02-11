@@ -37,6 +37,9 @@ Started: Wed Feb 11 06:57:15 PM MSK 2026
 - `pipeline.list`/`pipeline.status` daemon responses now include `mode` field in run JSON — both handlers updated in handlers.rs
 - Pipeline formatting: `format_pipeline_event()` for streaming, `print_pipeline_list/status/logs()` for response rendering in format.rs
 - Socket timeout: pipeline commands use `LONG_COMMAND_TIMEOUT` (300s) since pipeline.start can run for extended periods
+- Interactive CLI mode: `handle_pipeline_stream()` detects manual mode + tty stdin, intercepts `pipeline_question` and `waiting_for_approval`/`waiting_for_final_approval` events for interactive prompts
+- For sending commands during streaming, open a separate `SocketClient::connect()` — the main client is occupied by the streaming reader
+- `stdin_is_tty()` via `libc::isatty(libc::STDIN_FILENO)` for non-interactive fallback detection
 
 ---
 
@@ -312,4 +315,25 @@ Started: Wed Feb 11 06:57:15 PM MSK 2026
   - Pipeline approval commands are non-streaming (standard request/response) — they go through `build_command()` path
   - `pipeline.approve` is context-aware on the daemon side — one command handles both plan approval and final approval based on current pipeline state
   - `print_pipeline_questions` guards against questions key appearing in other response shapes with `!obj.contains_key("wave_number")`
+---
+
+## 2026-02-11 - US-019
+- Implemented interactive CLI mode for manual pipeline with stdin questions
+- Updated `handle_pipeline_stream()` in streaming.rs to support interactive mode:
+  - Detects manual mode from params + checks stdin is a tty via `stdin_is_tty()` (libc::isatty)
+  - Tracks `pipeline_run_id` from streaming events for use in interactive commands
+  - Intercepts `pipeline_question` events: prints question + context, prompts user for answer via `read_user_input_with_prompt()`, sends `pipeline.answer` command via separate socket connection
+  - Intercepts `waiting_for_approval` and `waiting_for_final_approval` events: prints plan/summary, prompts "Approve? (y/n/feedback):", handles y=approve, n=prompt-for-feedback-then-reject, other-text=reject-with-that-as-feedback
+  - Non-interactive fallback: if stdin is not a tty, skips all interactive prompts and treats as auto mode (just prints events)
+- Added `stdin_is_tty()` function using `libc::isatty(libc::STDIN_FILENO)`
+- Added `read_user_input_with_prompt()` function: same as `read_user_input()` but accepts custom prompt string
+- For sending commands during streaming (answer/approve/reject), opens separate `SocketClient::connect()` since the main client is occupied by the streaming reader
+- Files changed: crates/nflow-cli/src/streaming.rs, scripts/ralph/prd.json, scripts/ralph/progress.txt
+- All 101 nflow-cli tests pass, all 801 non-daemon tests pass
+- `cargo build --workspace` succeeds, `cargo clippy --workspace --all-targets` passes (no new warnings)
+- **Learnings for future iterations:**
+  - Cannot reuse the main `SocketClient` during streaming — it's borrowed by `StreamingReader`. Use a separate connection for interactive commands.
+  - `libc::isatty()` is already available via the `libc` crate in nflow-cli dependencies
+  - Event `type` field values for interactive events: `pipeline_question`, `waiting_for_approval`, `waiting_for_final_approval` — these match what the daemon emits in streaming responses
+  - `read_user_input_with_prompt()` is generic enough for reuse in future interactive CLI features
 ---
