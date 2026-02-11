@@ -3,7 +3,8 @@ use rusqlite::{params, Connection, Row};
 use uuid::Uuid;
 
 use nflow_core::pipeline::{
-    PipelineMode, PipelineRun, PipelineStage, PipelineStageType, PipelineStatus, StageStatus,
+    PipelineMode, PipelineQuestion, PipelineRun, PipelineStage, PipelineStageType, PipelineStatus,
+    StageStatus,
 };
 
 use super::Result;
@@ -145,6 +146,30 @@ fn row_to_pipeline_stage(row: &Row<'_>) -> rusqlite::Result<PipelineStage> {
         started_at: started_at_str.map(|s| parse_datetime(&s)),
         finished_at: finished_at_str.map(|s| parse_datetime(&s)),
         created_at: parse_datetime(&created_at_str),
+    })
+}
+
+fn row_to_pipeline_question(row: &Row<'_>) -> rusqlite::Result<PipelineQuestion> {
+    let id_str: String = row.get("id")?;
+    let pipeline_run_id_str: String = row.get("pipeline_run_id")?;
+    let question: String = row.get("question")?;
+    let context: Option<String> = row.get("context")?;
+    let answered: bool = row.get("answered")?;
+    let answer: Option<String> = row.get("answer")?;
+    let answered_by: Option<String> = row.get("answered_by")?;
+    let created_at_str: String = row.get("created_at")?;
+    let answered_at_str: Option<String> = row.get("answered_at")?;
+
+    Ok(PipelineQuestion {
+        id: parse_uuid(&id_str),
+        pipeline_run_id: parse_uuid(&pipeline_run_id_str),
+        question,
+        context,
+        answered,
+        answer,
+        answered_by,
+        created_at: parse_datetime(&created_at_str),
+        answered_at: answered_at_str.map(|s| parse_datetime(&s)),
     })
 }
 
@@ -346,4 +371,62 @@ pub fn find_pipeline_stages(
         stages.push(row?);
     }
     Ok(stages)
+}
+
+// ─── Pipeline Question Operations ───────────────────────
+
+pub fn insert_question(conn: &Connection, question: &PipelineQuestion) -> Result<()> {
+    conn.execute(
+        "INSERT INTO pipeline_questions (id, pipeline_run_id, question, context, answered, answer, answered_by, created_at, answered_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![
+            question.id.to_string(),
+            question.pipeline_run_id.to_string(),
+            question.question,
+            question.context,
+            question.answered,
+            question.answer,
+            question.answered_by,
+            question.created_at.to_rfc3339(),
+            question.answered_at.map(|dt| dt.to_rfc3339()),
+        ],
+    )?;
+    Ok(())
+}
+
+pub fn get_pending_questions(
+    conn: &Connection,
+    pipeline_run_id: &Uuid,
+) -> Result<Vec<PipelineQuestion>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, pipeline_run_id, question, context, answered, answer, answered_by, created_at, answered_at
+         FROM pipeline_questions WHERE pipeline_run_id = ?1 AND answered = 0 ORDER BY created_at",
+    )?;
+    let rows = stmt.query_map(
+        params![pipeline_run_id.to_string()],
+        row_to_pipeline_question,
+    )?;
+    let mut questions = Vec::new();
+    for row in rows {
+        questions.push(row?);
+    }
+    Ok(questions)
+}
+
+pub fn answer_question(
+    conn: &Connection,
+    id: &Uuid,
+    answer: &str,
+    answered_by: &str,
+) -> Result<bool> {
+    let rows_affected = conn.execute(
+        "UPDATE pipeline_questions SET answered = 1, answer = ?1, answered_by = ?2, answered_at = ?3 WHERE id = ?4 AND answered = 0",
+        params![
+            answer,
+            answered_by,
+            Utc::now().to_rfc3339(),
+            id.to_string(),
+        ],
+    )?;
+    Ok(rows_affected > 0)
 }

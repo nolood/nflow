@@ -162,6 +162,37 @@ impl PipelineStage {
     }
 }
 
+// ─── Pipeline Questions ─────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PipelineQuestion {
+    pub id: Uuid,
+    pub pipeline_run_id: Uuid,
+    pub question: String,
+    pub context: Option<String>,
+    pub answered: bool,
+    pub answer: Option<String>,
+    pub answered_by: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub answered_at: Option<DateTime<Utc>>,
+}
+
+impl PipelineQuestion {
+    pub fn new(pipeline_run_id: Uuid, question: String, context: Option<String>) -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            pipeline_run_id,
+            question,
+            context,
+            answered: false,
+            answer: None,
+            answered_by: None,
+            created_at: Utc::now(),
+            answered_at: None,
+        }
+    }
+}
+
 // ─── Structured Handoff Types ────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -717,5 +748,60 @@ mod tests {
                 status
             );
         }
+    }
+
+    // ─── PipelineQuestion tests ─────────────────────────
+
+    #[test]
+    fn pipeline_question_new_sets_defaults() {
+        let run_id = Uuid::new_v4();
+        let q = PipelineQuestion::new(
+            run_id,
+            "What database to use?".to_string(),
+            Some("We need a persistence layer".to_string()),
+        );
+
+        assert_eq!(q.pipeline_run_id, run_id);
+        assert_eq!(q.question, "What database to use?");
+        assert_eq!(q.context.as_deref(), Some("We need a persistence layer"));
+        assert!(!q.answered);
+        assert!(q.answer.is_none());
+        assert!(q.answered_by.is_none());
+        assert!(q.answered_at.is_none());
+    }
+
+    #[test]
+    fn pipeline_question_new_without_context() {
+        let q = PipelineQuestion::new(
+            Uuid::new_v4(),
+            "Which framework?".to_string(),
+            None,
+        );
+
+        assert_eq!(q.question, "Which framework?");
+        assert!(q.context.is_none());
+        assert!(!q.answered);
+    }
+
+    #[test]
+    fn pipeline_question_serialization_round_trip() {
+        let q = PipelineQuestion::new(
+            Uuid::new_v4(),
+            "What API style?".to_string(),
+            Some("REST vs gRPC".to_string()),
+        );
+
+        let json = serde_json::to_string(&q).unwrap();
+        assert!(json.contains("\"question\":\"What API style?\""));
+        assert!(json.contains("\"answered\":false"));
+
+        let parsed: PipelineQuestion = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.id, q.id);
+        assert_eq!(parsed.pipeline_run_id, q.pipeline_run_id);
+        assert_eq!(parsed.question, q.question);
+        assert_eq!(parsed.context, q.context);
+        assert_eq!(parsed.answered, q.answered);
+        assert_eq!(parsed.answer, q.answer);
+        assert_eq!(parsed.answered_by, q.answered_by);
     }
 }

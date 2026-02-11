@@ -39,7 +39,7 @@
         "cargo test -p nflow-core passes"
       ],
       "priority": 2,
-      "passes": false,
+      "passes": true,
       "notes": ""
     },
     {
@@ -56,7 +56,7 @@
         "cargo test passes"
       ],
       "priority": 3,
-      "passes": false,
+      "passes": true,
       "notes": ""
     },
     {
