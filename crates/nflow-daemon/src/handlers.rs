@@ -6134,6 +6134,67 @@ pub async fn auto_answer_question(
     }
 }
 
+/// Parsed pipeline questions block from the Plan agent output.
+#[derive(Debug, Clone, serde::Deserialize)]
+struct PipelineQuestionsBlock {
+    questions: Vec<PipelineQuestionItem>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct PipelineQuestionItem {
+    question: String,
+    context: Option<String>,
+}
+
+/// Extract pipeline questions from Plan agent output.
+///
+/// Looks for the PIPELINE_QUESTIONS marker followed by a ```json block
+/// containing `{ "questions": [...] }`. Returns the parsed questions
+/// and the text with the questions section removed (for subsequent plan parsing).
+fn extract_pipeline_questions(text: &str) -> (Vec<PipelineQuestionItem>, String) {
+    const MARKER: &str = "PIPELINE_QUESTIONS";
+
+    let marker_pos = match text.find(MARKER) {
+        Some(pos) => pos,
+        None => return (vec![], text.to_string()),
+    };
+
+    // Find the ```json block after the marker
+    let after_marker = &text[marker_pos + MARKER.len()..];
+    let json_block_start = match after_marker.find("```json") {
+        Some(pos) => pos,
+        None => return (vec![], text.to_string()),
+    };
+
+    let json_content_start = json_block_start + "```json".len();
+    let json_block_end = match after_marker[json_content_start..].find("```") {
+        Some(pos) => json_content_start + pos,
+        None => return (vec![], text.to_string()),
+    };
+
+    let json_str = after_marker[json_content_start..json_block_end].trim();
+
+    let questions = match serde_json::from_str::<PipelineQuestionsBlock>(json_str) {
+        Ok(block) => block.questions,
+        Err(e) => {
+            tracing::warn!("failed to parse PIPELINE_QUESTIONS JSON: {}", e);
+            return (vec![], text.to_string());
+        }
+    };
+
+    // Remove the questions section from the text so the plan JSON can be parsed cleanly.
+    // The questions section runs from the marker position to the closing ``` of the JSON block.
+    let questions_section_end =
+        marker_pos + MARKER.len() + json_block_end + "```".len();
+    let cleaned = format!(
+        "{}{}",
+        &text[..marker_pos].trim_end(),
+        &text[questions_section_end..]
+    );
+
+    (questions, cleaned)
+}
+
 fn extract_pipeline_json_from_text(text: &str) -> Option<String> {
     // Try ```json blocks first
     if let Some(start) = text.find("```json") {
@@ -6299,7 +6360,7 @@ async fn run_pipeline_stage(
     history: &[nflow_core::pipeline::IterationRecord],
     plan_output_json: Option<&str>,
     implement_output_json: Option<&str>,
-) -> Result<(nflow_core::pipeline::StageOutput, Option<String>), String> {
+) -> Result<(nflow_core::pipeline::StageOutput, Option<String>, String), String> {
     let stage_type_str = stage_type.to_string();
 
     let mut stage = nflow_core::pipeline::PipelineStage::new(run.id, stage_type, iteration);
@@ -6493,7 +6554,16 @@ async fn run_pipeline_stage(
 
     let _exit_status = child.wait().await.ok();
 
-    let stage_output = parse_pipeline_stage_output(&result_text, stage_type);
+    // For Plan stages, strip PIPELINE_QUESTIONS section before parsing the plan output.
+    // The raw result_text (with questions) is still returned for the caller to detect questions.
+    let text_for_parsing = if matches!(stage_type, nflow_core::pipeline::PipelineStageType::Plan) {
+        let (_questions, cleaned) = extract_pipeline_questions(&result_text);
+        cleaned
+    } else {
+        result_text.clone()
+    };
+
+    let stage_output = parse_pipeline_stage_output(&text_for_parsing, stage_type);
     let output_json = serde_json::to_string(&stage_output).unwrap_or_default();
 
     if let Ok(conn) = db::open_connection(db_path) {
@@ -6529,7 +6599,7 @@ async fn run_pipeline_stage(
         ))
         .await;
 
-    Ok((stage_output, session_id))
+    Ok((stage_output, session_id, result_text))
 }
 
 /// Handle "pipeline.start" command -- start a new pipeline run.
@@ -6659,7 +6729,7 @@ fn handle_pipeline_start(req: Request, state: &HandlerState) -> HandlerResult {
             }
 
             // ── PLAN STAGE ──
-            let (plan_output, _plan_session) = match run_pipeline_stage(
+            let (plan_output, _plan_session, plan_result_text) = match run_pipeline_stage(
                 &tx,
                 &initial_id,
                 &db_path,
@@ -6705,6 +6775,147 @@ fn handle_pipeline_start(req: Request, state: &HandlerState) -> HandlerResult {
             };
 
             let plan_json = serde_json::to_string_pretty(&plan_output).unwrap_or_default();
+
+            // ── QUESTION DETECTION AND ROUTING ──
+            let (detected_questions, _cleaned_text) = extract_pipeline_questions(&plan_result_text);
+            if !detected_questions.is_empty() {
+                tracing::info!(
+                    "detected {} questions from Plan agent for pipeline {}",
+                    detected_questions.len(),
+                    run_id
+                );
+
+                // Insert questions into DB and emit events
+                let mut question_records: Vec<(uuid::Uuid, String, Option<String>)> = Vec::new();
+                if let Ok(conn) = db::open_connection(&db_path) {
+                    for q_item in &detected_questions {
+                        let pq = nflow_core::pipeline::PipelineQuestion::new(
+                            run_id,
+                            q_item.question.clone(),
+                            q_item.context.clone(),
+                        );
+                        let q_id = pq.id;
+                        let q_text = pq.question.clone();
+                        let q_ctx = pq.context.clone();
+                        if let Err(e) = db::pipeline::insert_question(&conn, &pq) {
+                            tracing::warn!("failed to insert pipeline question: {}", e);
+                        }
+                        question_records.push((q_id, q_text, q_ctx));
+                    }
+                }
+
+                // Emit PipelineQuestion events for each question
+                for (q_id, q_text, q_ctx) in &question_records {
+                    if let Some(bus) = &event_bus {
+                        bus.broadcast(crate::events::Event::PipelineQuestion {
+                            pipeline_run_id: run_id.to_string(),
+                            question_id: q_id.to_string(),
+                            question: q_text.clone(),
+                            context: q_ctx.clone(),
+                        });
+                    }
+
+                    let _ = tx
+                        .send(StreamingResponseLine::data(
+                            initial_id.clone(),
+                            serde_json::json!({
+                                "type": "pipeline_question",
+                                "pipeline_run_id": run_id.to_string(),
+                                "question_id": q_id.to_string(),
+                                "question": q_text,
+                                "context": q_ctx,
+                            }),
+                        ))
+                        .await;
+                }
+
+                if mode == nflow_core::pipeline::PipelineMode::Auto {
+                    // Auto mode: spawn auto-answerer agents for all questions
+                    let mut answer_handles = Vec::new();
+                    for (q_id, q_text, q_ctx) in &question_records {
+                        let db_path_clone = db_path.clone();
+                        let event_bus_clone = event_bus.clone();
+                        let q_id_clone = *q_id;
+                        let q_text_clone = q_text.clone();
+                        let q_ctx_clone = q_ctx.clone();
+                        let project_path_clone = project_path.clone();
+                        let pipeline_run_id = run_id;
+
+                        let handle = tokio::spawn(async move {
+                            auto_answer_question(
+                                &db_path_clone,
+                                &event_bus_clone,
+                                pipeline_run_id,
+                                q_id_clone,
+                                &q_text_clone,
+                                q_ctx_clone.as_deref(),
+                                &project_path_clone,
+                            )
+                            .await;
+                        });
+                        answer_handles.push(handle);
+                    }
+
+                    // Wait for all auto-answerers to complete
+                    for handle in answer_handles {
+                        let _ = handle.await;
+                    }
+
+                    tracing::info!(
+                        "all {} auto-answerer agents completed for pipeline {}",
+                        question_records.len(),
+                        run_id
+                    );
+                } else {
+                    // Manual mode: wait for user to answer all questions via pipeline.answer commands
+                    let _ = tx
+                        .send(StreamingResponseLine::data(
+                            initial_id.clone(),
+                            serde_json::json!({
+                                "type": "waiting_for_answers",
+                                "pipeline_run_id": run_id.to_string(),
+                                "question_count": question_records.len(),
+                            }),
+                        ))
+                        .await;
+
+                    // Poll DB until all questions are answered
+                    loop {
+                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+                        let pending_count = if let Ok(conn) = db::open_connection(&db_path) {
+                            match db::pipeline::get_pending_questions(&conn, &run_id) {
+                                Ok(pending) => pending.len(),
+                                Err(_) => 0,
+                            }
+                        } else {
+                            0
+                        };
+
+                        if pending_count == 0 {
+                            break;
+                        }
+                    }
+
+                    tracing::info!(
+                        "all {} questions answered by user for pipeline {}",
+                        question_records.len(),
+                        run_id
+                    );
+                }
+
+                // Notify client that all questions have been answered
+                let _ = tx
+                    .send(StreamingResponseLine::data(
+                        initial_id.clone(),
+                        serde_json::json!({
+                            "type": "questions_answered",
+                            "pipeline_run_id": run_id.to_string(),
+                            "question_count": question_records.len(),
+                        }),
+                    ))
+                    .await;
+            }
 
             // ── MANUAL MODE: Plan approval gate ──
             if mode == nflow_core::pipeline::PipelineMode::Manual {
@@ -6838,7 +7049,7 @@ fn handle_pipeline_start(req: Request, state: &HandlerState) -> HandlerResult {
             }
 
             // ── IMPLEMENT STAGE ──
-            let (implement_output, _impl_session) = match run_pipeline_stage(
+            let (implement_output, _impl_session, _impl_result_text) = match run_pipeline_stage(
                 &tx,
                 &initial_id,
                 &db_path,
@@ -6896,7 +7107,7 @@ fn handle_pipeline_start(req: Request, state: &HandlerState) -> HandlerResult {
             }
 
             // ── REVIEW STAGE ──
-            let (review_output, _review_session) = match run_pipeline_stage(
+            let (review_output, _review_session, _review_result_text) = match run_pipeline_stage(
                 &tx,
                 &initial_id,
                 &db_path,
@@ -12505,5 +12716,90 @@ mod tests {
             _ => panic!("expected Single response"),
         }
         cleanup_db(&db_dir);
+    }
+
+    #[test]
+    fn test_extract_pipeline_questions_with_marker() {
+        let text = r#"I analyzed the codebase and have some questions.
+
+PIPELINE_QUESTIONS
+```json
+{
+  "questions": [
+    {
+      "question": "What auth method?",
+      "context": "Found JWT in auth.rs"
+    },
+    {
+      "question": "Use v1 or v2 API?",
+      "context": null
+    }
+  ]
+}
+```
+
+Now here is the plan:
+```json
+{"success": true, "summary": "The plan", "plan": {"steps": [], "files_to_modify": [], "rationale": "reason"}}
+```"#;
+
+        let (questions, cleaned) = extract_pipeline_questions(text);
+        assert_eq!(questions.len(), 2);
+        assert_eq!(questions[0].question, "What auth method?");
+        assert_eq!(
+            questions[0].context.as_deref(),
+            Some("Found JWT in auth.rs")
+        );
+        assert_eq!(questions[1].question, "Use v1 or v2 API?");
+        assert!(questions[1].context.is_none());
+
+        // Cleaned text should not contain PIPELINE_QUESTIONS or the questions JSON
+        assert!(!cleaned.contains("PIPELINE_QUESTIONS"));
+        assert!(!cleaned.contains("What auth method?"));
+        // But should still contain the plan JSON
+        assert!(cleaned.contains("The plan"));
+    }
+
+    #[test]
+    fn test_extract_pipeline_questions_no_marker() {
+        let text = r#"Here is the plan:
+```json
+{"success": true, "summary": "A plan", "plan": {"steps": [], "files_to_modify": [], "rationale": "r"}}
+```"#;
+
+        let (questions, cleaned) = extract_pipeline_questions(text);
+        assert!(questions.is_empty());
+        assert_eq!(cleaned, text);
+    }
+
+    #[test]
+    fn test_extract_pipeline_questions_invalid_json() {
+        let text = r#"Some text
+PIPELINE_QUESTIONS
+```json
+{not valid json}
+```
+More text"#;
+
+        let (questions, cleaned) = extract_pipeline_questions(text);
+        assert!(questions.is_empty());
+        // On parse failure, original text is returned unchanged
+        assert_eq!(cleaned, text);
+    }
+
+    #[test]
+    fn test_extract_pipeline_questions_empty_array() {
+        let text = r#"No questions needed.
+PIPELINE_QUESTIONS
+```json
+{"questions": []}
+```
+Plan follows."#;
+
+        let (questions, cleaned) = extract_pipeline_questions(text);
+        assert!(questions.is_empty());
+        // Empty array is still parsed successfully, text is cleaned
+        assert!(!cleaned.contains("PIPELINE_QUESTIONS"));
+        assert!(cleaned.contains("Plan follows."));
     }
 }

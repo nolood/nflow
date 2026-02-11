@@ -16,6 +16,10 @@ Started: Wed Feb 11 06:57:15 PM MSK 2026
 - Auto-answerer uses `extract_pipeline_json_from_text()` (same as stage output parsing) to extract JSON from Claude's response
 - `RunConfig::for_pipeline_auto_answer` limits to Read/Glob/Grep with max_turns=10 — no write/edit/bash access
 - `auto_answer_question()` in handlers.rs is the full-flow function: spawn agent → parse → save to DB → emit event
+- `extract_pipeline_questions()` parses the PIPELINE_QUESTIONS marker + ```json block from Plan agent output; returns (questions, cleaned_text)
+- `run_pipeline_stage()` returns a 3-tuple: `(StageOutput, Option<String>, String)` — the third element is raw result_text for question detection
+- For Plan stages, `run_pipeline_stage` strips PIPELINE_QUESTIONS from text before parsing plan JSON to avoid picking up questions as plan output
+- Question routing: Auto mode spawns parallel auto-answerer tasks (tokio::spawn), Manual mode polls DB every 500ms until all questions answered
 
 ---
 
@@ -103,4 +107,30 @@ Started: Wed Feb 11 06:57:15 PM MSK 2026
   - The `auto_answer_question()` function is designed to be called from US-011's question detection/routing logic
   - Auto-answerer fallback is intentionally generous — if raw text is short enough (<2000 chars), it's used as the answer; otherwise the static fallback is used
   - Note: agent_runs record creation for auto-answerer is deferred to US-011 where the actual invocation context (pipeline_run_id, etc.) is available in the executor loop
+---
+
+## 2026-02-11 - US-011
+- Implemented question detection and routing from Plan agent stream output in the pipeline executor
+- Added `PipelineQuestionsBlock` and `PipelineQuestionItem` structs for deserializing the PIPELINE_QUESTIONS JSON
+- Added `extract_pipeline_questions()` function: parses PIPELINE_QUESTIONS marker + ```json block, returns (questions, cleaned_text)
+- Modified `run_pipeline_stage()` return type to include raw `result_text` as third tuple element for caller-side question detection
+- In `run_pipeline_stage()`, Plan stages now strip PIPELINE_QUESTIONS section before parsing plan JSON
+- In executor loop (after Plan stage, before approval gate):
+  - Detects questions from `plan_result_text` using `extract_pipeline_questions()`
+  - Inserts each question into DB via `insert_question()`
+  - Emits `PipelineQuestion` events for each question
+  - Sends `pipeline_question` streaming response lines to client
+  - **Auto mode**: Spawns parallel `auto_answer_question()` tasks via `tokio::spawn`, waits for all to complete
+  - **Manual mode**: Sends `waiting_for_answers` message, polls DB every 500ms until all questions are answered
+  - After all questions answered (either mode): sends `questions_answered` notification
+  - If no questions detected, proceeds directly to plan completion (no-op)
+- Added 4 unit tests: `test_extract_pipeline_questions_with_marker`, `_no_marker`, `_invalid_json`, `_empty_array`
+- Files changed: crates/nflow-daemon/src/handlers.rs, scripts/ralph/prd.json, scripts/ralph/progress.txt
+- All tests pass: 558 daemon (554 existing + 4 new), 81 non-daemon (1 pre-existing flaky failure)
+- `cargo build --workspace` succeeds, `cargo clippy --workspace --all-targets` passes (no new warnings)
+- **Learnings for future iterations:**
+  - `extract_pipeline_questions()` strips the questions section from text and returns cleaned text — use this before `parse_pipeline_stage_output()` to avoid the questions JSON being picked up as plan output
+  - `run_pipeline_stage()` now returns a 3-tuple with raw result_text — all callers must destructure the third element (use `_` prefix if unused)
+  - For parallel async tasks within an async block, use `tokio::spawn` + clone all necessary data into the moved closure
+  - Manual mode question waiting uses DB polling (500ms interval) — simple and robust, avoids additional signal channel complexity
 ---
