@@ -127,7 +127,7 @@
         "cargo build --workspace succeeds"
       ],
       "priority": 7,
-      "passes": false,
+      "passes": true,
       "notes": ""
     },
     {
