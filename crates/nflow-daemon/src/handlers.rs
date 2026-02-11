@@ -6422,6 +6422,7 @@ fn handle_pipeline_start(req: Request, state: &HandlerState) -> HandlerResult {
         name.clone(),
         goal.clone(),
         max_iterations,
+        nflow_core::pipeline::PipelineMode::Auto,
     );
     pipeline_run.status = nflow_core::pipeline::PipelineStatus::Running;
     pipeline_run.iteration = 1;
@@ -6476,6 +6477,7 @@ fn handle_pipeline_start(req: Request, state: &HandlerState) -> HandlerResult {
                     project_id,
                     name: name.clone(),
                     goal: goal.clone(),
+                    mode: nflow_core::pipeline::PipelineMode::Auto,
                     status: nflow_core::pipeline::PipelineStatus::Running,
                     current_stage: Some(nflow_core::pipeline::PipelineStageType::Plan),
                     iteration,
@@ -6533,6 +6535,7 @@ fn handle_pipeline_start(req: Request, state: &HandlerState) -> HandlerResult {
                     project_id,
                     name: name.clone(),
                     goal: goal.clone(),
+                    mode: nflow_core::pipeline::PipelineMode::Auto,
                     status: nflow_core::pipeline::PipelineStatus::Running,
                     current_stage: Some(nflow_core::pipeline::PipelineStageType::Implement),
                     iteration,
@@ -6590,6 +6593,7 @@ fn handle_pipeline_start(req: Request, state: &HandlerState) -> HandlerResult {
                     project_id,
                     name: name.clone(),
                     goal: goal.clone(),
+                    mode: nflow_core::pipeline::PipelineMode::Auto,
                     status: nflow_core::pipeline::PipelineStatus::Running,
                     current_stage: Some(nflow_core::pipeline::PipelineStageType::Review),
                     iteration,
@@ -6630,6 +6634,7 @@ fn handle_pipeline_start(req: Request, state: &HandlerState) -> HandlerResult {
                 project_id,
                 name: name.clone(),
                 goal: goal.clone(),
+                mode: nflow_core::pipeline::PipelineMode::Auto,
                 status: nflow_core::pipeline::PipelineStatus::Running,
                 current_stage: Some(nflow_core::pipeline::PipelineStageType::Review),
                 iteration,

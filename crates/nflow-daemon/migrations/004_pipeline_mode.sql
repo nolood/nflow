@@ -1,0 +1,1 @@
+ALTER TABLE pipeline_runs ADD COLUMN mode TEXT NOT NULL DEFAULT 'auto';

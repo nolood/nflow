@@ -1,205 +1,389 @@
 {
   "project": "nflow",
-  "branchName": "ralph/daemon-full-activation",
-  "description": "Daemon Full Activation — wire socket server, migrations, crash recovery in main.rs; clean up all 32 dead code warnings; fix failing test; add nflow-core unit tests; verify all 33 CLI commands work end-to-end.",
+  "branchName": "ralph/pipeline-interactive-mode",
+  "description": "Pipeline Interactive Mode — Manual/Auto modes with Q&A, plan approval, real-time TUI streaming, CLI commands, and mandatory build/test verification",
   "userStories": [
     {
-      "id": "US-101",
-      "title": "Wire socket server startup in daemon main.rs",
-      "description": "As a developer, I want the daemon to create and listen on a Unix socket so that CLI commands can communicate with it.",
+      "id": "US-001",
+      "title": "Add PipelineMode enum and mode field to PipelineRun",
+      "description": "As a developer, I need to store the pipeline execution mode (manual/auto) in the core types so the daemon knows which flow to execute.",
       "acceptanceCriteria": [
-        "main.rs foreground_mode() calls socket::start_server() after initialization — modeled on e2e_tests.rs:56-67",
-        "HandlerState created with db_path from daemon::db_path()",
-        "create_handler(state) called to create command dispatcher",
-        "SocketServerConfig created with socket_path from daemon::socket_path(), handler, and event_bus: None",
-        "Socket created at ~/.nflow/nflow.sock with permissions 0o600",
-        "SocketServerHandle stored and used for graceful shutdown",
-        "cargo test passes",
-        "cargo clippy passes"
+        "Add PipelineMode enum { Manual, Auto } with Display, Serialize, Deserialize to nflow-core/src/pipeline.rs",
+        "Add mode: PipelineMode field to PipelineRun struct",
+        "Update PipelineRun::new() to accept mode parameter",
+        "Add pipeline_mode_to_str() and pipeline_mode_from_str() helpers in db/pipeline.rs",
+        "Update row_to_pipeline_run() and insert_pipeline_run() to handle mode field",
+        "Add new migration 004_pipeline_mode.sql: ALTER TABLE pipeline_runs ADD COLUMN mode TEXT NOT NULL DEFAULT 'auto'",
+        "Unit tests for PipelineMode Display, serialization round-trip",
+        "cargo build --workspace succeeds",
+        "cargo clippy --workspace --all-targets passes"
       ],
       "priority": 1,
       "passes": true,
       "notes": ""
     },
     {
-      "id": "US-102",
-      "title": "Wire database migrations on daemon start",
-      "description": "As a developer, I want migrations to run automatically when the daemon starts so that the schema is always up to date.",
+      "id": "US-002",
+      "title": "Add WaitingForApproval and WaitingForFinalApproval pipeline statuses",
+      "description": "As a developer, I need new pipeline states for manual mode approval gates so the pipeline can pause and wait for user decisions.",
       "acceptanceCriteria": [
-        "db::run_migrations() called in foreground_mode() after opening DB connection",
-        "Migration 001_init.sql applied on first start (creates all tables)",
-        "Re-running daemon does not re-apply migrations (idempotent)",
-        "MIGRATIONS constant in db/mod.rs is no longer dead code",
-        "DbError::Migration variant is no longer dead code",
-        "current_version() and backup_db() are no longer dead code",
-        "cargo test passes",
-        "cargo clippy passes"
+        "Add PipelineStatus::WaitingForApproval variant",
+        "Add PipelineStatus::WaitingForFinalApproval variant",
+        "Update PipelineStatus Display impl for both new variants",
+        "Update pipeline_status_to_str() and pipeline_status_from_str() in db/pipeline.rs",
+        "Update next_action() in pipeline.rs: accept &PipelineMode parameter; after Review passes in Manual mode, return new PipelineAction::WaitForFinalApproval instead of Complete",
+        "Add PipelineAction::WaitForApproval variant (used after Plan completes in Manual mode)",
+        "Add PipelineAction::WaitForFinalApproval variant",
+        "Update existing next_action tests, add tests for manual mode transitions",
+        "cargo build --workspace succeeds",
+        "cargo test -p nflow-core passes"
       ],
       "priority": 2,
-      "passes": true,
+      "passes": false,
       "notes": ""
     },
     {
-      "id": "US-103",
-      "title": "Wire crash recovery on daemon start",
-      "description": "As a developer, I want the daemon to recover from previous crashes on startup so that stale state does not block execution.",
+      "id": "US-003",
+      "title": "Add PipelineQuestion type and pipeline_questions DB table",
+      "description": "As a developer, I need a PipelineQuestion struct and database table to store planning questions and answers.",
       "acceptanceCriteria": [
-        "recovery::recover_session_state() called in foreground_mode() after migrations, before socket server",
-        "Stale agents (dead PIDs) marked as failed in DB",
-        "Orphaned in-progress tasks marked as failed",
-        "Active spec sessions reset",
-        "Stale socket and PID files cleaned up",
-        "RecoveryReport logged at info level",
-        "All recovery functions in recovery.rs are no longer dead code warnings",
-        "cargo test passes",
-        "cargo clippy passes"
+        "Add PipelineQuestion struct to nflow-core/src/pipeline.rs: { id: Uuid, pipeline_run_id: Uuid, question: String, context: Option<String>, answered: bool, answer: Option<String>, answered_by: Option<String>, created_at: DateTime<Utc>, answered_at: Option<DateTime<Utc>> }",
+        "Add pipeline_questions table in migration 004_pipeline_mode.sql (same file as US-001): CREATE TABLE pipeline_questions (id TEXT PK, pipeline_run_id TEXT FK, question TEXT NOT NULL, context TEXT, answered INTEGER NOT NULL DEFAULT 0, answer TEXT, answered_by TEXT, created_at TEXT NOT NULL, answered_at TEXT)",
+        "Add DB functions in db/pipeline.rs: insert_question(), get_pending_questions(pipeline_run_id), answer_question(id, answer, answered_by)",
+        "Add row_to_pipeline_question() mapper",
+        "Unit tests: insert question, get pending, answer a question and verify answered=true",
+        "cargo build --workspace succeeds",
+        "cargo test passes"
       ],
       "priority": 3,
-      "passes": true,
+      "passes": false,
       "notes": ""
     },
     {
-      "id": "US-104",
-      "title": "Clean up dead code — daemon spawning functions",
-      "description": "As a developer, I want to eliminate dead code warnings for daemon spawn and PID functions so that the codebase is clean.",
+      "id": "US-004",
+      "title": "Add pipeline Q&A and approval events to EventBus",
+      "description": "As a developer, I need new event variants for pipeline questions, answers, and approval gates so TUI/CLI can react in real-time.",
       "acceptanceCriteria": [
-        "spawn_daemon(), spawn_daemon_foreground(), spawn_daemon_with_mode() — either wired into CLI daemon_client.rs for 'nflow daemon start' or removed",
-        "is_daemon_running() — wired into CLI or removed",
-        "read_pid_file(), remove_pid_file() — wired into usage or removed",
-        "If functions moved to nflow-cli, update Cargo.toml dependencies",
-        "If functions made pub and used cross-crate, verify they are actually called",
-        "cargo build shows 0 warnings for daemon.rs",
-        "cargo test passes",
-        "cargo clippy passes"
+        "Add Event::PipelineQuestion { pipeline_run_id: String, question_id: String, question: String, context: Option<String> }",
+        "Add Event::PipelineQuestionAnswered { pipeline_run_id: String, question_id: String, answer: String, answered_by: String }",
+        "Add Event::PipelinePlanReady { pipeline_run_id: String, project_id: String, plan_summary: String }",
+        "Add Event::PipelinePlanApproved { pipeline_run_id: String }",
+        "Add Event::PipelinePlanRejected { pipeline_run_id: String, feedback: String }",
+        "Add Event::PipelineFinalApprovalReady { pipeline_run_id: String, project_id: String, summary: String }",
+        "Add Event::PipelineFinalApproved { pipeline_run_id: String }",
+        "Add Event::PipelineFinalRejected { pipeline_run_id: String, feedback: String }",
+        "Serialization tests for all new event variants",
+        "cargo build --workspace succeeds",
+        "cargo test passes"
       ],
       "priority": 4,
-      "passes": true,
+      "passes": false,
       "notes": ""
     },
     {
-      "id": "US-105",
-      "title": "Clean up dead code — DB queries, handlers, imports",
-      "description": "As a developer, I want to eliminate all remaining dead code warnings across the daemon crate.",
+      "id": "US-005",
+      "title": "Add pipeline.answer command handler in daemon",
+      "description": "As a developer, I need a pipeline.answer command handler so users/auto-agents can submit answers to planning questions.",
       "acceptanceCriteria": [
-        "list_specs_by_status() — wired into spec.list handler as optional filter or removed",
-        "reset_active_sessions() — wired into recovery or removed",
-        "count_tasks_by_status() — wired into exec.status handler or removed",
-        "find_running_agent_runs_by_session() — wired into usage or removed",
-        "read_process_start_time() in recovery.rs — consolidated with platform::get_pid_start_time() or removed",
-        "Unused state parameter in handle_cleanup_logs() — used or renamed to _state",
-        "Unused import get_pid_start_time in recovery.rs — removed",
-        "cargo build 2>&1 | grep 'warning:' | wc -l equals 0",
-        "cargo test passes",
-        "cargo clippy passes"
+        "New handler for 'pipeline.answer' command in handlers.rs",
+        "Params: { pipeline_run_id, question_id, answer }",
+        "Validates pipeline exists and is in Running state with current_stage=Plan",
+        "Calls db::pipeline::answer_question() to save the answer",
+        "Emits Event::PipelineQuestionAnswered via event bus",
+        "Returns { status: ok, data: { answered: true } }",
+        "Returns error if question not found or already answered",
+        "cargo build --workspace succeeds"
       ],
       "priority": 5,
-      "passes": true,
+      "passes": false,
       "notes": ""
     },
     {
-      "id": "US-106",
-      "title": "Fix failing test test_acquire_lock_contention",
-      "description": "As a developer, I want the lock contention test to pass reliably so that CI is green.",
+      "id": "US-006",
+      "title": "Add pipeline.approve and pipeline.reject command handlers",
+      "description": "As a developer, I need approve/reject handlers so users can approve plans and final results in manual mode.",
       "acceptanceCriteria": [
-        "test_acquire_lock_contention in daemon_client.rs passes consistently",
-        "Timing assertion relaxed: use elapsed >= 200ms instead of >= 400ms, or use polling-based check instead of strict timing",
-        "Test works on fast machines and in CI environments",
-        "cargo test -p nflow-cli shows 0 failures",
-        "cargo test (full workspace) shows 0 failures"
+        "New handler for 'pipeline.approve' command: if WaitingForApproval → emit PipelinePlanApproved, transition to Running + start Implement stage; if WaitingForFinalApproval → emit PipelineFinalApproved, transition to Completed",
+        "New handler for 'pipeline.reject' command: params include feedback string; if WaitingForApproval → emit PipelinePlanRejected, restart Plan with feedback; if WaitingForFinalApproval → emit PipelineFinalRejected, increment iteration, go back to Implement with feedback",
+        "Reject checks max_iterations — if exceeded, mark Failed",
+        "Both handlers validate pipeline exists and is in expected state",
+        "Returns appropriate error for invalid state transitions",
+        "cargo build --workspace succeeds"
       ],
       "priority": 6,
-      "passes": true,
+      "passes": false,
       "notes": ""
     },
     {
-      "id": "US-107",
-      "title": "Unit tests for nflow-core — DAG and scheduler",
-      "description": "As a developer, I want unit tests for DAG and scheduler logic in nflow-core so that core algorithms are verified at the source.",
+      "id": "US-007",
+      "title": "Add pipeline.questions command handler",
+      "description": "As a developer, I need a handler to list pending questions for a pipeline so CLI/TUI can display them.",
       "acceptanceCriteria": [
-        "Tests for dag.rs: empty DAG, single node, linear chain, diamond dependency, cycle detection, topological sort order",
-        "Tests for scheduler.rs: pick ready tasks with no deps, respect max_parallel, skip blocked tasks, handle all-done state",
-        "All tests in crates/nflow-core/src/ (not daemon integration tests)",
-        "Minimum 15 tests across dag.rs and scheduler.rs",
-        "cargo test -p nflow-core passes",
-        "Typecheck passes"
+        "New handler for 'pipeline.questions' command in handlers.rs",
+        "Params: { pipeline_run_id }",
+        "Calls db::pipeline::get_pending_questions() to fetch unanswered questions",
+        "Returns { status: ok, data: { questions: [...] } } with question id, text, context",
+        "Returns empty array if no pending questions",
+        "cargo build --workspace succeeds"
       ],
       "priority": 7,
-      "passes": true,
-      "notes": "Already had 35 dag tests + 30 scheduler tests = 65 total (far exceeds min 15). All 270 nflow-core tests pass. Clippy clean."
+      "passes": false,
+      "notes": ""
     },
     {
-      "id": "US-108",
-      "title": "Unit tests for nflow-core — state machines",
-      "description": "As a developer, I want unit tests for work item and spec state machines in nflow-core.",
+      "id": "US-008",
+      "title": "Update pipeline executor for manual mode approval gates",
+      "description": "As a developer, I need the pipeline executor tokio task to pause at approval gates in manual mode and resume when approve/reject commands arrive.",
       "acceptanceCriteria": [
-        "Tests for work_item.rs: valid transitions (pending->in_progress->done, pending->in_progress->failed), invalid transitions rejected, verify task state machine",
-        "Tests for spec.rs: draft->approved, approved->decomposed, approved->draft (reopen), invalid transitions rejected, session_active toggling",
-        "All tests in crates/nflow-core/src/",
-        "Minimum 15 tests across work_item.rs and spec.rs",
-        "cargo test -p nflow-core passes",
-        "Typecheck passes"
+        "Pipeline executor checks mode after Plan stage completes: if Manual → update DB status to WaitingForApproval, emit PipelinePlanReady, wait on tokio::sync::Notify",
+        "pipeline.approve handler triggers the Notify to resume executor",
+        "pipeline.reject handler triggers the Notify with rejection flag, executor restarts Plan with feedback",
+        "After Review passes in Manual mode: update DB to WaitingForFinalApproval, emit PipelineFinalApprovalReady, wait on Notify",
+        "pipeline.approve (final) triggers Notify, executor marks Completed",
+        "pipeline.reject (final) triggers Notify with feedback, executor loops back to Implement",
+        "Store Notify handle in a shared map keyed by pipeline_run_id",
+        "cargo build --workspace succeeds"
       ],
       "priority": 8,
-      "passes": true,
-      "notes": "Already had 68 work_item tests + 23 spec tests = 91 total (far exceeds min 15). Covers all valid/invalid transitions, verify task state machine, session_active toggling. All 270 nflow-core tests pass. Clippy clean."
+      "passes": false,
+      "notes": ""
     },
     {
-      "id": "US-109",
-      "title": "Unit tests for nflow-core — IDs, decomposition, config, project",
-      "description": "As a developer, I want unit tests for short IDs, decomposition, config, and project models in nflow-core.",
+      "id": "US-009",
+      "title": "Update pipeline_plan.md prompt for structured question output",
+      "description": "As a developer, I need the Plan stage prompt to instruct Claude to output questions in a structured JSON format so the daemon can parse and route them.",
       "acceptanceCriteria": [
-        "Tests for short_id.rs: parse E1/S1/T1/T1v, round-trip format/parse, invalid IDs rejected, wave-prefixed IDs (W1-S1)",
-        "Tests for decomposition.rs: validate epic->story->task structure, reject missing stories, reject orphan tasks",
-        "Tests for config.rs: default values, merge override, partial merge",
-        "Tests for project.rs: create with valid fields, reject empty name, git provider detection from URL",
-        "All tests in crates/nflow-core/src/",
-        "Minimum 20 tests across these modules",
-        "cargo test -p nflow-core passes",
-        "Typecheck passes"
+        "Update prompts/pipeline_plan.md: add section instructing Claude to output questions as JSON array BEFORE the plan",
+        "Question format: { \"questions\": [{ \"question\": \"...\", \"context\": \"...\" }] } wrapped in ```json block with a marker like PIPELINE_QUESTIONS",
+        "Prompt instructs: first explore the codebase, then ask questions about ambiguous requirements, then produce the plan",
+        "If no questions needed, skip the questions block entirely",
+        "cargo build --workspace succeeds (prompts are embedded at compile time)"
       ],
       "priority": 9,
-      "passes": true,
-      "notes": "Already had 50 short_id tests + 21 decomposition tests + 28 config tests + 15 project tests = 114 total (far exceeds min 20). Covers parsing/round-trip/invalid IDs, epic->story->task structure, default values/merge/partial merge, project creation/validation/git detection. All 270 nflow-core tests pass. Clippy clean."
+      "passes": false,
+      "notes": ""
     },
     {
-      "id": "US-110",
-      "title": "E2E test — real daemon binary socket lifecycle",
-      "description": "As a developer, I want an E2E test that starts the actual nflow-daemon binary and verifies socket communication works.",
+      "id": "US-010",
+      "title": "Create auto-answerer agent prompt and spawning logic",
+      "description": "As a developer, I need a new prompt template and agent spawning logic for the auto-answerer that searches the codebase to answer planning questions.",
       "acceptanceCriteria": [
-        "Test spawns nflow-daemon binary as child process with NFLOW_HOME set to temp directory",
-        "Polls for socket file creation with 10s timeout",
-        "Performs NDJSON handshake (protocol_version: 1)",
-        "Sends project.init command and receives success response",
-        "Sends project.list and sees the created project in response",
-        "Sends SIGTERM to daemon, verifies socket file removed and PID file removed",
-        "Test uses tempdir for full isolation",
-        "Test passes within 30 seconds",
-        "cargo test passes"
+        "Create new prompts/pipeline_auto_answer.md with variables: {question}, {context}",
+        "Prompt instructs: search the codebase using Read/Glob/Grep, find relevant code/patterns, provide a concrete answer; if not found, recommend a sensible default with rationale",
+        "Output format: { \"answer\": \"...\", \"confidence\": \"high|medium|low\", \"sources\": [\"file paths consulted\"] }",
+        "In daemon pipeline executor: when question detected in auto mode, spawn Claude process via nflow-claude with --allowedTools 'Read,Glob,Grep' --max-turns 10",
+        "Set 60 second timeout on the spawned process",
+        "Parse auto-answerer output, call db::pipeline::answer_question with answered_by='auto-agent'",
+        "If auto-answerer fails or times out: use fallback answer 'Proceed with your best judgment based on codebase analysis' and log warning",
+        "Create new agent_runs record with run_type='auto-answerer'",
+        "Emit PipelineQuestionAnswered event",
+        "cargo build --workspace succeeds"
       ],
       "priority": 10,
-      "passes": true,
-      "notes": "3 binary E2E tests: socket lifecycle (spawn→handshake→init→list→SIGTERM→cleanup), database initialization, multiple concurrent clients. All pass within 6s. Uses std::os::unix::net::UnixStream (sync) for simplicity."
+      "passes": false,
+      "notes": ""
     },
     {
-      "id": "US-111",
-      "title": "Verify all CLI commands work with running daemon",
-      "description": "As a developer, I want to verify that every CLI command group produces correct results when connected to a running daemon.",
+      "id": "US-011",
+      "title": "Detect and route questions from Plan agent stream output",
+      "description": "As a developer, I need the pipeline executor to detect structured question JSON from the Plan agent's stream-json output and route them to either user or auto-answerer.",
       "acceptanceCriteria": [
-        "Test starts daemon with temp NFLOW_HOME",
-        "project group: init succeeds, projects list shows project, project delete removes it",
-        "spec group: spec list returns empty for new project, spec approve on nonexistent returns NOT_FOUND error",
-        "plan group: plan show on project with no plans returns appropriate message",
-        "exec group: exec status on project with no execution returns appropriate message",
-        "worktree group: worktree list returns empty for new project",
-        "config group: config show returns valid config, config set updates value",
-        "cleanup group: cleanup --logs succeeds",
-        "All error responses have proper status='error' and descriptive messages",
-        "Test passes within 30 seconds",
-        "cargo test passes"
+        "Pipeline executor parses Plan agent stream output looking for PIPELINE_QUESTIONS marker + JSON block",
+        "When questions detected: insert each into DB via insert_question(), emit PipelineQuestion events",
+        "If mode=Manual: pause execution (questions are shown to user, they answer via pipeline.answer command)",
+        "If mode=Auto: for each question, spawn auto-answerer agent (US-010), wait for all answers, then feed answers back into Plan agent context",
+        "Questions are batch-style: all questions emitted at once, all must be answered before plan continues",
+        "If no questions detected in output, proceed directly to plan completion",
+        "cargo build --workspace succeeds"
       ],
       "priority": 11,
-      "passes": true,
-      "notes": "Single comprehensive binary E2E test exercises all 7 command groups: project (init→list→delete), spec (list empty, approve NOT_FOUND), plan (show no waves), exec (status empty), worktree (list empty), config (show→set→verify), cleanup (logs). Also validates error format for unknown commands and missing params. Passes in ~2s."
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-012",
+      "title": "Update pipeline_implement.md prompt with mandatory build/test",
+      "description": "As a developer, I need the Implement stage prompt to require the agent to build and test before completing.",
+      "acceptanceCriteria": [
+        "Update prompts/pipeline_implement.md: add mandatory section 'After making all code changes, you MUST: 1) Run the project build command, 2) Run the project test suite, 3) Report results in output'",
+        "Prompt instructs agent to detect build system: look for Cargo.toml (cargo build/test), package.json (npm run build/test), Makefile, etc.",
+        "Add build_result and test_result fields to expected output JSON schema in the prompt",
+        "build_result: { success: bool, output: string }, test_result: { success: bool, output: string, tests_passed: number, tests_failed: number }",
+        "If build fails, agent MUST set success: false in its output",
+        "Add ImplementBuildResult and ImplementTestResult structs to nflow-core/src/pipeline.rs",
+        "Update ImplementOutput struct to include optional build_result and test_result fields",
+        "cargo build --workspace succeeds"
+      ],
+      "priority": 12,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-013",
+      "title": "Real-time agent output streaming in TUI pipeline detail view",
+      "description": "As a user, I want to see live agent output in the TUI when viewing a running pipeline stage.",
+      "acceptanceCriteria": [
+        "Add pipeline_output_buffer: VecDeque<String> with capacity 1000 to App struct in nflow-tui/src/app.rs",
+        "Add pipeline_output_scroll: usize field for scroll position, pipeline_auto_scroll: bool field (default true)",
+        "In event handler: when PipelineAgentOutput event received, push line to buffer (pop front if > 1000)",
+        "In pipeline detail view (ui.rs render_pipeline_detail): add scrollable output pane below stages list",
+        "Output pane auto-scrolls to bottom when pipeline_auto_scroll is true",
+        "k/arrow-up scrolls up and sets auto_scroll=false; when user scrolls to bottom, auto_scroll re-enables",
+        "j/arrow-down scrolls down in the output pane",
+        "When switching between pipeline runs (different pipeline selected), clear the output buffer",
+        "Stage status indicators: spinner char for running, checkmark for completed, X for failed (reuse existing spinner_char())",
+        "cargo build --workspace succeeds"
+      ],
+      "priority": 13,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-014",
+      "title": "Pipeline question dialog overlay in TUI",
+      "description": "As a user in manual mode, I want to see questions from Claude and answer them in the TUI.",
+      "acceptanceCriteria": [
+        "Add PipelineQuestionOverlay variant to Overlay enum in app.rs with fields: questions: Vec<PipelineQuestion>, current_index: usize, answer_input: String",
+        "When PipelineQuestion event received for current pipeline in manual mode: push to pending questions list, open overlay if not already open",
+        "Render question dialog: question text at top, context below (if any), text input at bottom",
+        "Enter submits answer (sends pipeline.answer command to daemon), advances to next question or closes overlay",
+        "Esc dismisses overlay temporarily (questions still pending, re-openable with 'q' key)",
+        "Show question count badge in pipeline list: e.g. '2 questions' next to pipeline entry",
+        "cargo build --workspace succeeds"
+      ],
+      "priority": 14,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-015",
+      "title": "Plan approval and final approval UI in TUI",
+      "description": "As a user in manual mode, I want to approve or reject the plan and final result in the TUI.",
+      "acceptanceCriteria": [
+        "When pipeline status changes to WaitingForApproval: show plan output in detail view with approval controls",
+        "Plan text rendered with existing markdown_to_lines() function in a scrollable pane",
+        "Keybinding 'a': sends pipeline.approve command, keybinding 'r': opens text input for rejection feedback then sends pipeline.reject",
+        "Status bar shows 'Awaiting plan approval' in yellow when WaitingForApproval",
+        "When pipeline status changes to WaitingForFinalApproval: show summary of all iteration changes with approval controls",
+        "Same keybindings for final approval (a/r)",
+        "Status bar shows 'Awaiting final approval' in yellow when WaitingForFinalApproval",
+        "After approval, UI transitions smoothly to next state (no stale display)",
+        "cargo build --workspace succeeds"
+      ],
+      "priority": 15,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-016",
+      "title": "Add mode selector to TUI new pipeline dialog",
+      "description": "As a user creating a new pipeline in TUI, I want to choose between Manual and Automatic mode.",
+      "acceptanceCriteria": [
+        "Add mode: PipelineMode field to PipelineNewState in app.rs (default: Auto)",
+        "Add third field to the dialog: Mode selector showing 'Manual' or 'Auto'",
+        "Tab cycles through: Description → Max Iterations → Mode → Description",
+        "Left/Right arrow keys toggle between Manual and Auto in the mode field",
+        "Selected mode included in pipeline.start command params when submitting",
+        "Mode displayed in pipeline list view as a badge/column (M for manual, A for auto)",
+        "Update PipelineRunItem to include mode field, populate from daemon response",
+        "cargo build --workspace succeeds"
+      ],
+      "priority": 16,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-017",
+      "title": "CLI pipeline subcommand group — start, list, status, cancel, log",
+      "description": "As a user, I want basic pipeline management commands in CLI.",
+      "acceptanceCriteria": [
+        "Add Pipeline subcommand to cli.rs: nflow pipeline <subcommand>",
+        "pipeline start '<description>' --mode manual|auto --max-iterations N: sends pipeline.start, streams output to stdout",
+        "pipeline list: sends pipeline.list, prints table (ID, Description, Mode, State, Iteration, Created)",
+        "pipeline status <pipeline-id>: sends pipeline.status, prints detail + stage history",
+        "pipeline cancel <pipeline-id>: sends pipeline.cancel, prints confirmation",
+        "pipeline log <pipeline-id> --stage plan|implement|review --iteration N: sends pipeline.log, streams output",
+        "All commands use existing SocketClient for daemon communication",
+        "IMPORTANT: After cargo build, restart daemon before testing CLI commands",
+        "cargo build --workspace succeeds",
+        "cargo clippy --workspace --all-targets passes"
+      ],
+      "priority": 17,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-018",
+      "title": "CLI pipeline approval and Q&A commands",
+      "description": "As a user in manual mode, I want to approve/reject plans and answer questions from the CLI.",
+      "acceptanceCriteria": [
+        "pipeline approve <pipeline-id>: sends pipeline.approve (context-aware based on current state), prints result",
+        "pipeline reject <pipeline-id> '<feedback>': sends pipeline.reject with feedback, prints result",
+        "pipeline answer <pipeline-id> <question-id> '<answer>': sends pipeline.answer, prints confirmation",
+        "pipeline questions <pipeline-id>: sends pipeline.questions, prints table of pending questions (ID, Question, Context)",
+        "All commands return clear error messages for invalid states",
+        "IMPORTANT: After cargo build, restart daemon before testing CLI commands",
+        "cargo build --workspace succeeds",
+        "cargo clippy --workspace --all-targets passes"
+      ],
+      "priority": 18,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-019",
+      "title": "Interactive CLI mode for manual pipeline with stdin questions",
+      "description": "As a user running nflow pipeline start --mode manual, I want questions to appear inline and prompt me for answers interactively.",
+      "acceptanceCriteria": [
+        "When pipeline.start streaming response includes PipelineQuestion events in manual mode: print question to stdout and read answer from stdin",
+        "Format: 'Question: <text>\\nContext: <context>\\nYour answer: ' with stdin readline",
+        "After user types answer and presses Enter: sends pipeline.answer command",
+        "When PipelinePlanReady received: print plan summary and ask 'Approve? (y/n/feedback): '",
+        "y sends pipeline.approve, n prompts for feedback and sends pipeline.reject",
+        "Same interactive flow for PipelineFinalApprovalReady",
+        "Non-interactive fallback: if stdin is not a tty, skip interactive prompts and treat as auto mode",
+        "IMPORTANT: After cargo build, restart daemon before testing CLI commands",
+        "cargo build --workspace succeeds"
+      ],
+      "priority": 19,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-020",
+      "title": "Update pipeline.start handler to accept mode parameter",
+      "description": "As a developer, I need the daemon's pipeline.start command handler to accept and store the mode parameter.",
+      "acceptanceCriteria": [
+        "Update pipeline.start handler in handlers.rs to parse 'mode' from params (default: 'auto')",
+        "Pass mode to PipelineRun::new()",
+        "Store mode in DB via insert_pipeline_run()",
+        "Mode included in pipeline.status and pipeline.list response data",
+        "Update PipelineStageChange and PipelineCompleted events to include mode for client routing",
+        "Existing pipeline start flow (auto mode) still works identically",
+        "cargo build --workspace succeeds"
+      ],
+      "priority": 20,
+      "passes": false,
+      "notes": "This should be done early but depends on US-001 mode field being in place"
+    },
+    {
+      "id": "US-021",
+      "title": "Build and run end-to-end CLI verification",
+      "description": "As a developer, after implementing all features I must build and verify everything works.",
+      "acceptanceCriteria": [
+        "cargo build --workspace completes with no errors",
+        "cargo test --workspace --exclude nflow-daemon passes",
+        "cargo test -p nflow-daemon -- --test-threads=1 passes",
+        "cargo clippy --workspace --all-targets passes with no warnings",
+        "cargo build --release succeeds",
+        "IMPORTANT: After build, restart daemon before testing CLI commands",
+        "./target/release/nflow pipeline --help shows all subcommands: start, list, status, cancel, log, approve, reject, answer, questions",
+        "./target/release/nflow pipeline list returns valid output against running daemon",
+        "All new daemon command handlers respond correctly via socket protocol"
+      ],
+      "priority": 21,
+      "passes": false,
+      "notes": ""
     }
   ]
 }

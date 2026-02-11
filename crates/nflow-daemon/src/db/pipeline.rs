@@ -3,12 +3,26 @@ use rusqlite::{params, Connection, Row};
 use uuid::Uuid;
 
 use nflow_core::pipeline::{
-    PipelineRun, PipelineStage, PipelineStageType, PipelineStatus, StageStatus,
+    PipelineMode, PipelineRun, PipelineStage, PipelineStageType, PipelineStatus, StageStatus,
 };
 
 use super::Result;
 
 // ─── Status Conversions ──────────────────────────────────
+
+pub fn pipeline_mode_to_str(m: PipelineMode) -> &'static str {
+    match m {
+        PipelineMode::Manual => "manual",
+        PipelineMode::Auto => "auto",
+    }
+}
+
+pub fn pipeline_mode_from_str(s: &str) -> PipelineMode {
+    match s {
+        "manual" => PipelineMode::Manual,
+        _ => PipelineMode::Auto,
+    }
+}
 
 fn pipeline_status_to_str(s: PipelineStatus) -> &'static str {
     match s {
@@ -79,6 +93,7 @@ fn row_to_pipeline_run(row: &Row<'_>) -> rusqlite::Result<PipelineRun> {
     let project_id_str: String = row.get("project_id")?;
     let name: String = row.get("name")?;
     let goal: String = row.get("goal")?;
+    let mode_str: String = row.get("mode")?;
     let status_str: String = row.get("status")?;
     let current_stage_str: Option<String> = row.get("current_stage")?;
     let iteration: u32 = row.get("iteration")?;
@@ -91,6 +106,7 @@ fn row_to_pipeline_run(row: &Row<'_>) -> rusqlite::Result<PipelineRun> {
         project_id: parse_uuid(&project_id_str),
         name,
         goal,
+        mode: pipeline_mode_from_str(&mode_str),
         status: pipeline_status_from_str(&status_str),
         current_stage: current_stage_str.map(|s| stage_type_from_str(&s)),
         iteration,
@@ -132,13 +148,14 @@ fn row_to_pipeline_stage(row: &Row<'_>) -> rusqlite::Result<PipelineStage> {
 
 pub fn insert_pipeline_run(conn: &Connection, run: &PipelineRun) -> Result<()> {
     conn.execute(
-        "INSERT INTO pipeline_runs (id, project_id, name, goal, status, current_stage, iteration, max_iterations, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        "INSERT INTO pipeline_runs (id, project_id, name, goal, mode, status, current_stage, iteration, max_iterations, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
         params![
             run.id.to_string(),
             run.project_id.to_string(),
             run.name,
             run.goal,
+            pipeline_mode_to_str(run.mode),
             pipeline_status_to_str(run.status),
             run.current_stage.map(|s| stage_type_to_str(s)),
             run.iteration,
@@ -152,7 +169,7 @@ pub fn insert_pipeline_run(conn: &Connection, run: &PipelineRun) -> Result<()> {
 
 pub fn get_pipeline_run(conn: &Connection, id: &Uuid) -> Result<Option<PipelineRun>> {
     let mut stmt = conn.prepare(
-        "SELECT id, project_id, name, goal, status, current_stage, iteration, max_iterations, created_at, updated_at
+        "SELECT id, project_id, name, goal, mode, status, current_stage, iteration, max_iterations, created_at, updated_at
          FROM pipeline_runs WHERE id = ?1",
     )?;
     let mut rows = stmt.query_map(params![id.to_string()], row_to_pipeline_run)?;
@@ -164,7 +181,7 @@ pub fn get_pipeline_run(conn: &Connection, id: &Uuid) -> Result<Option<PipelineR
 
 pub fn list_pipeline_runs(conn: &Connection, project_id: &Uuid) -> Result<Vec<PipelineRun>> {
     let mut stmt = conn.prepare(
-        "SELECT id, project_id, name, goal, status, current_stage, iteration, max_iterations, created_at, updated_at
+        "SELECT id, project_id, name, goal, mode, status, current_stage, iteration, max_iterations, created_at, updated_at
          FROM pipeline_runs WHERE project_id = ?1 ORDER BY created_at DESC",
     )?;
     let rows = stmt.query_map(params![project_id.to_string()], row_to_pipeline_run)?;
@@ -180,7 +197,7 @@ pub fn get_active_pipeline_run(
     project_id: &Uuid,
 ) -> Result<Option<PipelineRun>> {
     let mut stmt = conn.prepare(
-        "SELECT id, project_id, name, goal, status, current_stage, iteration, max_iterations, created_at, updated_at
+        "SELECT id, project_id, name, goal, mode, status, current_stage, iteration, max_iterations, created_at, updated_at
          FROM pipeline_runs WHERE project_id = ?1 AND status = 'running' LIMIT 1",
     )?;
     let mut rows = stmt.query_map(params![project_id.to_string()], row_to_pipeline_run)?;

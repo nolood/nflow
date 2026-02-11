@@ -6,6 +6,23 @@ use uuid::Uuid;
 
 // ─── Enums ───────────────────────────────────────────────
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PipelineMode {
+    Manual,
+    #[default]
+    Auto,
+}
+
+impl fmt::Display for PipelineMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            PipelineMode::Manual => write!(f, "manual"),
+            PipelineMode::Auto => write!(f, "auto"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum PipelineStatus {
@@ -74,6 +91,7 @@ pub struct PipelineRun {
     pub project_id: Uuid,
     pub name: String,
     pub goal: String,
+    pub mode: PipelineMode,
     pub status: PipelineStatus,
     pub current_stage: Option<PipelineStageType>,
     pub iteration: u32,
@@ -83,13 +101,20 @@ pub struct PipelineRun {
 }
 
 impl PipelineRun {
-    pub fn new(project_id: Uuid, name: String, goal: String, max_iterations: u32) -> Self {
+    pub fn new(
+        project_id: Uuid,
+        name: String,
+        goal: String,
+        max_iterations: u32,
+        mode: PipelineMode,
+    ) -> Self {
         let now = Utc::now();
         Self {
             id: Uuid::new_v4(),
             project_id,
             name,
             goal,
+            mode,
             status: PipelineStatus::Pending,
             current_stage: None,
             iteration: 0,
@@ -258,6 +283,7 @@ mod tests {
             project_id: Uuid::new_v4(),
             name: "test".to_string(),
             goal: "test goal".to_string(),
+            mode: PipelineMode::Auto,
             status: PipelineStatus::Running,
             current_stage: Some(PipelineStageType::Plan),
             iteration,
@@ -319,11 +345,13 @@ mod tests {
             "test-pipeline".to_string(),
             "build feature X".to_string(),
             5,
+            PipelineMode::Auto,
         );
 
         assert_eq!(run.project_id, project_id);
         assert_eq!(run.name, "test-pipeline");
         assert_eq!(run.goal, "build feature X");
+        assert_eq!(run.mode, PipelineMode::Auto);
         assert_eq!(run.status, PipelineStatus::Pending);
         assert_eq!(run.current_stage, None);
         assert_eq!(run.iteration, 0);
@@ -521,5 +549,43 @@ mod tests {
         assert_eq!(parsed.iteration, 2);
         assert_eq!(parsed.history.len(), 1);
         assert_eq!(parsed.history[0].iteration, 1);
+    }
+
+    // ─── PipelineMode tests ─────────────────────────────
+
+    #[test]
+    fn pipeline_mode_display() {
+        assert_eq!(PipelineMode::Manual.to_string(), "manual");
+        assert_eq!(PipelineMode::Auto.to_string(), "auto");
+    }
+
+    #[test]
+    fn pipeline_mode_default_is_auto() {
+        assert_eq!(PipelineMode::default(), PipelineMode::Auto);
+    }
+
+    #[test]
+    fn pipeline_mode_serialization_round_trip() {
+        let auto_json = serde_json::to_string(&PipelineMode::Auto).unwrap();
+        assert_eq!(auto_json, "\"auto\"");
+        let parsed: PipelineMode = serde_json::from_str(&auto_json).unwrap();
+        assert_eq!(parsed, PipelineMode::Auto);
+
+        let manual_json = serde_json::to_string(&PipelineMode::Manual).unwrap();
+        assert_eq!(manual_json, "\"manual\"");
+        let parsed: PipelineMode = serde_json::from_str(&manual_json).unwrap();
+        assert_eq!(parsed, PipelineMode::Manual);
+    }
+
+    #[test]
+    fn pipeline_run_new_with_manual_mode() {
+        let run = PipelineRun::new(
+            Uuid::new_v4(),
+            "test".to_string(),
+            "goal".to_string(),
+            5,
+            PipelineMode::Manual,
+        );
+        assert_eq!(run.mode, PipelineMode::Manual);
     }
 }
