@@ -8,9 +8,13 @@ use uuid::Uuid;
 use crate::db::agent_runs::{
     find_running_agent_runs, update_agent_run_status, AgentRun, AgentRunStatus,
 };
+use crate::db::decomposition_sessions::{
+    find_approved_sessions, find_failed_sessions, find_in_progress_sessions, update_session_status,
+};
 use crate::db::work_items::update_work_item_status;
 use crate::db::Result;
 use crate::platform::ProcessState;
+use nflow_core::decomposition::DecompositionStatus;
 use nflow_core::work_item::WorkItemStatus;
 
 // Re-export platform functions for backwards compatibility with existing consumers.
@@ -200,6 +204,41 @@ pub fn find_completed_in_progress_stories(conn: &Connection) -> Result<Vec<Uuid>
     Ok(ids)
 }
 
+/// Discard stale in-progress decomposition sessions that have no work items.
+///
+/// After a daemon crash during decomposition, sessions can be left in in_progress,
+/// approved, or failed status with 0 work items. This function finds and discards them.
+///
+/// Returns the number of sessions discarded.
+pub fn discard_stale_decomposition_sessions(conn: &Connection) -> Result<u64> {
+    let in_progress = find_in_progress_sessions(conn)?;
+    let approved = find_approved_sessions(conn)?;
+    let failed = find_failed_sessions(conn)?;
+    let mut discarded = 0u64;
+
+    for session in in_progress.into_iter().chain(approved).chain(failed) {
+        // Count work items for this session
+        let count: u32 = conn.query_row(
+            "SELECT COUNT(*) FROM work_items WHERE decomposition_session_id = ?1",
+            params![session.id.to_string()],
+            |row| row.get(0),
+        )?;
+
+        if count == 0 {
+            update_session_status(conn, &session.id, DecompositionStatus::Discarded)?;
+            info!(
+                session_id = %session.id,
+                wave_number = session.wave_number,
+                status = %session.status,
+                "discarded stale decomposition session with 0 work items"
+            );
+            discarded += 1;
+        }
+    }
+
+    Ok(discarded)
+}
+
 /// Remove a stale Unix socket file if it exists.
 ///
 /// Returns true if a socket was removed, false if none existed.
@@ -271,6 +310,8 @@ pub struct RecoveryReport {
     pub socket_removed: bool,
     /// Whether a stale PID file was removed.
     pub pid_file_removed: bool,
+    /// Number of stale decomposition sessions discarded.
+    pub decomposition_sessions_discarded: u64,
 }
 
 /// Full session and state recovery on daemon startup.
@@ -306,10 +347,13 @@ pub fn recover_session_state(
     // 3. Reset all active spec sessions
     let specs_reset = reset_all_active_spec_sessions(conn)?;
 
-    // 4. Mark orphaned in-progress tasks as failed
+    // 4. Discard stale decomposition sessions
+    let decomposition_sessions_discarded = discard_stale_decomposition_sessions(conn)?;
+
+    // 5. Mark orphaned in-progress tasks as failed
     let tasks_failed = fail_orphaned_in_progress_items(conn)?;
 
-    // 5. Find stories needing completion flow
+    // 6. Find stories needing completion flow
     let stories_needing_completion = find_completed_in_progress_stories(conn)?;
     if !stories_needing_completion.is_empty() {
         info!(
@@ -326,6 +370,7 @@ pub fn recover_session_state(
         agents_adopted,
         socket_removed,
         pid_file_removed,
+        decomposition_sessions_discarded,
     })
 }
 
@@ -1023,6 +1068,7 @@ mod tests {
         assert!(report.agents_adopted.is_empty());
         assert!(!report.socket_removed);
         assert!(!report.pid_file_removed);
+        assert_eq!(report.decomposition_sessions_discarded, 0);
 
         let _ = std::fs::remove_dir(&dir);
     }
@@ -1059,5 +1105,147 @@ mod tests {
         assert_eq!(item.status, WorkItemStatus::Failed);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- discard_stale_decomposition_sessions ---
+
+    #[test]
+    fn test_discard_stale_decomposition_no_sessions() {
+        let conn = test_conn();
+        let count = discard_stale_decomposition_sessions(&conn).unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn test_discard_stale_decomposition_in_progress_no_work_items() {
+        let conn = test_conn();
+        let pid = make_project(&conn);
+        let sid = make_session(&conn, pid);
+
+        // Session is in_progress with 0 work items — should be discarded
+        let count = discard_stale_decomposition_sessions(&conn).unwrap();
+        assert_eq!(count, 1);
+
+        // Verify session status changed to discarded
+        use crate::db::decomposition_sessions::get_decomposition_session;
+        let session = get_decomposition_session(&conn, &sid).unwrap().unwrap();
+        assert_eq!(session.status, DecompositionStatus::Discarded);
+    }
+
+    #[test]
+    fn test_discard_stale_decomposition_in_progress_with_work_items() {
+        let conn = test_conn();
+        let pid = make_project(&conn);
+        let sid = make_session(&conn, pid);
+
+        // Create work items for this session
+        let epic = WorkItem::new_epic(sid, "Epic 1".into(), "Desc".into(), "E1".into(), 0);
+        crate::db::work_items::insert_work_item(&conn, &epic).unwrap();
+
+        // Session has work items — should NOT be discarded
+        let count = discard_stale_decomposition_sessions(&conn).unwrap();
+        assert_eq!(count, 0);
+
+        // Verify session is still in_progress
+        use crate::db::decomposition_sessions::get_decomposition_session;
+        let session = get_decomposition_session(&conn, &sid).unwrap().unwrap();
+        assert_eq!(session.status, DecompositionStatus::InProgress);
+    }
+
+    #[test]
+    fn test_discard_stale_decomposition_discards_approved_and_failed_with_zero_items() {
+        let conn = test_conn();
+        let pid = make_project(&conn);
+
+        // Create approved session with 0 work items — SHOULD be discarded
+        let approved_zero_id = Uuid::new_v4();
+        let now = Utc::now();
+        conn.execute(
+            "INSERT INTO decomposition_sessions (id, project_id, wave_number, status, created_at, updated_at)
+             VALUES (?1, ?2, 1, 'approved', ?3, ?3)",
+            rusqlite::params![
+                approved_zero_id.to_string(),
+                pid.to_string(),
+                now.to_rfc3339(),
+            ],
+        )
+        .unwrap();
+
+        // Create failed session with 0 work items — SHOULD be discarded
+        let failed_zero_id = Uuid::new_v4();
+        conn.execute(
+            "INSERT INTO decomposition_sessions (id, project_id, wave_number, status, created_at, updated_at)
+             VALUES (?1, ?2, 2, 'failed', ?3, ?3)",
+            rusqlite::params![
+                failed_zero_id.to_string(),
+                pid.to_string(),
+                now.to_rfc3339(),
+            ],
+        )
+        .unwrap();
+
+        // Create discarded session with 0 work items — should NOT be re-processed (already terminal)
+        let discarded_id = Uuid::new_v4();
+        conn.execute(
+            "INSERT INTO decomposition_sessions (id, project_id, wave_number, status, created_at, updated_at)
+             VALUES (?1, ?2, 3, 'discarded', ?3, ?3)",
+            rusqlite::params![
+                discarded_id.to_string(),
+                pid.to_string(),
+                now.to_rfc3339(),
+            ],
+        )
+        .unwrap();
+
+        // Create approved session WITH work items — should NOT be discarded
+        let approved_with_items_id = Uuid::new_v4();
+        conn.execute(
+            "INSERT INTO decomposition_sessions (id, project_id, wave_number, status, created_at, updated_at)
+             VALUES (?1, ?2, 4, 'approved', ?3, ?3)",
+            rusqlite::params![
+                approved_with_items_id.to_string(),
+                pid.to_string(),
+                now.to_rfc3339(),
+            ],
+        )
+        .unwrap();
+        let epic = WorkItem::new_epic(
+            approved_with_items_id,
+            "Epic 1".into(),
+            "Desc".into(),
+            "E1".into(),
+            0,
+        );
+        crate::db::work_items::insert_work_item(&conn, &epic).unwrap();
+
+        // Should discard approved_zero and failed_zero, skip discarded and approved_with_items
+        let count = discard_stale_decomposition_sessions(&conn).unwrap();
+        assert_eq!(count, 2);
+
+        // Verify statuses
+        use crate::db::decomposition_sessions::get_decomposition_session;
+
+        let approved_zero_session = get_decomposition_session(&conn, &approved_zero_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(approved_zero_session.status, DecompositionStatus::Discarded);
+
+        let failed_zero_session = get_decomposition_session(&conn, &failed_zero_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(failed_zero_session.status, DecompositionStatus::Discarded);
+
+        let discarded_session = get_decomposition_session(&conn, &discarded_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(discarded_session.status, DecompositionStatus::Discarded);
+
+        let approved_with_items_session = get_decomposition_session(&conn, &approved_with_items_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            approved_with_items_session.status,
+            DecompositionStatus::Approved
+        );
     }
 }

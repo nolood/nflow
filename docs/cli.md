@@ -445,6 +445,79 @@ nflow worktree clean --all        # clean all projects
 
 ---
 
+## Pipeline
+
+Pipeline Flow provides a simplified Plan → Implement → Review workflow for rapid development without the overhead of formal specification and decomposition. See `docs/pipeline.md` for detailed documentation.
+
+### `nflow pipeline start <description>`
+
+Start a new pipeline run.
+
+```bash
+nflow pipeline start "Add user profile page with avatar upload"
+nflow pipeline start "Fix login redirect bug" --max-iterations 3
+```
+
+Arguments:
+- `<description>` — task description for Claude (required)
+
+Options:
+- `--max-iterations <n>` — max Implement→Review loops (default: 5)
+
+Runs three stages sequentially:
+1. **Plan** — Claude analyzes task and creates implementation plan
+2. **Implement** — Claude executes plan and makes code changes
+3. **Review** — Claude verifies implementation, loops back if issues found
+
+The command streams output in real-time. Only one pipeline can be active per project at a time.
+
+### `nflow pipeline list`
+
+List all pipeline runs for the current project.
+
+```bash
+nflow pipeline list
+```
+
+Output columns: ID (short), description, state (Running/Completed/Failed/Cancelled), iteration (current/max), created, updated.
+
+### `nflow pipeline status <pipeline-id>`
+
+Show detailed status for a specific pipeline run.
+
+```bash
+nflow pipeline status abc123
+```
+
+Displays:
+- Pipeline metadata (description, state, iterations)
+- Stage history (Plan, Implement, Review with timestamps)
+- Stage outputs (approach, changes, review feedback)
+- Current iteration progress
+
+### `nflow pipeline cancel <pipeline-id>`
+
+Cancel a running pipeline.
+
+```bash
+nflow pipeline cancel abc123
+```
+
+Stops the currently running agent (SIGTERM) and sets pipeline state to Cancelled. Cannot cancel pipelines that are already Completed/Failed/Cancelled.
+
+### `nflow pipeline log <pipeline-id> [--stage-id <stage-id>]`
+
+Stream logs for a pipeline stage.
+
+```bash
+nflow pipeline log abc123                    # latest stage
+nflow pipeline log abc123 --stage-id def456  # specific stage
+```
+
+Shows raw agent output (tool calls, text, results). If stage ID is omitted, streams the most recent stage.
+
+---
+
 ## TUI
 
 ### `nflow tui`

@@ -10,6 +10,8 @@ use crate::error::ClaudeError;
 pub enum StreamEvent {
     /// Incremental text output from Claude.
     TextDelta { text: String },
+    /// Incremental tool input JSON (streamed character-by-character).
+    InputJsonDelta { partial_json: String },
     /// Claude is using a tool.
     ToolUse { name: String, input: Value },
     /// Result of a tool call.
@@ -66,6 +68,7 @@ struct RawDelta {
     #[serde(rename = "type")]
     delta_type: Option<String>,
     text: Option<String>,
+    partial_json: Option<String>,
 }
 
 /// Parses a single JSON line into a StreamEvent.
@@ -92,17 +95,27 @@ pub fn parse_line(line: &str) -> StreamEvent {
         "stream_event" => {
             if let Some(event) = raw.event {
                 if let Some(delta) = event.delta {
-                    if delta.delta_type.as_deref() == Some("text_delta") {
-                        if let Some(text) = delta.text {
-                            return StreamEvent::TextDelta { text };
+                    match delta.delta_type.as_deref() {
+                        Some("text_delta") => {
+                            if let Some(text) = delta.text {
+                                return StreamEvent::TextDelta { text };
+                            }
                         }
+                        Some("input_json_delta") => {
+                            if let Some(partial_json) = delta.partial_json {
+                                return StreamEvent::InputJsonDelta { partial_json };
+                            }
+                        }
+                        _ => {}
                     }
                 }
             }
-            // stream_event without a text delta — treat as parse error
+            // stream_event without a recognized delta — silently ignore (not an error)
+            // This includes: content_block_start, content_block_stop, message_start,
+            // message_stop, and other stream metadata events
             StreamEvent::ParseError {
                 line: line.to_string(),
-                reason: "stream_event missing text_delta".to_string(),
+                reason: "ignored_stream_metadata".to_string(),
             }
         }
         "tool_use" => {
@@ -124,6 +137,11 @@ pub fn parse_line(line: &str) -> StreamEvent {
         },
         "error" => StreamEvent::Error {
             message: raw.error.unwrap_or_default(),
+        },
+        // Claude's system, assistant, and user turn markers — ignore these
+        "system" | "assistant" | "user" => StreamEvent::ParseError {
+            line: line.to_string(),
+            reason: "ignored_turn_marker".to_string(),
         },
         _ => StreamEvent::ParseError {
             line: line.to_string(),
@@ -193,6 +211,42 @@ mod tests {
                 text: "Reading".to_string()
             }
         );
+    }
+
+    #[test]
+    fn parse_input_json_delta() {
+        let line = r#"{"type":"stream_event","event":{"delta":{"type":"input_json_delta","partial_json":"{"}}}"#;
+        let event = parse_line(line);
+        assert_eq!(
+            event,
+            StreamEvent::InputJsonDelta {
+                partial_json: "{".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn parse_input_json_delta_field() {
+        let line = r#"{"type":"stream_event","event":{"delta":{"type":"input_json_delta","partial_json":"\"file_path\""}}}"#;
+        let event = parse_line(line);
+        assert_eq!(
+            event,
+            StreamEvent::InputJsonDelta {
+                partial_json: "\"file_path\"".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn parse_input_json_delta_no_partial() {
+        let line = r#"{"type":"stream_event","event":{"delta":{"type":"input_json_delta"}}}"#;
+        let event = parse_line(line);
+        match event {
+            StreamEvent::ParseError { reason, .. } => {
+                assert_eq!(reason, "ignored_stream_metadata");
+            }
+            other => panic!("expected ParseError, got: {other:?}"),
+        }
     }
 
     #[test]
@@ -311,7 +365,7 @@ mod tests {
         let event = parse_line(line);
         match event {
             StreamEvent::ParseError { reason, .. } => {
-                assert!(reason.contains("missing text_delta"));
+                assert!(reason.contains("ignored_stream_metadata"));
             }
             other => panic!("expected ParseError, got: {other:?}"),
         }
@@ -638,5 +692,41 @@ mod tests {
         let debug = format!("{event:?}");
         assert!(debug.contains("TextDelta"));
         assert!(debug.contains("hello"));
+    }
+
+    #[test]
+    fn parse_system_event_ignored() {
+        let line = r#"{"type":"system","content":"System prompt"}"#;
+        let event = parse_line(line);
+        match event {
+            StreamEvent::ParseError { reason, .. } => {
+                assert_eq!(reason, "ignored_turn_marker");
+            }
+            other => panic!("expected ParseError with ignored_turn_marker, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_assistant_event_ignored() {
+        let line = r#"{"type":"assistant","content":"Assistant response"}"#;
+        let event = parse_line(line);
+        match event {
+            StreamEvent::ParseError { reason, .. } => {
+                assert_eq!(reason, "ignored_turn_marker");
+            }
+            other => panic!("expected ParseError with ignored_turn_marker, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_user_event_ignored() {
+        let line = r#"{"type":"user","content":"User input"}"#;
+        let event = parse_line(line);
+        match event {
+            StreamEvent::ParseError { reason, .. } => {
+                assert_eq!(reason, "ignored_turn_marker");
+            }
+            other => panic!("expected ParseError with ignored_turn_marker, got: {other:?}"),
+        }
     }
 }

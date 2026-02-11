@@ -83,6 +83,7 @@ fn row_to_work_item(row: &Row<'_>) -> rusqlite::Result<WorkItem> {
     let worktree_path: Option<String> = row.get("worktree_path")?;
     let mr_url: Option<String> = row.get("mr_url")?;
     let commit_hash: Option<String> = row.get("commit_hash")?;
+    let error_message: Option<String> = row.get("error_message")?;
     let created_at_str: String = row.get("created_at")?;
     let updated_at_str: String = row.get("updated_at")?;
 
@@ -102,6 +103,7 @@ fn row_to_work_item(row: &Row<'_>) -> rusqlite::Result<WorkItem> {
         worktree_path,
         mr_url,
         commit_hash,
+        error_message,
         created_at: parse_datetime(&created_at_str),
         updated_at: parse_datetime(&updated_at_str),
     })
@@ -109,8 +111,8 @@ fn row_to_work_item(row: &Row<'_>) -> rusqlite::Result<WorkItem> {
 
 pub fn insert_work_item(conn: &Connection, item: &WorkItem) -> Result<()> {
     conn.execute(
-        "INSERT INTO work_items (id, parent_id, decomposition_session_id, item_type, kind, title, description, acceptance_criteria, status, short_id, sort_order, branch_name, worktree_path, mr_url, commit_hash, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+        "INSERT INTO work_items (id, parent_id, decomposition_session_id, item_type, kind, title, description, acceptance_criteria, status, short_id, sort_order, branch_name, worktree_path, mr_url, commit_hash, error_message, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
         params![
             item.id.to_string(),
             item.parent_id.map(|id| id.to_string()),
@@ -127,6 +129,7 @@ pub fn insert_work_item(conn: &Connection, item: &WorkItem) -> Result<()> {
             item.worktree_path,
             item.mr_url,
             item.commit_hash,
+            item.error_message,
             item.created_at.to_rfc3339(),
             item.updated_at.to_rfc3339(),
         ],
@@ -144,7 +147,7 @@ pub fn insert_dependency(conn: &Connection, dep: &Dependency) -> Result<()> {
 
 pub fn get_work_item_by_id(conn: &Connection, id: &Uuid) -> Result<Option<WorkItem>> {
     let mut stmt = conn.prepare(
-        "SELECT id, parent_id, decomposition_session_id, item_type, kind, title, description, acceptance_criteria, status, short_id, sort_order, branch_name, worktree_path, mr_url, commit_hash, created_at, updated_at
+        "SELECT id, parent_id, decomposition_session_id, item_type, kind, title, description, acceptance_criteria, status, short_id, sort_order, branch_name, worktree_path, mr_url, commit_hash, error_message, created_at, updated_at
          FROM work_items WHERE id = ?1",
     )?;
     let mut rows = stmt.query_map(params![id.to_string()], row_to_work_item)?;
@@ -156,7 +159,7 @@ pub fn get_work_item_by_id(conn: &Connection, id: &Uuid) -> Result<Option<WorkIt
 
 pub fn list_work_items_by_session(conn: &Connection, session_id: &Uuid) -> Result<Vec<WorkItem>> {
     let mut stmt = conn.prepare(
-        "SELECT id, parent_id, decomposition_session_id, item_type, kind, title, description, acceptance_criteria, status, short_id, sort_order, branch_name, worktree_path, mr_url, commit_hash, created_at, updated_at
+        "SELECT id, parent_id, decomposition_session_id, item_type, kind, title, description, acceptance_criteria, status, short_id, sort_order, branch_name, worktree_path, mr_url, commit_hash, error_message, created_at, updated_at
          FROM work_items WHERE decomposition_session_id = ?1 ORDER BY sort_order",
     )?;
     let rows = stmt.query_map(params![session_id.to_string()], row_to_work_item)?;
@@ -169,7 +172,7 @@ pub fn list_work_items_by_session(conn: &Connection, session_id: &Uuid) -> Resul
 
 pub fn list_work_items_by_parent(conn: &Connection, parent_id: &Uuid) -> Result<Vec<WorkItem>> {
     let mut stmt = conn.prepare(
-        "SELECT id, parent_id, decomposition_session_id, item_type, kind, title, description, acceptance_criteria, status, short_id, sort_order, branch_name, worktree_path, mr_url, commit_hash, created_at, updated_at
+        "SELECT id, parent_id, decomposition_session_id, item_type, kind, title, description, acceptance_criteria, status, short_id, sort_order, branch_name, worktree_path, mr_url, commit_hash, error_message, created_at, updated_at
          FROM work_items WHERE parent_id = ?1 ORDER BY sort_order",
     )?;
     let rows = stmt.query_map(params![parent_id.to_string()], row_to_work_item)?;
@@ -253,6 +256,19 @@ pub fn update_work_item_status(conn: &Connection, id: &Uuid, status: WorkItemSta
     Ok(())
 }
 
+/// Set work item status to failed with an error message in a single query.
+pub fn update_work_item_error(conn: &Connection, id: &Uuid, error_message: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE work_items SET status = 'failed', error_message = ?1, updated_at = ?2 WHERE id = ?3",
+        params![
+            error_message,
+            Utc::now().to_rfc3339(),
+            id.to_string(),
+        ],
+    )?;
+    Ok(())
+}
+
 pub fn update_work_item_commit(conn: &Connection, id: &Uuid, commit_hash: &str) -> Result<()> {
     conn.execute(
         "UPDATE work_items SET commit_hash = ?1, updated_at = ?2 WHERE id = ?3",
@@ -320,6 +336,17 @@ pub fn count_pending_stories_by_project(conn: &Connection, project_id: &Uuid) ->
     Ok(count)
 }
 
+
+/// Count all work items for a decomposition session.
+pub fn count_work_items_by_session(conn: &Connection, session_id: &Uuid) -> Result<u32> {
+    let count: u32 = conn.query_row(
+        "SELECT COUNT(*) FROM work_items WHERE decomposition_session_id = ?1",
+        params![session_id.to_string()],
+        |row| row.get(0),
+    )?;
+    Ok(count)
+}
+
 /// List worktree paths for all stories in a project.
 pub fn list_worktree_paths_by_project(conn: &Connection, project_id: &Uuid) -> Result<Vec<String>> {
     let mut stmt = conn.prepare(
@@ -363,7 +390,7 @@ pub fn find_work_item_by_wave_short_id(
     };
 
     let mut stmt = conn.prepare(
-        "SELECT w.id, w.parent_id, w.decomposition_session_id, w.item_type, w.kind, w.title, w.description, w.acceptance_criteria, w.status, w.short_id, w.sort_order, w.branch_name, w.worktree_path, w.mr_url, w.commit_hash, w.created_at, w.updated_at
+        "SELECT w.id, w.parent_id, w.decomposition_session_id, w.item_type, w.kind, w.title, w.description, w.acceptance_criteria, w.status, w.short_id, w.sort_order, w.branch_name, w.worktree_path, w.mr_url, w.commit_hash, w.error_message, w.created_at, w.updated_at
          FROM work_items w
          JOIN decomposition_sessions ds ON w.decomposition_session_id = ds.id
          WHERE w.short_id = ?1 AND ds.wave_number = ?2",
@@ -390,7 +417,7 @@ fn parse_wave_prefix(wave_short_id: &str) -> Option<(u32, &str)> {
 /// List all stories in a specific session (wave).
 pub fn list_stories_by_session(conn: &Connection, session_id: &Uuid) -> Result<Vec<WorkItem>> {
     let mut stmt = conn.prepare(
-        "SELECT id, parent_id, decomposition_session_id, item_type, kind, title, description, acceptance_criteria, status, short_id, sort_order, branch_name, worktree_path, mr_url, commit_hash, created_at, updated_at
+        "SELECT id, parent_id, decomposition_session_id, item_type, kind, title, description, acceptance_criteria, status, short_id, sort_order, branch_name, worktree_path, mr_url, commit_hash, error_message, created_at, updated_at
          FROM work_items WHERE decomposition_session_id = ?1 AND item_type = 'story' ORDER BY sort_order",
     )?;
     let rows = stmt.query_map(params![session_id.to_string()], row_to_work_item)?;
@@ -410,7 +437,7 @@ pub fn list_stories_with_worktree_by_project(
     let mut stmt = conn.prepare(
         "SELECT w.id, w.parent_id, w.decomposition_session_id, w.item_type, w.kind, w.title,
                 w.description, w.acceptance_criteria, w.status, w.short_id, w.sort_order,
-                w.branch_name, w.worktree_path, w.mr_url, w.commit_hash, w.created_at, w.updated_at,
+                w.branch_name, w.worktree_path, w.mr_url, w.commit_hash, w.error_message, w.created_at, w.updated_at,
                 ds.wave_number
          FROM work_items w
          JOIN decomposition_sessions ds ON w.decomposition_session_id = ds.id
@@ -419,7 +446,7 @@ pub fn list_stories_with_worktree_by_project(
     )?;
     let rows = stmt.query_map(params![project_id.to_string()], |row| {
         let item = row_to_work_item(row)?;
-        let wave: u32 = row.get(17)?;
+        let wave: u32 = row.get(18)?;
         Ok((item, wave))
     })?;
     let mut items = Vec::new();

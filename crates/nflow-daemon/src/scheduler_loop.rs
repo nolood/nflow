@@ -398,12 +398,10 @@ pub fn reap_finished_agents(
                 let _ = db::agent_runs::update_agent_run_session_id(conn, &run.id, sid);
             }
 
-            // Mark work item as failed
-            if let Err(e) = db::work_items::update_work_item_status(
-                conn,
-                &run.work_item_id,
-                WorkItemStatus::Failed,
-            ) {
+            // Mark work item as failed with error message
+            let update_result =
+                db::work_items::update_work_item_error(conn, &run.work_item_id, error_msg);
+            if let Err(e) = update_result {
                 warn!(
                     "reap: failed to update work item {}: {}",
                     run.work_item_id, e
@@ -453,15 +451,14 @@ fn determine_story_progress(
 
     // On failure: always fail the story immediately
     if !succeeded {
+        let story_error = format!("Task {} failed", completed_task.short_id);
         info!(
             "progress: task {} failed — failing story {}",
             completed_task.short_id, story_id
         );
 
-        // Update story status to Failed
-        if let Err(e) =
-            db::work_items::update_work_item_status(conn, &story_id, WorkItemStatus::Failed)
-        {
+        // Update story status to Failed with error message from the task
+        if let Err(e) = db::work_items::update_work_item_error(conn, &story_id, &story_error) {
             warn!("progress: failed to fail story {}: {}", story_id, e);
         } else if let Ok(Some(story)) = db::work_items::get_work_item_by_id(conn, &story_id) {
             broadcast_status_change(event_bus, &story_id, &story, "in_progress", "failed", conn);
@@ -1766,6 +1763,7 @@ pub fn scheduler_tick(
                     DecompositionStatus::InProgress => SessionStatus::InProgress,
                     DecompositionStatus::Approved => SessionStatus::Approved,
                     DecompositionStatus::Discarded => SessionStatus::Discarded,
+                    DecompositionStatus::Failed => SessionStatus::Discarded, // Treat failed as discarded for scheduling
                 };
                 (s.id, status)
             })
@@ -1866,6 +1864,7 @@ mod tests {
             wave_number: wave,
             status: DecompositionStatus::Approved,
             claude_session_id: None,
+            error_message: None,
             created_at: now,
             updated_at: now,
         }
@@ -1972,6 +1971,7 @@ mod tests {
             wave_number: 1,
             status: DecompositionStatus::InProgress,
             claude_session_id: None,
+            error_message: None,
             created_at: now,
             updated_at: now,
         };

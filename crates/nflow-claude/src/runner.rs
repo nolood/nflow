@@ -122,6 +122,51 @@ impl RunConfig {
             ..Self::base(prompt)
         }
     }
+
+    /// Config for pipeline plan stage.
+    ///
+    /// allowedTools: Read, Glob, Grep; max_turns: 30
+    pub fn for_pipeline_plan(prompt: String) -> Self {
+        Self {
+            allowed_tools: vec!["Read".to_string(), "Glob".to_string(), "Grep".to_string()],
+            max_turns: Some(30),
+            ..Self::base(prompt)
+        }
+    }
+
+    /// Config for pipeline implement stage.
+    ///
+    /// allowedTools: Read, Write, Edit, Bash, Glob, Grep; max_turns: 50
+    pub fn for_pipeline_implement(prompt: String) -> Self {
+        Self {
+            allowed_tools: vec![
+                "Read".to_string(),
+                "Write".to_string(),
+                "Edit".to_string(),
+                "Bash".to_string(),
+                "Glob".to_string(),
+                "Grep".to_string(),
+            ],
+            max_turns: Some(50),
+            ..Self::base(prompt)
+        }
+    }
+
+    /// Config for pipeline review stage.
+    ///
+    /// allowedTools: Read, Bash, Glob, Grep; max_turns: 30
+    pub fn for_pipeline_review(prompt: String) -> Self {
+        Self {
+            allowed_tools: vec![
+                "Read".to_string(),
+                "Bash".to_string(),
+                "Glob".to_string(),
+                "Grep".to_string(),
+            ],
+            max_turns: Some(30),
+            ..Self::base(prompt)
+        }
+    }
 }
 
 /// Output format for the Claude CLI.

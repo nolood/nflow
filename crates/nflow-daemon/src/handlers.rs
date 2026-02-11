@@ -70,6 +70,11 @@ fn dispatch(req: Request, state: &HandlerState) -> HandlerResult {
         "cleanup.logs" => HandlerResult::Single(handle_cleanup_logs(req, state)),
         "config.show" => HandlerResult::Single(handle_config_show(req, state)),
         "config.set" => HandlerResult::Single(handle_config_set(req, state)),
+        "pipeline.start" => handle_pipeline_start(req, state),
+        "pipeline.status" => HandlerResult::Single(handle_pipeline_status(req, state)),
+        "pipeline.list" => HandlerResult::Single(handle_pipeline_list(req, state)),
+        "pipeline.cancel" => HandlerResult::Single(handle_pipeline_cancel(req, state)),
+        "pipeline.log" => HandlerResult::Single(handle_pipeline_log(req, state)),
         _ => HandlerResult::Single(Response::error(
             req.id,
             &format!("unknown command: {}", req.command),
@@ -688,6 +693,9 @@ async fn stream_claude_spec_session(
                         nflow_claude::stream::StreamEvent::TextDelta { text } => {
                             serde_json::json!({"type": "text", "text": text})
                         }
+                        nflow_claude::stream::StreamEvent::InputJsonDelta { partial_json } => {
+                            serde_json::json!({"type": "input_json_delta", "partial_json": partial_json})
+                        }
                         nflow_claude::stream::StreamEvent::ToolUse { name, input } => {
                             serde_json::json!({"type": "tool_use", "name": name, "input": input})
                         }
@@ -751,12 +759,7 @@ async fn stream_claude_spec_session(
                 .ok()
                 .flatten()
                 .and_then(|s| s.claude_session_id);
-            let _ = db::specs::update_spec_session(
-                &conn,
-                &spec_id,
-                true,
-                existing_sid.as_deref(),
-            );
+            let _ = db::specs::update_spec_session(&conn, &spec_id, true, existing_sid.as_deref());
         }
     }
 
@@ -1090,12 +1093,9 @@ fn handle_spec_deactivate(req: Request, state: &HandlerState) -> Response {
         );
     }
 
-    if let Err(e) = db::specs::update_spec_session(
-        &conn,
-        &spec.id,
-        false,
-        spec.claude_session_id.as_deref(),
-    ) {
+    if let Err(e) =
+        db::specs::update_spec_session(&conn, &spec.id, false, spec.claude_session_id.as_deref())
+    {
         return Response::error(id, &format!("database error: {}", e));
     }
 
@@ -1716,11 +1716,16 @@ async fn stream_claude_decompose(
     let process = match runner.spawn(&run_config) {
         Ok(p) => p,
         Err(e) => {
+            let error_msg = format!("Failed to spawn Claude process: {}", e);
+            if let Ok(conn) = db::open_connection(db_path) {
+                let _ = db::decomposition_sessions::update_session_error(
+                    &conn,
+                    &session_id,
+                    &error_msg,
+                );
+            }
             let _ = tx
-                .send(StreamingResponseLine::error(
-                    req_id,
-                    &format!("failed to spawn Claude: {}", e),
-                ))
+                .send(StreamingResponseLine::error(req_id, &error_msg))
                 .await;
             return;
         }
@@ -1741,6 +1746,9 @@ async fn stream_claude_decompose(
                 let event_json = match &event {
                     nflow_claude::stream::StreamEvent::TextDelta { text } => {
                         serde_json::json!({"type": "text", "text": text})
+                    }
+                    nflow_claude::stream::StreamEvent::InputJsonDelta { partial_json } => {
+                        serde_json::json!({"type": "input_json_delta", "partial_json": partial_json})
                     }
                     nflow_claude::stream::StreamEvent::ToolUse { name, input } => {
                         serde_json::json!({"type": "tool_use", "name": name, "input": input})
@@ -1788,11 +1796,12 @@ async fn stream_claude_decompose(
 
     // Parse Claude's JSON output into work items
     if result_text.is_empty() {
+        let error_msg = "Claude process exited without producing a result";
+        if let Ok(conn) = db::open_connection(db_path) {
+            let _ = db::decomposition_sessions::update_session_error(&conn, &session_id, error_msg);
+        }
         let _ = tx
-            .send(StreamingResponseLine::error(
-                req_id,
-                "Claude did not produce a result — decomposition failed",
-            ))
+            .send(StreamingResponseLine::error(req_id, error_msg))
             .await;
         return;
     }
@@ -1803,11 +1812,20 @@ async fn stream_claude_decompose(
     let parsed: serde_json::Value = match serde_json::from_str(json_text) {
         Ok(v) => v,
         Err(e) => {
+            let preview: String = json_text.chars().take(500).collect();
+            let error_msg = format!(
+                "Failed to parse Claude output as JSON: {}. First 500 chars: {}",
+                e, preview
+            );
+            if let Ok(conn) = db::open_connection(db_path) {
+                let _ = db::decomposition_sessions::update_session_error(
+                    &conn,
+                    &session_id,
+                    &error_msg,
+                );
+            }
             let _ = tx
-                .send(StreamingResponseLine::error(
-                    req_id,
-                    &format!("failed to parse Claude output as JSON: {}", e),
-                ))
+                .send(StreamingResponseLine::error(req_id, &error_msg))
                 .await;
             return;
         }
@@ -1852,7 +1870,12 @@ async fn stream_claude_decompose(
                 .await;
         }
         Err(e) => {
-            let _ = tx.send(StreamingResponseLine::error(req_id, &e)).await;
+            let error_msg = format!("Failed to build work items: {}", e);
+            let _ =
+                db::decomposition_sessions::update_session_error(&conn, &session_id, &error_msg);
+            let _ = tx
+                .send(StreamingResponseLine::error(req_id, &error_msg))
+                .await;
         }
     }
 }
@@ -2375,6 +2398,7 @@ fn handle_plan_show(req: Request, state: &HandlerState) -> Response {
                     "title": task.title,
                     "status": task.status.to_string(),
                     "kind": task.kind.as_ref().map(|k| k.to_string()),
+                    "error_message": task.error_message,
                 }));
             }
 
@@ -2385,6 +2409,7 @@ fn handle_plan_show(req: Request, state: &HandlerState) -> Response {
                 "depends_on": depends_on,
                 "progress": format!("{}/{}", done_tasks, total_tasks),
                 "tasks": tasks_data,
+                "error_message": story.error_message,
             }));
         }
 
@@ -2393,6 +2418,7 @@ fn handle_plan_show(req: Request, state: &HandlerState) -> Response {
             "title": epic.title,
             "status": epic.status.to_string(),
             "stories": stories_data,
+            "error_message": epic.error_message,
         }));
     }
 
@@ -2401,6 +2427,7 @@ fn handle_plan_show(req: Request, state: &HandlerState) -> Response {
         serde_json::json!({
             "wave_number": session.wave_number,
             "status": session.status.to_string(),
+            "error_message": session.error_message,
             "epics": epics_data,
         }),
     )
@@ -3097,6 +3124,7 @@ fn handle_exec_status(req: Request, state: &HandlerState) -> Response {
                         "retry_count": retry_count,
                         "started_at": task_started_at,
                         "finished_at": task_finished_at,
+                        "error_message": task.error_message,
                     }));
                 }
 
@@ -3114,6 +3142,7 @@ fn handle_exec_status(req: Request, state: &HandlerState) -> Response {
                         None
                     },
                     "tasks": tasks_data,
+                    "error_message": story.error_message,
                 }));
             }
 
@@ -3128,12 +3157,14 @@ fn handle_exec_status(req: Request, state: &HandlerState) -> Response {
                     None
                 },
                 "stories": stories_data,
+                "error_message": epic.error_message,
             }));
         }
 
         waves_data.push(serde_json::json!({
             "wave_number": session.wave_number,
             "status": session.status.to_string(),
+            "error_message": session.error_message,
             "summary": summary,
             "epics": epics_data,
         }));
@@ -5130,6 +5161,12 @@ fn parse_single_log_event(line: &str) -> serde_json::Value {
                 "text": text,
             })
         }
+        nflow_claude::stream::StreamEvent::InputJsonDelta { partial_json } => {
+            serde_json::json!({
+                "type": "input_json_delta",
+                "partial_json": partial_json,
+            })
+        }
         nflow_claude::stream::StreamEvent::ToolUse { name, input } => {
             serde_json::json!({
                 "type": "tool_use",
@@ -5905,6 +5942,1134 @@ fn parse_duration_secs(s: &str) -> Option<u64> {
         "s" => Some(num),
         _ => None,
     }
+}
+
+// ─── Pipeline Handlers ──────────────────────────────────────────────────────
+
+/// Extract JSON from text produced by Claude.
+///
+/// Looks for ```json code blocks first, then falls back to finding raw JSON objects.
+fn extract_pipeline_json_from_text(text: &str) -> Option<String> {
+    // Try ```json blocks first
+    if let Some(start) = text.find("```json") {
+        let json_start = start + "```json".len();
+        if let Some(end) = text[json_start..].find("```") {
+            let json_str = text[json_start..json_start + end].trim();
+            if !json_str.is_empty() {
+                return Some(json_str.to_string());
+            }
+        }
+    }
+
+    // Fallback: find a raw JSON object
+    if let Some(start) = text.find('{') {
+        let mut depth = 0i32;
+        let mut in_string = false;
+        let mut escape_next = false;
+        let bytes = text[start..].as_bytes();
+        for (i, &b) in bytes.iter().enumerate() {
+            if escape_next {
+                escape_next = false;
+                continue;
+            }
+            match b {
+                b'\\' if in_string => {
+                    escape_next = true;
+                }
+                b'"' => {
+                    in_string = !in_string;
+                }
+                b'{' if !in_string => {
+                    depth += 1;
+                }
+                b'}' if !in_string => {
+                    depth -= 1;
+                    if depth == 0 {
+                        let json_str = &text[start..start + i + 1];
+                        return Some(json_str.to_string());
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    None
+}
+
+/// Parse stage output JSON from Claude's result text.
+fn parse_pipeline_stage_output(
+    result_text: &str,
+    stage_type: nflow_core::pipeline::PipelineStageType,
+) -> nflow_core::pipeline::StageOutput {
+    if let Some(json_str) = extract_pipeline_json_from_text(result_text) {
+        if let Ok(output) = serde_json::from_str::<nflow_core::pipeline::StageOutput>(&json_str) {
+            return output;
+        }
+    }
+
+    let summary = result_text
+        .lines()
+        .take(3)
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(200)
+        .collect::<String>();
+
+    match stage_type {
+        nflow_core::pipeline::PipelineStageType::Plan
+        | nflow_core::pipeline::PipelineStageType::Implement => nflow_core::pipeline::StageOutput {
+            success: true,
+            summary,
+            plan: None,
+            implementation: None,
+            review: None,
+        },
+        nflow_core::pipeline::PipelineStageType::Review => nflow_core::pipeline::StageOutput {
+            success: false,
+            summary,
+            plan: None,
+            implementation: None,
+            review: Some(nflow_core::pipeline::ReviewOutput {
+                passed: false,
+                issues: vec![],
+                feedback: "Could not parse review output. Treating as failed.".to_string(),
+            }),
+        },
+    }
+}
+
+/// Build the prompt for a pipeline stage.
+fn build_pipeline_prompt(
+    stage_type: nflow_core::pipeline::PipelineStageType,
+    goal: &str,
+    iteration: u32,
+    history: &[nflow_core::pipeline::IterationRecord],
+    plan_output: Option<&str>,
+    implement_output: Option<&str>,
+) -> Result<String, String> {
+    let nflow_home = crate::daemon::nflow_home().map_err(|e| format!("{}", e))?;
+    let override_dir = nflow_home.join("prompts");
+    let override_path = if override_dir.is_dir() {
+        Some(override_dir)
+    } else {
+        None
+    };
+
+    let template_name = match stage_type {
+        nflow_core::pipeline::PipelineStageType::Plan => "pipeline_plan",
+        nflow_core::pipeline::PipelineStageType::Implement => "pipeline_implement",
+        nflow_core::pipeline::PipelineStageType::Review => "pipeline_review",
+    };
+
+    let template = nflow_claude::prompt::load_template(template_name, override_path.as_deref())
+        .map_err(|e| format!("failed to load template: {}", e))?;
+
+    let previous_context = if history.is_empty() {
+        String::new()
+    } else {
+        let ctx_json = serde_json::to_string_pretty(history).unwrap_or_default();
+        format!("## Previous Iterations\n\n```json\n{}\n```", ctx_json)
+    };
+
+    let iteration_str = iteration.to_string();
+    let mut vars: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
+    vars.insert("goal", goal);
+    vars.insert("iteration", &iteration_str);
+    vars.insert("previous_context", &previous_context);
+
+    let empty = String::new();
+    let plan_json_str = plan_output.unwrap_or(&empty);
+    let impl_json_str = implement_output.unwrap_or(&empty);
+
+    if matches!(
+        stage_type,
+        nflow_core::pipeline::PipelineStageType::Implement
+            | nflow_core::pipeline::PipelineStageType::Review
+    ) {
+        vars.insert("plan_json", plan_json_str);
+    }
+    if matches!(stage_type, nflow_core::pipeline::PipelineStageType::Review) {
+        vars.insert("implementation_json", impl_json_str);
+    }
+
+    nflow_claude::prompt::render_template(&template, &vars)
+        .map_err(|e| format!("failed to render template: {}", e))
+}
+
+/// Run a single pipeline stage (plan, implement, or review).
+///
+/// Returns the StageOutput and session_id (if captured).
+async fn run_pipeline_stage(
+    tx: &tokio::sync::mpsc::Sender<StreamingResponseLine>,
+    req_id: &str,
+    db_path: &Path,
+    event_bus: &Option<crate::events::SharedEventBus>,
+    run: &nflow_core::pipeline::PipelineRun,
+    stage_type: nflow_core::pipeline::PipelineStageType,
+    iteration: u32,
+    project_path: &str,
+    goal: &str,
+    history: &[nflow_core::pipeline::IterationRecord],
+    plan_output_json: Option<&str>,
+    implement_output_json: Option<&str>,
+) -> Result<(nflow_core::pipeline::StageOutput, Option<String>), String> {
+    let stage_type_str = stage_type.to_string();
+
+    let mut stage = nflow_core::pipeline::PipelineStage::new(run.id, stage_type, iteration);
+    stage.status = nflow_core::pipeline::StageStatus::Running;
+    stage.started_at = Some(chrono::Utc::now());
+
+    let context = nflow_core::pipeline::PipelineContext {
+        goal: goal.to_string(),
+        iteration,
+        history: history.to_vec(),
+    };
+    stage.input_context = serde_json::to_string(&context).ok();
+
+    if let Ok(conn) = db::open_connection(db_path) {
+        let _ = db::pipeline::insert_pipeline_stage(&conn, &stage);
+    }
+
+    if let Some(bus) = event_bus {
+        bus.broadcast(crate::events::Event::PipelineStageChange {
+            pipeline_run_id: run.id.to_string(),
+            project_id: run.project_id.to_string(),
+            stage_type: stage_type_str.clone(),
+            iteration,
+            new_status: "running".to_string(),
+        });
+    }
+
+    let _ = tx
+        .send(StreamingResponseLine::data(
+            req_id.to_string(),
+            serde_json::json!({
+                "type": "stage_start",
+                "stage_type": stage_type_str,
+                "iteration": iteration,
+            }),
+        ))
+        .await;
+
+    let prompt = build_pipeline_prompt(
+        stage_type,
+        goal,
+        iteration,
+        history,
+        plan_output_json,
+        implement_output_json,
+    )?;
+
+    let mut run_config = match stage_type {
+        nflow_core::pipeline::PipelineStageType::Plan => {
+            nflow_claude::runner::RunConfig::for_pipeline_plan(prompt)
+        }
+        nflow_core::pipeline::PipelineStageType::Implement => {
+            nflow_claude::runner::RunConfig::for_pipeline_implement(prompt)
+        }
+        nflow_core::pipeline::PipelineStageType::Review => {
+            nflow_claude::runner::RunConfig::for_pipeline_review(prompt)
+        }
+    };
+    run_config.working_dir = Some(PathBuf::from(project_path));
+
+    let runner = match std::env::var("NFLOW_CLAUDE_BINARY") {
+        Ok(bin) => nflow_claude::runner::ClaudeRunner::with_binary(bin),
+        Err(_) => nflow_claude::runner::ClaudeRunner::new(),
+    };
+    let process = runner
+        .spawn(&run_config)
+        .map_err(|e| format!("failed to spawn Claude: {}", e))?;
+
+    let nflow_home = crate::daemon::nflow_home().map_err(|e| format!("{}", e))?;
+    let log_dir = nflow_home.join("logs").join("pipeline");
+    std::fs::create_dir_all(&log_dir).map_err(|e| format!("failed to create log dir: {}", e))?;
+    let log_file_name = format!("{}_{}_{}.log", run.id, stage_type_str, iteration);
+    let log_path = log_dir.join(&log_file_name);
+
+    let log_file = tokio::fs::File::create(&log_path)
+        .await
+        .map_err(|e| format!("failed to create log file: {}", e))?;
+    let mut log_writer = tokio::io::BufWriter::new(log_file);
+
+    if let Ok(conn) = db::open_connection(db_path) {
+        let _ = db::pipeline::update_pipeline_stage_started(&conn, &stage.id, None);
+    }
+
+    let mut parser = nflow_claude::stream::StreamParser::new(process.stdout);
+    let mut child = process.child;
+    let mut result_text = String::new();
+    let mut session_id = None;
+
+    loop {
+        match parser.next_event().await {
+            Ok(Some(event)) => {
+                let log_line = match &event {
+                    nflow_claude::stream::StreamEvent::TextDelta { text } => {
+                        format!("[text] {}", text)
+                    }
+                    nflow_claude::stream::StreamEvent::ToolUse { name, .. } => {
+                        format!("[tool_use] {}", name)
+                    }
+                    nflow_claude::stream::StreamEvent::ToolResult { content } => {
+                        format!("[tool_result] {}", &content[..content.len().min(200)])
+                    }
+                    nflow_claude::stream::StreamEvent::Result {
+                        text,
+                        session_id: sid,
+                    } => {
+                        format!("[result] session={} len={}", sid, text.len())
+                    }
+                    nflow_claude::stream::StreamEvent::Error { message } => {
+                        format!("[error] {}", message)
+                    }
+                    _ => String::new(),
+                };
+
+                if !log_line.is_empty() {
+                    use tokio::io::AsyncWriteExt;
+                    let _ = log_writer
+                        .write_all(format!("{}\n", log_line).as_bytes())
+                        .await;
+                }
+
+                match &event {
+                    nflow_claude::stream::StreamEvent::TextDelta { text } => {
+                        let _ = tx
+                            .send(StreamingResponseLine::data(
+                                req_id.to_string(),
+                                serde_json::json!({
+                                    "type": "text",
+                                    "stage_type": stage_type_str,
+                                    "iteration": iteration,
+                                    "text": text,
+                                }),
+                            ))
+                            .await;
+
+                        if let Some(bus) = event_bus {
+                            bus.broadcast(crate::events::Event::PipelineAgentOutput {
+                                pipeline_run_id: run.id.to_string(),
+                                stage_type: stage_type_str.clone(),
+                                iteration,
+                                line: text.clone(),
+                            });
+                        }
+                    }
+                    nflow_claude::stream::StreamEvent::Result {
+                        text,
+                        session_id: sid,
+                    } => {
+                        result_text = text.clone();
+                        session_id = Some(sid.clone());
+                    }
+                    nflow_claude::stream::StreamEvent::Error { message } => {
+                        let _ = tx
+                            .send(StreamingResponseLine::data(
+                                req_id.to_string(),
+                                serde_json::json!({
+                                    "type": "stage_error",
+                                    "stage_type": stage_type_str,
+                                    "iteration": iteration,
+                                    "message": message,
+                                }),
+                            ))
+                            .await;
+                    }
+                    _ => {}
+                }
+            }
+            Ok(None) => {
+                break;
+            }
+            Err(e) => {
+                let _ = tx
+                    .send(StreamingResponseLine::data(
+                        req_id.to_string(),
+                        serde_json::json!({
+                            "type": "stage_error",
+                            "stage_type": stage_type_str,
+                            "iteration": iteration,
+                            "message": format!("stream error: {}", e),
+                        }),
+                    ))
+                    .await;
+                break;
+            }
+        }
+    }
+
+    {
+        use tokio::io::AsyncWriteExt;
+        let _ = log_writer.flush().await;
+    }
+
+    let _exit_status = child.wait().await.ok();
+
+    let stage_output = parse_pipeline_stage_output(&result_text, stage_type);
+    let output_json = serde_json::to_string(&stage_output).unwrap_or_default();
+
+    if let Ok(conn) = db::open_connection(db_path) {
+        let _ = db::pipeline::update_pipeline_stage(
+            &conn,
+            &stage.id,
+            "completed",
+            Some(&output_json),
+            None,
+            Some(chrono::Utc::now()),
+        );
+    }
+
+    if let Some(bus) = event_bus {
+        bus.broadcast(crate::events::Event::PipelineStageChange {
+            pipeline_run_id: run.id.to_string(),
+            project_id: run.project_id.to_string(),
+            stage_type: stage_type_str.clone(),
+            iteration,
+            new_status: "completed".to_string(),
+        });
+    }
+
+    let _ = tx
+        .send(StreamingResponseLine::data(
+            req_id.to_string(),
+            serde_json::json!({
+                "type": "stage_complete",
+                "stage_type": stage_type_str,
+                "iteration": iteration,
+                "output": stage_output,
+            }),
+        ))
+        .await;
+
+    Ok((stage_output, session_id))
+}
+
+/// Handle "pipeline.start" command -- start a new pipeline run.
+///
+/// Receives: { project_name, name, goal, max_iterations? }
+/// Returns streaming: pipeline progress events.
+fn handle_pipeline_start(req: Request, state: &HandlerState) -> HandlerResult {
+    let id = req.id.clone();
+
+    let project_name = match req.params.get("project_name").and_then(|v| v.as_str()) {
+        Some(n) => n.to_string(),
+        None => {
+            return HandlerResult::Single(Response::error(
+                id,
+                "missing required parameter: project_name",
+            ));
+        }
+    };
+
+    let name = match req.params.get("name").and_then(|v| v.as_str()) {
+        Some(n) => n.to_string(),
+        None => {
+            return HandlerResult::Single(Response::error(id, "missing required parameter: name"));
+        }
+    };
+
+    let goal = match req.params.get("goal").and_then(|v| v.as_str()) {
+        Some(g) => g.to_string(),
+        None => {
+            return HandlerResult::Single(Response::error(id, "missing required parameter: goal"));
+        }
+    };
+
+    let max_iterations = req
+        .params
+        .get("max_iterations")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(5) as u32;
+
+    let conn = match db::open_connection(&state.db_path) {
+        Ok(c) => c,
+        Err(e) => {
+            return HandlerResult::Single(Response::error(id, &format!("database error: {}", e)));
+        }
+    };
+
+    let project = match db::projects::get_project_by_name(&conn, &project_name) {
+        Ok(Some(p)) => p,
+        Ok(None) => {
+            return HandlerResult::Single(Response::error(
+                id,
+                &format!("NOT_FOUND: project '{}' not found", project_name),
+            ));
+        }
+        Err(e) => {
+            return HandlerResult::Single(Response::error(id, &format!("database error: {}", e)));
+        }
+    };
+
+    match db::pipeline::get_active_pipeline_run(&conn, &project.id) {
+        Ok(Some(_)) => {
+            return HandlerResult::Single(Response::error(
+                id,
+                "INVALID_STATE: a pipeline run is already active for this project",
+            ));
+        }
+        Ok(None) => {}
+        Err(e) => {
+            return HandlerResult::Single(Response::error(id, &format!("database error: {}", e)));
+        }
+    }
+
+    let mut pipeline_run = nflow_core::pipeline::PipelineRun::new(
+        project.id,
+        name.clone(),
+        goal.clone(),
+        max_iterations,
+    );
+    pipeline_run.status = nflow_core::pipeline::PipelineStatus::Running;
+    pipeline_run.iteration = 1;
+    pipeline_run.current_stage = Some(nflow_core::pipeline::PipelineStageType::Plan);
+
+    if let Err(e) = db::pipeline::insert_pipeline_run(&conn, &pipeline_run) {
+        return HandlerResult::Single(Response::error(id, &format!("database error: {}", e)));
+    }
+
+    let (tx, rx) = tokio::sync::mpsc::channel(64);
+    let db_path = state.db_path.clone();
+    let event_bus = state.event_bus.clone();
+    let run_id = pipeline_run.id;
+    let project_id = project.id;
+    let project_path = project.path.clone();
+
+    let initial_id = id.clone();
+    tokio::spawn(async move {
+        let _ = tx
+            .send(StreamingResponseLine::data(
+                initial_id.clone(),
+                serde_json::json!({
+                    "pipeline_run_id": run_id.to_string(),
+                    "name": name,
+                    "status": "running",
+                    "max_iterations": max_iterations,
+                }),
+            ))
+            .await;
+
+        let mut history: Vec<nflow_core::pipeline::IterationRecord> = Vec::new();
+
+        for iteration in 1..=max_iterations {
+            if let Ok(conn) = db::open_connection(&db_path) {
+                let _ = db::pipeline::update_pipeline_run(
+                    &conn,
+                    &run_id,
+                    "running",
+                    Some("plan"),
+                    iteration,
+                );
+            }
+
+            // ── PLAN STAGE ──
+            let (plan_output, _plan_session) = match run_pipeline_stage(
+                &tx,
+                &initial_id,
+                &db_path,
+                &event_bus,
+                &nflow_core::pipeline::PipelineRun {
+                    id: run_id,
+                    project_id,
+                    name: name.clone(),
+                    goal: goal.clone(),
+                    status: nflow_core::pipeline::PipelineStatus::Running,
+                    current_stage: Some(nflow_core::pipeline::PipelineStageType::Plan),
+                    iteration,
+                    max_iterations,
+                    created_at: chrono::Utc::now(),
+                    updated_at: chrono::Utc::now(),
+                },
+                nflow_core::pipeline::PipelineStageType::Plan,
+                iteration,
+                &project_path,
+                &goal,
+                &history,
+                None,
+                None,
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(e) => {
+                    let _ = tx
+                        .send(StreamingResponseLine::error(
+                            initial_id.clone(),
+                            &format!("plan stage failed: {}", e),
+                        ))
+                        .await;
+                    if let Ok(conn) = db::open_connection(&db_path) {
+                        let _ = db::pipeline::update_pipeline_run(
+                            &conn, &run_id, "failed", None, iteration,
+                        );
+                    }
+                    return;
+                }
+            };
+
+            let plan_json = serde_json::to_string_pretty(&plan_output).unwrap_or_default();
+
+            if let Ok(conn) = db::open_connection(&db_path) {
+                let _ = db::pipeline::update_pipeline_run(
+                    &conn,
+                    &run_id,
+                    "running",
+                    Some("implement"),
+                    iteration,
+                );
+            }
+
+            // ── IMPLEMENT STAGE ──
+            let (implement_output, _impl_session) = match run_pipeline_stage(
+                &tx,
+                &initial_id,
+                &db_path,
+                &event_bus,
+                &nflow_core::pipeline::PipelineRun {
+                    id: run_id,
+                    project_id,
+                    name: name.clone(),
+                    goal: goal.clone(),
+                    status: nflow_core::pipeline::PipelineStatus::Running,
+                    current_stage: Some(nflow_core::pipeline::PipelineStageType::Implement),
+                    iteration,
+                    max_iterations,
+                    created_at: chrono::Utc::now(),
+                    updated_at: chrono::Utc::now(),
+                },
+                nflow_core::pipeline::PipelineStageType::Implement,
+                iteration,
+                &project_path,
+                &goal,
+                &history,
+                Some(&plan_json),
+                None,
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(e) => {
+                    let _ = tx
+                        .send(StreamingResponseLine::error(
+                            initial_id.clone(),
+                            &format!("implement stage failed: {}", e),
+                        ))
+                        .await;
+                    if let Ok(conn) = db::open_connection(&db_path) {
+                        let _ = db::pipeline::update_pipeline_run(
+                            &conn, &run_id, "failed", None, iteration,
+                        );
+                    }
+                    return;
+                }
+            };
+
+            let impl_json = serde_json::to_string_pretty(&implement_output).unwrap_or_default();
+
+            if let Ok(conn) = db::open_connection(&db_path) {
+                let _ = db::pipeline::update_pipeline_run(
+                    &conn,
+                    &run_id,
+                    "running",
+                    Some("review"),
+                    iteration,
+                );
+            }
+
+            // ── REVIEW STAGE ──
+            let (review_output, _review_session) = match run_pipeline_stage(
+                &tx,
+                &initial_id,
+                &db_path,
+                &event_bus,
+                &nflow_core::pipeline::PipelineRun {
+                    id: run_id,
+                    project_id,
+                    name: name.clone(),
+                    goal: goal.clone(),
+                    status: nflow_core::pipeline::PipelineStatus::Running,
+                    current_stage: Some(nflow_core::pipeline::PipelineStageType::Review),
+                    iteration,
+                    max_iterations,
+                    created_at: chrono::Utc::now(),
+                    updated_at: chrono::Utc::now(),
+                },
+                nflow_core::pipeline::PipelineStageType::Review,
+                iteration,
+                &project_path,
+                &goal,
+                &history,
+                Some(&plan_json),
+                Some(&impl_json),
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(e) => {
+                    let _ = tx
+                        .send(StreamingResponseLine::error(
+                            initial_id.clone(),
+                            &format!("review stage failed: {}", e),
+                        ))
+                        .await;
+                    if let Ok(conn) = db::open_connection(&db_path) {
+                        let _ = db::pipeline::update_pipeline_run(
+                            &conn, &run_id, "failed", None, iteration,
+                        );
+                    }
+                    return;
+                }
+            };
+
+            // Evaluate next action
+            let temp_run = nflow_core::pipeline::PipelineRun {
+                id: run_id,
+                project_id,
+                name: name.clone(),
+                goal: goal.clone(),
+                status: nflow_core::pipeline::PipelineStatus::Running,
+                current_stage: Some(nflow_core::pipeline::PipelineStageType::Review),
+                iteration,
+                max_iterations,
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+            };
+
+            let action = nflow_core::pipeline::next_action(
+                &temp_run,
+                nflow_core::pipeline::PipelineStageType::Review,
+                &review_output,
+            );
+
+            match action {
+                nflow_core::pipeline::PipelineAction::Complete => {
+                    if let Ok(conn) = db::open_connection(&db_path) {
+                        let _ = db::pipeline::update_pipeline_run(
+                            &conn,
+                            &run_id,
+                            "completed",
+                            None,
+                            iteration,
+                        );
+                    }
+                    if let Some(bus) = &event_bus {
+                        bus.broadcast(crate::events::Event::PipelineCompleted {
+                            pipeline_run_id: run_id.to_string(),
+                            project_id: project_id.to_string(),
+                            status: "completed".to_string(),
+                            iterations: iteration,
+                        });
+                    }
+                    let _ = tx
+                        .send(StreamingResponseLine::done(
+                            initial_id,
+                            serde_json::json!({
+                                "pipeline_run_id": run_id.to_string(),
+                                "status": "completed",
+                                "iterations": iteration,
+                            }),
+                        ))
+                        .await;
+                    return;
+                }
+                nflow_core::pipeline::PipelineAction::MaxIterationsReached => {
+                    if let Ok(conn) = db::open_connection(&db_path) {
+                        let _ = db::pipeline::update_pipeline_run(
+                            &conn, &run_id, "failed", None, iteration,
+                        );
+                    }
+                    if let Some(bus) = &event_bus {
+                        bus.broadcast(crate::events::Event::PipelineCompleted {
+                            pipeline_run_id: run_id.to_string(),
+                            project_id: project_id.to_string(),
+                            status: "failed".to_string(),
+                            iterations: iteration,
+                        });
+                    }
+                    let _ = tx
+                        .send(StreamingResponseLine::done(
+                            initial_id,
+                            serde_json::json!({
+                                "pipeline_run_id": run_id.to_string(),
+                                "status": "failed",
+                                "reason": "max_iterations_reached",
+                                "iterations": iteration,
+                            }),
+                        ))
+                        .await;
+                    return;
+                }
+                nflow_core::pipeline::PipelineAction::LoopBack { feedback } => {
+                    let _ = tx
+                        .send(StreamingResponseLine::data(
+                            initial_id.clone(),
+                            serde_json::json!({
+                                "type": "loop_back",
+                                "iteration": iteration,
+                                "feedback": feedback,
+                            }),
+                        ))
+                        .await;
+
+                    history.push(nflow_core::pipeline::IterationRecord {
+                        iteration,
+                        plan: plan_output.plan.clone(),
+                        implementation: implement_output.implementation.clone(),
+                        review: review_output.review.clone(),
+                    });
+                }
+                nflow_core::pipeline::PipelineAction::StartStage(_) => {
+                    history.push(nflow_core::pipeline::IterationRecord {
+                        iteration,
+                        plan: plan_output.plan.clone(),
+                        implementation: implement_output.implementation.clone(),
+                        review: review_output.review.clone(),
+                    });
+                }
+            }
+        }
+
+        // Loop exited without returning: max iterations exhausted
+        if let Ok(conn) = db::open_connection(&db_path) {
+            let _ =
+                db::pipeline::update_pipeline_run(&conn, &run_id, "failed", None, max_iterations);
+        }
+        if let Some(bus) = &event_bus {
+            bus.broadcast(crate::events::Event::PipelineCompleted {
+                pipeline_run_id: run_id.to_string(),
+                project_id: project_id.to_string(),
+                status: "failed".to_string(),
+                iterations: max_iterations,
+            });
+        }
+        let _ = tx
+            .send(StreamingResponseLine::done(
+                initial_id,
+                serde_json::json!({
+                    "pipeline_run_id": run_id.to_string(),
+                    "status": "failed",
+                    "reason": "max_iterations_reached",
+                    "iterations": max_iterations,
+                }),
+            ))
+            .await;
+    });
+
+    HandlerResult::Streaming(rx)
+}
+
+/// Handle "pipeline.status" command.
+///
+/// Receives: { pipeline_run_id }
+/// Returns: { run: {...}, stages: [...] }
+fn handle_pipeline_status(req: Request, state: &HandlerState) -> Response {
+    let id = req.id.clone();
+
+    let run_id_str = match req.params.get("pipeline_run_id").and_then(|v| v.as_str()) {
+        Some(s) => s.to_string(),
+        None => {
+            return Response::error(id, "missing required parameter: pipeline_run_id");
+        }
+    };
+
+    let run_id = match uuid::Uuid::parse_str(&run_id_str) {
+        Ok(u) => u,
+        Err(_) => {
+            return Response::error(id, "INVALID_PARAMS: invalid pipeline_run_id format");
+        }
+    };
+
+    let conn = match db::open_connection(&state.db_path) {
+        Ok(c) => c,
+        Err(e) => return Response::error(id, &format!("database error: {}", e)),
+    };
+
+    let run = match db::pipeline::get_pipeline_run(&conn, &run_id) {
+        Ok(Some(r)) => r,
+        Ok(None) => {
+            return Response::error(
+                id,
+                &format!("NOT_FOUND: pipeline run '{}' not found", run_id_str),
+            );
+        }
+        Err(e) => return Response::error(id, &format!("database error: {}", e)),
+    };
+
+    let stages = match db::pipeline::list_pipeline_stages(&conn, &run_id) {
+        Ok(s) => s,
+        Err(e) => return Response::error(id, &format!("database error: {}", e)),
+    };
+
+    let stages_json: Vec<serde_json::Value> = stages
+        .iter()
+        .map(|s| {
+            serde_json::json!({
+                "id": s.id.to_string(),
+                "stage_type": s.stage_type.to_string(),
+                "iteration": s.iteration,
+                "status": s.status.to_string(),
+                "output_result": s.output_result,
+                "started_at": s.started_at.map(|dt| dt.to_rfc3339()),
+                "finished_at": s.finished_at.map(|dt| dt.to_rfc3339()),
+            })
+        })
+        .collect();
+
+    Response::ok(
+        id,
+        serde_json::json!({
+            "run": {
+                "id": run.id.to_string(),
+                "project_id": run.project_id.to_string(),
+                "name": run.name,
+                "goal": run.goal,
+                "status": run.status.to_string(),
+                "current_stage": run.current_stage.map(|s| s.to_string()),
+                "iteration": run.iteration,
+                "max_iterations": run.max_iterations,
+                "created_at": run.created_at.to_rfc3339(),
+                "updated_at": run.updated_at.to_rfc3339(),
+            },
+            "stages": stages_json,
+        }),
+    )
+}
+
+/// Handle "pipeline.list" command.
+///
+/// Receives: { project_name }
+/// Returns: { runs: [...] }
+fn handle_pipeline_list(req: Request, state: &HandlerState) -> Response {
+    let id = req.id.clone();
+
+    let project_name = match req.params.get("project_name").and_then(|v| v.as_str()) {
+        Some(n) => n.to_string(),
+        None => {
+            return Response::error(id, "missing required parameter: project_name");
+        }
+    };
+
+    let conn = match db::open_connection(&state.db_path) {
+        Ok(c) => c,
+        Err(e) => return Response::error(id, &format!("database error: {}", e)),
+    };
+
+    let project = match db::projects::get_project_by_name(&conn, &project_name) {
+        Ok(Some(p)) => p,
+        Ok(None) => {
+            return Response::error(
+                id,
+                &format!("NOT_FOUND: project '{}' not found", project_name),
+            );
+        }
+        Err(e) => return Response::error(id, &format!("database error: {}", e)),
+    };
+
+    let runs = match db::pipeline::list_pipeline_runs(&conn, &project.id) {
+        Ok(r) => r,
+        Err(e) => return Response::error(id, &format!("database error: {}", e)),
+    };
+
+    let runs_json: Vec<serde_json::Value> = runs
+        .iter()
+        .map(|r| {
+            serde_json::json!({
+                "id": r.id.to_string(),
+                "name": r.name,
+                "goal": r.goal,
+                "status": r.status.to_string(),
+                "current_stage": r.current_stage.map(|s| s.to_string()),
+                "iteration": r.iteration,
+                "max_iterations": r.max_iterations,
+                "created_at": r.created_at.to_rfc3339(),
+                "updated_at": r.updated_at.to_rfc3339(),
+            })
+        })
+        .collect();
+
+    Response::ok(
+        id,
+        serde_json::json!({
+            "runs": runs_json,
+        }),
+    )
+}
+
+/// Handle "pipeline.cancel" command.
+///
+/// Receives: { pipeline_run_id }
+/// Returns: { pipeline_run_id, status: "cancelled" }
+fn handle_pipeline_cancel(req: Request, state: &HandlerState) -> Response {
+    let id = req.id.clone();
+
+    let run_id_str = match req.params.get("pipeline_run_id").and_then(|v| v.as_str()) {
+        Some(s) => s.to_string(),
+        None => {
+            return Response::error(id, "missing required parameter: pipeline_run_id");
+        }
+    };
+
+    let run_id = match uuid::Uuid::parse_str(&run_id_str) {
+        Ok(u) => u,
+        Err(_) => {
+            return Response::error(id, "INVALID_PARAMS: invalid pipeline_run_id format");
+        }
+    };
+
+    let conn = match db::open_connection(&state.db_path) {
+        Ok(c) => c,
+        Err(e) => return Response::error(id, &format!("database error: {}", e)),
+    };
+
+    let run = match db::pipeline::get_pipeline_run(&conn, &run_id) {
+        Ok(Some(r)) => r,
+        Ok(None) => {
+            return Response::error(
+                id,
+                &format!("NOT_FOUND: pipeline run '{}' not found", run_id_str),
+            );
+        }
+        Err(e) => return Response::error(id, &format!("database error: {}", e)),
+    };
+
+    if run.status != nflow_core::pipeline::PipelineStatus::Running {
+        return Response::error(
+            id,
+            &format!(
+                "INVALID_STATE: pipeline run is not running (status: {})",
+                run.status
+            ),
+        );
+    }
+
+    if let Err(e) =
+        db::pipeline::update_pipeline_run(&conn, &run_id, "cancelled", None, run.iteration)
+    {
+        return Response::error(id, &format!("database error: {}", e));
+    }
+
+    if let Some(bus) = &state.event_bus {
+        bus.broadcast(crate::events::Event::PipelineCompleted {
+            pipeline_run_id: run_id.to_string(),
+            project_id: run.project_id.to_string(),
+            status: "cancelled".to_string(),
+            iterations: run.iteration,
+        });
+    }
+
+    Response::ok(
+        id,
+        serde_json::json!({
+            "pipeline_run_id": run_id.to_string(),
+            "status": "cancelled",
+        }),
+    )
+}
+
+/// Handle "pipeline.log" command.
+///
+/// Receives: { pipeline_run_id, stage_type?, iteration? }
+/// Returns: log content for the specified stage(s).
+fn handle_pipeline_log(req: Request, state: &HandlerState) -> Response {
+    let id = req.id.clone();
+
+    let run_id_str = match req.params.get("pipeline_run_id").and_then(|v| v.as_str()) {
+        Some(s) => s.to_string(),
+        None => {
+            return Response::error(id, "missing required parameter: pipeline_run_id");
+        }
+    };
+
+    let run_id = match uuid::Uuid::parse_str(&run_id_str) {
+        Ok(u) => u,
+        Err(_) => {
+            return Response::error(id, "INVALID_PARAMS: invalid pipeline_run_id format");
+        }
+    };
+
+    let stage_type_str = req
+        .params
+        .get("stage_type")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    let iteration = req
+        .params
+        .get("iteration")
+        .and_then(|v| v.as_u64())
+        .map(|v| v as u32);
+
+    let conn = match db::open_connection(&state.db_path) {
+        Ok(c) => c,
+        Err(e) => return Response::error(id, &format!("database error: {}", e)),
+    };
+
+    match db::pipeline::get_pipeline_run(&conn, &run_id) {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return Response::error(
+                id,
+                &format!("NOT_FOUND: pipeline run '{}' not found", run_id_str),
+            );
+        }
+        Err(e) => return Response::error(id, &format!("database error: {}", e)),
+    };
+
+    let stages = match db::pipeline::find_pipeline_stages(
+        &conn,
+        &run_id,
+        stage_type_str.as_deref(),
+        iteration,
+    ) {
+        Ok(s) => s,
+        Err(e) => return Response::error(id, &format!("database error: {}", e)),
+    };
+
+    if stages.is_empty() {
+        return Response::error(id, "NOT_FOUND: no matching pipeline stages found");
+    }
+
+    let nflow_home = match crate::daemon::nflow_home() {
+        Ok(h) => h,
+        Err(e) => {
+            return Response::error(id, &format!("failed to get nflow home: {}", e));
+        }
+    };
+
+    let mut logs: Vec<serde_json::Value> = Vec::new();
+    for stage in &stages {
+        let log_file_name = format!("{}_{}_{}.log", run_id, stage.stage_type, stage.iteration);
+        let log_path = nflow_home
+            .join("logs")
+            .join("pipeline")
+            .join(&log_file_name);
+
+        let content = if log_path.exists() {
+            std::fs::read_to_string(&log_path).unwrap_or_else(|_| String::new())
+        } else {
+            String::new()
+        };
+
+        logs.push(serde_json::json!({
+            "stage_id": stage.id.to_string(),
+            "stage_type": stage.stage_type.to_string(),
+            "iteration": stage.iteration,
+            "status": stage.status.to_string(),
+            "log_path": log_path.to_string_lossy(),
+            "content": content,
+        }));
+    }
+
+    Response::ok(
+        id,
+        serde_json::json!({
+            "pipeline_run_id": run_id_str,
+            "logs": logs,
+        }),
+    )
 }
 
 #[cfg(test)]
@@ -8163,6 +9328,7 @@ mod tests {
             wave_number: 1,
             status: DecompositionStatus::Approved,
             claude_session_id: None,
+            error_message: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };
@@ -8281,6 +9447,7 @@ mod tests {
             wave_number: 1,
             status: DecompositionStatus::Approved,
             claude_session_id: None,
+            error_message: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };
@@ -8363,6 +9530,7 @@ mod tests {
             wave_number: 1,
             status: DecompositionStatus::Approved,
             claude_session_id: None,
+            error_message: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };
@@ -8374,6 +9542,7 @@ mod tests {
             wave_number: 2,
             status: DecompositionStatus::InProgress,
             claude_session_id: None,
+            error_message: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };

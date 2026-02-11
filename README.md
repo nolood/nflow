@@ -13,9 +13,25 @@ nflow run                   # 5. Агенты работают параллел�
 nflow status                # 6. Наблюдаем
 ```
 
+### SDD Flow (Structured Development)
+
 Три фазы: **SPEC** (спецификация) → **DECOMPOSE** (декомпозиция) → **EXECUTE** (выполнение).
 
 Задачи внутри истории выполняются последовательно с чередованием impl→verify. Истории без зависимостей выполняются параллельно (до `max_parallel` агентов). После завершения всех задач nflow делает rebase, push и создаёт PR/MR.
+
+### Pipeline Flow (Rapid Development)
+
+Упрощённый поток для быстрой разработки:
+
+```
+nflow pipeline start "Add user profile page"  # Запустить pipeline
+nflow pipeline status <id>                    # Проверить статус
+nflow pipeline list                           # Список всех pipelines
+```
+
+Три стадии: **Plan** (анализ и план) → **Implement** (реализация) → **Review** (проверка).
+
+Review проверяет реализацию и, если находит проблемы, возвращается к Implement с фидбеком (до `max_iterations`, по умолчанию 5). Работает in-place (без веток), подходит для прототипов, багфиксов, быстрых доработок.
 
 ## Требования
 

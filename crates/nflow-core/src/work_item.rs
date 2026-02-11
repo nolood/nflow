@@ -86,6 +86,7 @@ pub struct WorkItem {
     pub worktree_path: Option<String>,
     pub mr_url: Option<String>,
     pub commit_hash: Option<String>,
+    pub error_message: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -132,6 +133,7 @@ impl WorkItem {
             worktree_path: None,
             mr_url: None,
             commit_hash: None,
+            error_message: None,
             created_at: now,
             updated_at: now,
         }
@@ -164,6 +166,7 @@ impl WorkItem {
             worktree_path: None,
             mr_url: None,
             commit_hash: None,
+            error_message: None,
             created_at: now,
             updated_at: now,
         }
@@ -304,6 +307,7 @@ impl WorkItem {
             worktree_path: None,
             mr_url: None,
             commit_hash: None,
+            error_message: None,
             created_at: now,
             updated_at: now,
         }
@@ -421,6 +425,7 @@ pub fn auto_generate_verify_tasks(impl_tasks: &[WorkItem]) -> Vec<WorkItem> {
                 worktree_path: None,
                 mr_url: None,
                 commit_hash: None,
+                error_message: None,
                 created_at: now,
                 updated_at: now,
             }

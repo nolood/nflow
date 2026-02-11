@@ -53,13 +53,31 @@ Unix socket at `~/.nflow/nflow.sock`, NDJSON (newline-delimited JSON).
 
 **Streaming**: multiple lines with `done: false`, final line with `done: true`.
 
-**Command namespaces**: `project.*`, `spec.*`, `plan.*`, `exec.*`, `worktree.*`, `cleanup.*`, `config.*`. All command dispatch is in `nflow-daemon/src/handlers.rs` (large file — ~10k lines).
+**Command namespaces**: `project.*`, `spec.*`, `plan.*`, `exec.*`, `pipeline.*`, `worktree.*`, `cleanup.*`, `config.*`. All command dispatch is in `nflow-daemon/src/handlers.rs` (large file — ~10k lines).
 
-## Three-Phase Flow
+## Two Development Flows
+
+nflow supports two workflows:
+
+### SDD Flow (SPEC → DECOMPOSE → EXECUTE)
+
+The full structured development lifecycle:
 
 1. **SPEC** — Interactive Claude dialogue produces markdown specs (`nflow spec new`)
 2. **DECOMPOSE** — Claude decomposes approved specs into epic→story→task DAG as JSON (`nflow plan generate`). Auto-generates verify tasks after each impl task.
 3. **EXECUTE** — Scheduler runs Claude agents in git worktrees. Each story = 1 worktree + 1 branch + 1 MR. Tasks run sequentially within a story (impl→verify alternation). Stories run in parallel across dependency chains (up to `max_parallel`).
+
+Use for: complex features, formal planning, parallel story execution, structured MR workflow.
+
+### Pipeline Flow (Plan → Implement → Review)
+
+Simplified 3-stage sequential flow for rapid development:
+
+1. **PLAN** — Claude analyzes task and creates implementation plan
+2. **IMPLEMENT** — Claude executes plan and makes code changes (in-place, no branches)
+3. **REVIEW** — Claude verifies implementation, loops back if issues found (max iterations: 5 default)
+
+Use for: rapid prototyping, small features, bug fixes, quick exploration. See `docs/pipeline.md` for details.
 
 ## Work Item Hierarchy & IDs
 
@@ -73,9 +91,9 @@ Unix socket at `~/.nflow/nflow.sock`, NDJSON (newline-delimited JSON).
 
 SQLite with custom migration system. Numbered files in `crates/nflow-daemon/migrations/` (`001_init.sql`, etc.), applied on daemon start.
 
-Key tables: `projects`, `specs`, `work_items` (unified for epic/story/task with self-referential `parent_id`), `dependencies`, `agent_runs`, `decomposition_sessions`.
+Key tables: `projects`, `specs`, `work_items` (unified for epic/story/task with self-referential `parent_id`), `dependencies`, `agent_runs`, `decomposition_sessions`, `pipeline_runs`, `pipeline_stages`.
 
-DB access layer is in `nflow-daemon/src/db/` (modules: `projects`, `specs`, `work_items`, `agent_runs`, `decomposition_sessions`).
+DB access layer is in `nflow-daemon/src/db/` (modules: `projects`, `specs`, `work_items`, `agent_runs`, `decomposition_sessions`, `pipeline`).
 
 ## Test Organization
 
@@ -86,7 +104,11 @@ DB access layer is in `nflow-daemon/src/db/` (modules: `projects`, `specs`, `wor
 
 ## Prompt Templates
 
-Located in `prompts/`, embedded at compile time via `include_str!`. User overrides in `~/.nflow/prompts/`. Uses simple `{variable}` substitution (`nflow-claude/src/prompt.rs`). Key templates: `spec_session.md`, `decompose.md`, `task_execution.md`, `verify_task.md`, `mr_body.md`.
+Located in `prompts/`, embedded at compile time via `include_str!`. User overrides in `~/.nflow/prompts/`. Uses simple `{variable}` substitution (`nflow-claude/src/prompt.rs`).
+
+**SDD Flow templates**: `spec_session.md`, `decompose.md`, `task_execution.md`, `verify_task.md`, `mr_body.md`
+
+**Pipeline Flow templates**: `pipeline_plan.md`, `pipeline_implement.md`, `pipeline_review.md`
 
 ## Daemon Lifecycle
 

@@ -32,6 +32,28 @@ pub enum Event {
         project_id: String,
         wave_number: u32,
     },
+    /// A pipeline stage changed status.
+    PipelineStageChange {
+        pipeline_run_id: String,
+        project_id: String,
+        stage_type: String,
+        iteration: u32,
+        new_status: String,
+    },
+    /// A pipeline run completed.
+    PipelineCompleted {
+        pipeline_run_id: String,
+        project_id: String,
+        status: String,
+        iterations: u32,
+    },
+    /// Output from a pipeline agent process.
+    PipelineAgentOutput {
+        pipeline_run_id: String,
+        stage_type: String,
+        iteration: u32,
+        line: String,
+    },
 }
 
 /// A client subscription identified by a unique ID.

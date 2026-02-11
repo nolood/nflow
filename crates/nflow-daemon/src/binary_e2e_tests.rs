@@ -222,7 +222,10 @@ mod tests {
         // --- AC2: PID file should exist ---
         assert!(pid_path.exists(), "PID file should exist");
         let pid_content = fs::read_to_string(&pid_path).unwrap();
-        let daemon_pid: u32 = pid_content.trim().parse().expect("PID file should contain a number");
+        let daemon_pid: u32 = pid_content
+            .trim()
+            .parse()
+            .expect("PID file should contain a number");
         assert_eq!(daemon_pid, child.id(), "PID file should match child PID");
 
         // --- AC3: Perform NDJSON handshake ---
@@ -269,9 +272,7 @@ mod tests {
         send_sigterm(&child);
 
         // Wait for the process to exit
-        let status = child
-            .wait()
-            .expect("failed to wait for daemon");
+        let status = child.wait().expect("failed to wait for daemon");
 
         // Process should have exited (SIGTERM causes graceful shutdown)
         assert!(
@@ -327,7 +328,11 @@ mod tests {
                 "git_provider": "github"
             }),
         );
-        assert_eq!(resp["status"], "ok", "project.init should succeed: {:?}", resp);
+        assert_eq!(
+            resp["status"], "ok",
+            "project.init should succeed: {:?}",
+            resp
+        );
 
         // Cleanup
         drop(writer);
@@ -467,7 +472,10 @@ mod tests {
                 "spec_name": "nonexistent-spec"
             }),
         );
-        assert_eq!(resp["status"], "error", "spec.approve should fail for nonexistent spec");
+        assert_eq!(
+            resp["status"], "error",
+            "spec.approve should fail for nonexistent spec"
+        );
         let msg = resp["data"]["message"].as_str().unwrap();
         assert!(
             msg.contains("NOT_FOUND"),
@@ -487,7 +495,10 @@ mod tests {
             "plan.show",
             serde_json::json!({ "project_name": "test-project" }),
         );
-        assert_eq!(resp["status"], "error", "plan.show should fail with no plans");
+        assert_eq!(
+            resp["status"], "error",
+            "plan.show should fail with no plans"
+        );
         let msg = resp["data"]["message"].as_str().unwrap();
         assert!(
             msg.contains("NOT_FOUND") && msg.contains("no decomposition waves"),
@@ -616,7 +627,10 @@ mod tests {
             "nonexistent.command",
             serde_json::json!({}),
         );
-        assert_eq!(resp["status"], "error", "unknown command should return error");
+        assert_eq!(
+            resp["status"], "error",
+            "unknown command should return error"
+        );
         let msg = resp["data"]["message"].as_str().unwrap();
         assert!(
             msg.contains("unknown command"),
@@ -632,7 +646,10 @@ mod tests {
             "spec.list",
             serde_json::json!({}),
         );
-        assert_eq!(resp["status"], "error", "missing params should return error");
+        assert_eq!(
+            resp["status"], "error",
+            "missing params should return error"
+        );
         let msg = resp["data"]["message"].as_str().unwrap();
         assert!(
             msg.contains("missing required parameter"),

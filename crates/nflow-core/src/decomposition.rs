@@ -15,6 +15,7 @@ pub enum DecompositionStatus {
     InProgress,
     Approved,
     Discarded,
+    Failed,
 }
 
 impl fmt::Display for DecompositionStatus {
@@ -23,6 +24,7 @@ impl fmt::Display for DecompositionStatus {
             DecompositionStatus::InProgress => write!(f, "in_progress"),
             DecompositionStatus::Approved => write!(f, "approved"),
             DecompositionStatus::Discarded => write!(f, "discarded"),
+            DecompositionStatus::Failed => write!(f, "failed"),
         }
     }
 }
@@ -38,6 +40,7 @@ pub struct DecompositionSession {
     pub wave_number: u32,
     pub status: DecompositionStatus,
     pub claude_session_id: Option<String>,
+    pub error_message: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -65,6 +68,7 @@ impl DecompositionSession {
             wave_number: max_wave_number + 1,
             status: DecompositionStatus::InProgress,
             claude_session_id: None,
+            error_message: None,
             created_at: now,
             updated_at: now,
         })
@@ -106,6 +110,30 @@ impl DecompositionSession {
     pub fn set_claude_session_id(&mut self, session_id: String) {
         self.claude_session_id = Some(session_id);
         self.updated_at = Utc::now();
+    }
+
+    /// Mark the session as failed.
+    ///
+    /// Valid transition: InProgress -> Failed
+    pub fn fail(&mut self) -> Result<()> {
+        if self.status != DecompositionStatus::InProgress {
+            return Err(NflowError::InvalidTransition {
+                from: self.status.to_string(),
+                to: "failed".into(),
+            });
+        }
+        self.status = DecompositionStatus::Failed;
+        self.updated_at = Utc::now();
+        Ok(())
+    }
+
+    /// Mark the session as failed with an error message.
+    ///
+    /// Valid transition: InProgress -> Failed
+    pub fn fail_with_message(&mut self, message: String) -> Result<()> {
+        self.fail()?;
+        self.error_message = Some(message);
+        Ok(())
     }
 }
 
@@ -188,6 +216,7 @@ mod tests {
         assert_eq!(session.wave_number, 1);
         assert_eq!(session.status, DecompositionStatus::InProgress);
         assert!(session.claude_session_id.is_none());
+        assert!(session.error_message.is_none());
     }
 
     #[test]

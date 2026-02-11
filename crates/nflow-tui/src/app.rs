@@ -1,5 +1,32 @@
+use std::time::Instant;
+
 use crate::error::Result;
 use crate::socket_client::{ResponseStatus, SocketClient};
+
+/// Current phase of the plan decomposition process.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DecompositionPhase {
+    /// No decomposition in progress.
+    Idle,
+    /// Decomposition request sent, waiting for first event.
+    Starting,
+    /// Claude is analyzing specs (receiving text events).
+    Analyzing,
+    /// Claude is building work items (receiving tool_use/input_json_delta events).
+    BuildingItems,
+    /// Decomposition finished successfully.
+    Completed(DecompositionSummary),
+    /// Decomposition failed with an error message.
+    Failed(String),
+}
+
+/// Summary of a completed decomposition for display.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecompositionSummary {
+    pub epic_count: u32,
+    pub story_count: u32,
+    pub task_count: u32,
+}
 
 /// A single spec entry for display in the specs list view.
 #[derive(Debug, Clone)]
@@ -288,6 +315,8 @@ pub struct PlanTreeNode {
     pub progress: Option<String>,
     /// Task kind: "impl" or "verify" (tasks only).
     pub kind: Option<String>,
+    /// Error message for failed items.
+    pub error_message: Option<String>,
 }
 
 /// State for the plan tree view.
@@ -303,6 +332,8 @@ pub struct PlanTreeState {
     pub wave_number: Option<u32>,
     /// Wave status (e.g., "in_progress", "approved").
     pub wave_status: Option<String>,
+    /// Spec names for this wave.
+    pub spec_names: Vec<String>,
 }
 
 impl PlanTreeState {
@@ -313,6 +344,7 @@ impl PlanTreeState {
             hide_verify: false,
             wave_number: None,
             wave_status: None,
+            spec_names: Vec::new(),
         }
     }
 
@@ -453,6 +485,11 @@ impl PlanTreeState {
         }
     }
 
+    /// Returns true if the tree has any epic nodes (depth 1).
+    pub fn has_epics(&self) -> bool {
+        self.nodes.iter().any(|n| n.depth == 1)
+    }
+
     /// Update tree from daemon plan.show response data.
     pub fn update_from_response(&mut self, data: &serde_json::Value) {
         let wave_number = data
@@ -463,9 +500,19 @@ impl PlanTreeState {
             .get("status")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
+        let spec_names: Vec<String> = data
+            .get("spec_names")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
 
         self.wave_number = wave_number;
         self.wave_status = wave_status.clone();
+        self.spec_names = spec_names.clone();
 
         let mut nodes = Vec::new();
 
@@ -477,9 +524,22 @@ impl PlanTreeState {
             .get("epics")
             .and_then(|v| v.as_array())
             .is_some_and(|a| !a.is_empty());
+        let wave_title = if spec_names.is_empty() {
+            wave_status.unwrap_or_default()
+        } else {
+            format!(
+                "{} [{}]",
+                wave_status.unwrap_or_default(),
+                spec_names.join(", ")
+            )
+        };
+        let wave_error_message = data
+            .get("error_message")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
         nodes.push(PlanTreeNode {
             short_id: wave_label,
-            title: wave_status.unwrap_or_default(),
+            title: wave_title,
             status: String::new(),
             depth: 0,
             collapsed: false,
@@ -487,6 +547,7 @@ impl PlanTreeState {
             depends_on: Vec::new(),
             progress: None,
             kind: None,
+            error_message: wave_error_message,
         });
 
         if let Some(epics) = data.get("epics").and_then(|v| v.as_array()) {
@@ -509,6 +570,10 @@ impl PlanTreeState {
                 let stories = epic.get("stories").and_then(|v| v.as_array());
                 let has_stories = stories.is_some_and(|s| !s.is_empty());
 
+                let epic_error_message = epic
+                    .get("error_message")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
                 nodes.push(PlanTreeNode {
                     short_id: epic_short_id,
                     title: epic_title,
@@ -519,6 +584,7 @@ impl PlanTreeState {
                     depends_on: Vec::new(),
                     progress: None,
                     kind: None,
+                    error_message: epic_error_message,
                 });
 
                 if let Some(stories) = stories {
@@ -554,6 +620,10 @@ impl PlanTreeState {
                         let tasks = story.get("tasks").and_then(|v| v.as_array());
                         let has_tasks = tasks.is_some_and(|t| !t.is_empty());
 
+                        let story_error_message = story
+                            .get("error_message")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string());
                         nodes.push(PlanTreeNode {
                             short_id: story_short_id,
                             title: story_title,
@@ -564,6 +634,7 @@ impl PlanTreeState {
                             depends_on: story_deps,
                             progress: story_progress,
                             kind: None,
+                            error_message: story_error_message,
                         });
 
                         if let Some(tasks) = tasks {
@@ -588,6 +659,10 @@ impl PlanTreeState {
                                     .and_then(|v| v.as_str())
                                     .map(|s| s.to_string());
 
+                                let task_error_message = task
+                                    .get("error_message")
+                                    .and_then(|v| v.as_str())
+                                    .map(|s| s.to_string());
                                 nodes.push(PlanTreeNode {
                                     short_id: task_short_id,
                                     title: task_title,
@@ -598,6 +673,7 @@ impl PlanTreeState {
                                     depends_on: Vec::new(),
                                     progress: None,
                                     kind: task_kind,
+                                    error_message: task_error_message,
                                 });
                             }
                         }
@@ -613,6 +689,14 @@ impl PlanTreeState {
         if !visible.is_empty() && self.selected >= visible.len() {
             self.selected = visible.len() - 1;
         }
+    }
+
+    /// Clear the plan tree state.
+    pub fn clear(&mut self) {
+        self.nodes.clear();
+        self.selected = 0;
+        self.wave_number = None;
+        self.wave_status = None;
     }
 }
 
@@ -749,6 +833,8 @@ pub struct PlanDetailState {
     pub kind: Option<String>,
     /// Node depth.
     pub depth: u8,
+    /// Error message for failed items.
+    pub error_message: Option<String>,
 }
 
 /// State for daemon event subscription.
@@ -785,6 +871,8 @@ pub struct ExecuteTreeNode {
     pub progress: Option<String>,
     /// MR URL for completed stories.
     pub mr_url: Option<String>,
+    /// Error message for failed items.
+    pub error_message: Option<String>,
 }
 
 /// State for the execute tree view (left pane).
@@ -1095,6 +1183,10 @@ impl ExecuteTreeState {
                     .unwrap_or("")
                     .to_string();
 
+                if wave_status == "discarded" {
+                    continue;
+                }
+
                 let wave_label = wave_number
                     .map(|w| format!("W{}", w))
                     .unwrap_or_else(|| "Wave".to_string());
@@ -1103,6 +1195,10 @@ impl ExecuteTreeState {
                     .and_then(|v| v.as_array())
                     .is_some_and(|a| !a.is_empty());
 
+                let wave_error_message = wave
+                    .get("error_message")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
                 nodes.push(ExecuteTreeNode {
                     short_id: wave_label,
                     title: wave_status,
@@ -1113,6 +1209,7 @@ impl ExecuteTreeState {
                     kind: None,
                     progress: None,
                     mr_url: None,
+                    error_message: wave_error_message,
                 });
 
                 if let Some(epics) = wave.get("epics").and_then(|v| v.as_array()) {
@@ -1135,6 +1232,10 @@ impl ExecuteTreeState {
                         let stories = epic.get("stories").and_then(|v| v.as_array());
                         let has_stories = stories.is_some_and(|s| !s.is_empty());
 
+                        let epic_error_message = epic
+                            .get("error_message")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string());
                         nodes.push(ExecuteTreeNode {
                             short_id: epic_short_id,
                             title: epic_title,
@@ -1145,6 +1246,7 @@ impl ExecuteTreeState {
                             kind: None,
                             progress: None,
                             mr_url: None,
+                            error_message: epic_error_message,
                         });
 
                         if let Some(stories) = stories {
@@ -1171,6 +1273,10 @@ impl ExecuteTreeState {
                                 let tasks = story.get("tasks").and_then(|v| v.as_array());
                                 let has_tasks = tasks.is_some_and(|t| !t.is_empty());
 
+                                let story_error_message = story
+                                    .get("error_message")
+                                    .and_then(|v| v.as_str())
+                                    .map(|s| s.to_string());
                                 nodes.push(ExecuteTreeNode {
                                     short_id: story_short_id,
                                     title: story_title,
@@ -1181,6 +1287,7 @@ impl ExecuteTreeState {
                                     kind: None,
                                     progress: story_progress,
                                     mr_url: None,
+                                    error_message: story_error_message,
                                 });
 
                                 if let Some(tasks) = tasks {
@@ -1205,6 +1312,10 @@ impl ExecuteTreeState {
                                             .and_then(|v| v.as_str())
                                             .map(|s| s.to_string());
 
+                                        let task_error_message = task
+                                            .get("error_message")
+                                            .and_then(|v| v.as_str())
+                                            .map(|s| s.to_string());
                                         nodes.push(ExecuteTreeNode {
                                             short_id: task_short_id,
                                             title: task_title,
@@ -1215,6 +1326,7 @@ impl ExecuteTreeState {
                                             kind: task_kind,
                                             progress: None,
                                             mr_url: None,
+                                            error_message: task_error_message,
                                         });
                                     }
                                 }
@@ -1317,6 +1429,347 @@ impl ExecuteOutputState {
     /// Scroll down in the output pane.
     pub fn scroll_down(&mut self) {
         self.scroll_offset = self.scroll_offset.saturating_sub(1);
+    }
+}
+
+/// State for the decomposition output pane (plan view during decomposition).
+#[derive(Debug)]
+pub struct DecompositionOutputState {
+    /// Log lines from Claude's decomposition streaming output.
+    pub lines: Vec<String>,
+    /// Whether we're streaming live output.
+    pub is_streaming: bool,
+    /// Streaming request ID (for validating response lines).
+    pub request_id: Option<String>,
+    /// Current scroll offset (0 = bottom for streaming).
+    pub scroll_offset: u16,
+    /// Total number of lines.
+    pub total_lines: u16,
+    /// Partial line accumulator for text events that don't end with newline.
+    partial_line: String,
+    /// Accumulator for tool input JSON fragments.
+    tool_input_buffer: String,
+}
+
+impl DecompositionOutputState {
+    pub fn new() -> Self {
+        Self {
+            lines: Vec::new(),
+            is_streaming: false,
+            request_id: None,
+            scroll_offset: 0,
+            total_lines: 0,
+            partial_line: String::new(),
+            tool_input_buffer: String::new(),
+        }
+    }
+
+    /// Start streaming output for a decomposition.
+    pub fn start_streaming(&mut self, request_id: String) {
+        self.clear();
+        self.is_streaming = true;
+        self.request_id = Some(request_id);
+        self.tool_input_buffer.clear();
+    }
+
+    /// Append a line of streaming output.
+    pub fn append_line(&mut self, line: String) {
+        self.lines.push(line);
+        self.total_lines = self.lines.len() as u16;
+        // Auto-scroll when streaming (keep at bottom)
+        self.scroll_offset = 0;
+    }
+
+    /// Stop streaming.
+    pub fn stop_streaming(&mut self) {
+        self.is_streaming = false;
+        self.request_id = None;
+        // Flush any remaining partial line
+        if !self.partial_line.is_empty() {
+            self.lines.push(self.partial_line.clone());
+            self.partial_line.clear();
+            self.total_lines = self.lines.len() as u16;
+        }
+    }
+
+    /// Clear the output pane.
+    pub fn clear(&mut self) {
+        self.lines.clear();
+        self.total_lines = 0;
+        self.is_streaming = false;
+        self.request_id = None;
+        self.scroll_offset = 0;
+        self.partial_line.clear();
+        self.tool_input_buffer.clear();
+    }
+
+    /// Scroll up in the output pane.
+    pub fn scroll_up(&mut self) {
+        self.scroll_offset = self.scroll_offset.saturating_add(1);
+    }
+
+    /// Scroll down in the output pane.
+    pub fn scroll_down(&mut self) {
+        self.scroll_offset = self.scroll_offset.saturating_sub(1);
+    }
+
+    /// Append a streaming event from the decomposition process.
+    /// Handles text deltas, tool use, tool results, and errors.
+    pub fn append_decomposition_event(&mut self, data: &serde_json::Value) {
+        let event_type = data.get("type").and_then(|v| v.as_str()).unwrap_or("");
+
+        match event_type {
+            "text" => {
+                // Claude's reasoning text - split by newlines and accumulate partials
+                if let Some(text) = data.get("text").and_then(|v| v.as_str()) {
+                    // If partial_line is not empty, prepend it to the text
+                    let full_text = if self.partial_line.is_empty() {
+                        text.to_string()
+                    } else {
+                        let mut combined = self.partial_line.clone();
+                        combined.push_str(text);
+                        self.partial_line.clear();
+                        combined
+                    };
+
+                    // Split by newlines
+                    let mut iter = full_text.split('\n').peekable();
+                    while let Some(line) = iter.next() {
+                        if iter.peek().is_some() {
+                            // Not the last fragment, so it's a complete line
+                            self.append_line(line.to_string());
+                        } else {
+                            // Last fragment - might be partial
+                            if text.ends_with('\n') {
+                                // Text ended with newline, so this is a complete line
+                                self.append_line(line.to_string());
+                            } else {
+                                // Partial line - accumulate it
+                                self.partial_line = line.to_string();
+                            }
+                        }
+                    }
+                }
+            }
+            "input_json_delta" => {
+                // Accumulate partial JSON for tool input
+                if let Some(partial) = data.get("partial_json").and_then(|v| v.as_str()) {
+                    self.tool_input_buffer.push_str(partial);
+
+                    // Remove previous typing indicator if it exists
+                    if self
+                        .lines
+                        .last()
+                        .is_some_and(|l| l == "  \u{22EF} typing...")
+                    {
+                        self.lines.pop();
+                        self.total_lines = self.total_lines.saturating_sub(1);
+                    }
+
+                    // Show a minimal typing indicator instead of raw JSON
+                    self.append_line("  \u{22EF} typing...".to_string());
+                }
+            }
+            "tool_use" => {
+                // Clear the tool input buffer (the complete tool_use event has arrived)
+                self.tool_input_buffer.clear();
+
+                // Flush any partial line first
+                if !self.partial_line.is_empty() {
+                    self.append_line(self.partial_line.clone());
+                    self.partial_line.clear();
+                }
+
+                // Remove the typing indicator if present
+                if self
+                    .lines
+                    .last()
+                    .is_some_and(|l| l == "  \u{22EF} typing...")
+                {
+                    self.lines.pop();
+                    self.total_lines = self.total_lines.saturating_sub(1);
+                }
+
+                let name = data
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown");
+                let input = data.get("input");
+
+                // Add empty line before tool block for breathing room
+                if !self.lines.is_empty() {
+                    self.append_line(String::new());
+                }
+
+                // Separator line with tool name
+                self.append_line(format!(
+                    "\u{2500}\u{2500}\u{2500}\u{2500}\u{2500} Tool: {} \u{2500}\u{2500}\u{2500}\u{2500}\u{2500}",
+                    name
+                ));
+
+                // Extract and display key parameters based on tool name
+                if let Some(input_obj) = input {
+                    Self::format_tool_params(name, input_obj, &mut self.lines);
+                    self.total_lines = self.lines.len() as u16;
+                    self.scroll_offset = 0;
+                }
+            }
+            "tool_result" => {
+                let content = data.get("content").and_then(|v| v.as_str()).unwrap_or("");
+
+                if content.is_empty() {
+                    self.append_line("  \u{21B3} (no output)".to_string());
+                } else {
+                    let result_lines: Vec<&str> = content.lines().collect();
+                    let max_display_lines: usize = 4;
+                    let max_line_width = 120;
+
+                    // Show first line with arrow indicator
+                    if let Some(first) = result_lines.first() {
+                        let truncated = truncate_str(first, max_line_width);
+                        self.append_line(format!("  \u{21B3} {}", truncated));
+                    }
+
+                    // Show subsequent lines (up to max) with indentation
+                    for line in result_lines
+                        .iter()
+                        .skip(1)
+                        .take(max_display_lines.saturating_sub(1))
+                    {
+                        let truncated = truncate_str(line, max_line_width);
+                        self.append_line(format!("    {}", truncated));
+                    }
+
+                    // If more lines exist, show a summary
+                    if result_lines.len() > max_display_lines {
+                        self.append_line(format!(
+                            "    ... ({} more lines)",
+                            result_lines.len() - max_display_lines
+                        ));
+                    }
+                }
+            }
+            "result" => {
+                // Flush any partial line first
+                if !self.partial_line.is_empty() {
+                    self.append_line(self.partial_line.clone());
+                    self.partial_line.clear();
+                }
+                self.append_line("[Decomposition complete]".to_string());
+            }
+            "error" => {
+                // Flush any partial line first
+                if !self.partial_line.is_empty() {
+                    self.append_line(self.partial_line.clone());
+                    self.partial_line.clear();
+                }
+                let message = data
+                    .get("message")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown error");
+                self.append_line(format!("[Error: {}]", message));
+            }
+            "parse_error" => {
+                // Silently ignore parse errors — they are internal diagnostics, not user-facing errors.
+                // Most parse errors are from valid Claude events we don't need to handle (system, assistant, user turn markers,
+                // stream metadata events like content_block_start/stop, message_start/stop, etc.)
+                // No need to display these to the user.
+            }
+            _ => {
+                // Unknown event type - ignore
+            }
+        }
+    }
+
+    /// Format tool parameters into human-readable indented lines.
+    /// Pushes directly into the provided lines vector for efficiency.
+    fn format_tool_params(tool_name: &str, input: &serde_json::Value, lines: &mut Vec<String>) {
+        let max_value_len: usize = 120;
+
+        let truncate = |s: &str| -> String { truncate_str(s, max_value_len) };
+
+        let obj = match input.as_object() {
+            Some(o) => o,
+            None => {
+                // Not an object — just show the raw value
+                let raw = input.to_string();
+                lines.push(format!("  {}", truncate(&raw)));
+                return;
+            }
+        };
+
+        // For known tools, extract the most important parameter first
+        match tool_name {
+            "Bash" | "bash" => {
+                if let Some(cmd) = obj.get("command").and_then(|v| v.as_str()) {
+                    lines.push(format!("  command: {}", truncate(cmd)));
+                }
+                if let Some(desc) = obj.get("description").and_then(|v| v.as_str()) {
+                    lines.push(format!("  description: {}", truncate(desc)));
+                }
+            }
+            "Read" | "read" => {
+                if let Some(path) = obj.get("file_path").and_then(|v| v.as_str()) {
+                    lines.push(format!("  file_path: {}", truncate(path)));
+                }
+                if let Some(offset) = obj.get("offset") {
+                    lines.push(format!("  offset: {}", offset));
+                }
+                if let Some(limit) = obj.get("limit") {
+                    lines.push(format!("  limit: {}", limit));
+                }
+            }
+            "Write" | "write" => {
+                if let Some(path) = obj.get("file_path").and_then(|v| v.as_str()) {
+                    lines.push(format!("  file_path: {}", truncate(path)));
+                }
+            }
+            "Edit" | "edit" => {
+                if let Some(path) = obj.get("file_path").and_then(|v| v.as_str()) {
+                    lines.push(format!("  file_path: {}", truncate(path)));
+                }
+                if let Some(old) = obj.get("old_string").and_then(|v| v.as_str()) {
+                    let first_line = old.lines().next().unwrap_or("");
+                    lines.push(format!("  old_string: {}", truncate(first_line)));
+                }
+            }
+            "Glob" | "glob" => {
+                if let Some(pattern) = obj.get("pattern").and_then(|v| v.as_str()) {
+                    lines.push(format!("  pattern: {}", truncate(pattern)));
+                }
+                if let Some(path) = obj.get("path").and_then(|v| v.as_str()) {
+                    lines.push(format!("  path: {}", truncate(path)));
+                }
+            }
+            "Grep" | "grep" => {
+                if let Some(pattern) = obj.get("pattern").and_then(|v| v.as_str()) {
+                    lines.push(format!("  pattern: {}", truncate(pattern)));
+                }
+                if let Some(path) = obj.get("path").and_then(|v| v.as_str()) {
+                    lines.push(format!("  path: {}", truncate(path)));
+                }
+            }
+            _ => {
+                // Generic: show all params as key: value, up to 5
+                for (count, (key, val)) in obj.iter().enumerate() {
+                    if count >= 5 {
+                        lines.push(format!("  ... ({} more params)", obj.len() - 5));
+                        break;
+                    }
+                    let display_val = match val {
+                        serde_json::Value::String(s) => truncate(s),
+                        serde_json::Value::Null => "null".to_string(),
+                        serde_json::Value::Bool(b) => b.to_string(),
+                        serde_json::Value::Number(n) => n.to_string(),
+                        _ => {
+                            let raw = val.to_string();
+                            truncate(&raw)
+                        }
+                    };
+                    lines.push(format!("  {}: {}", key, display_val));
+                }
+            }
+        }
     }
 }
 
@@ -1558,6 +2011,8 @@ fn format_single_entry(entry: &LogEntry) -> String {
         let time_part = if let Some(t_pos) = ts.find('T') {
             let time_str = &ts[t_pos + 1..];
             // Truncate at seconds (drop fractional/timezone)
+            // Safety: All slice positions come from find() on ASCII chars ('.', '+', 'T')
+            // which always return valid UTF-8 boundaries.
             if let Some(dot) = time_str.find('.') {
                 &time_str[..dot]
             } else if let Some(plus) = time_str.find('+') {
@@ -1705,6 +2160,161 @@ impl FilterState {
     }
 }
 
+/// A pipeline run item for display in the list.
+#[derive(Debug, Clone)]
+pub struct PipelineRunItem {
+    pub id: String,
+    pub name: String,
+    pub status: String,
+    pub current_stage: Option<String>,
+    pub iteration: u32,
+    pub max_iterations: u32,
+    pub created_at: String,
+}
+
+/// State for the pipeline list view.
+#[derive(Debug)]
+pub struct PipelineListState {
+    pub runs: Vec<PipelineRunItem>,
+    pub selected: usize,
+}
+
+impl PipelineListState {
+    pub fn new() -> Self {
+        Self {
+            runs: Vec::new(),
+            selected: 0,
+        }
+    }
+
+    pub fn select_prev(&mut self) {
+        if self.selected > 0 {
+            self.selected -= 1;
+        }
+    }
+
+    pub fn select_next(&mut self) {
+        if !self.runs.is_empty() && self.selected < self.runs.len() - 1 {
+            self.selected += 1;
+        }
+    }
+
+    pub fn selected_item(&self) -> Option<&PipelineRunItem> {
+        self.runs.get(self.selected)
+    }
+}
+
+/// A pipeline stage item for display.
+#[derive(Debug, Clone)]
+pub struct PipelineStageItem {
+    pub stage_type: String,
+    pub iteration: u32,
+    pub status: String,
+}
+
+/// State for the pipeline detail view.
+#[derive(Debug)]
+pub struct PipelineDetailState {
+    pub run: PipelineRunItem,
+    pub stages: Vec<PipelineStageItem>,
+    pub selected_stage: usize,
+    #[allow(dead_code)]
+    pub output_lines: Vec<String>, // Deprecated: kept for backward compat, use stage_outputs
+    pub stage_outputs: std::collections::HashMap<String, Vec<String>>, // Key: "plan_1", "implement_1", etc.
+    pub is_streaming: bool,
+    pub scroll_offset: u16,
+    pub current_streaming_stage: Option<(String, u32)>, // Track current stage during streaming (stage_type, iteration)
+}
+
+impl PipelineDetailState {
+    pub fn new(run: PipelineRunItem) -> Self {
+        Self {
+            run,
+            stages: Vec::new(),
+            selected_stage: 0,
+            output_lines: Vec::new(),
+            stage_outputs: std::collections::HashMap::new(),
+            is_streaming: false,
+            scroll_offset: 0,
+            current_streaming_stage: None,
+        }
+    }
+
+    /// Generate a unique key for a stage: "stage_type_iteration"
+    pub fn stage_key(stage_type: &str, iteration: u32) -> String {
+        format!("{}_{}", stage_type, iteration)
+    }
+
+    /// Append output to a specific stage's output buffer.
+    pub fn append_stage_output(&mut self, stage_type: &str, iteration: u32, text: String) {
+        let key = Self::stage_key(stage_type, iteration);
+        self.stage_outputs.entry(key).or_default().push(text);
+    }
+
+    /// Get the output lines for the currently selected stage.
+    pub fn current_stage_output(&self) -> &[String] {
+        if let Some(stage) = self.stages.get(self.selected_stage) {
+            let key = Self::stage_key(&stage.stage_type, stage.iteration);
+            if let Some(lines) = self.stage_outputs.get(&key) {
+                return lines;
+            }
+        }
+        &[]
+    }
+
+    pub fn select_prev_stage(&mut self) {
+        if self.selected_stage > 0 {
+            self.selected_stage -= 1;
+            self.scroll_offset = 0; // Reset scroll when changing stages
+        }
+    }
+
+    pub fn select_next_stage(&mut self) {
+        if !self.stages.is_empty() && self.selected_stage < self.stages.len() - 1 {
+            self.selected_stage += 1;
+            self.scroll_offset = 0; // Reset scroll when changing stages
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn append_output(&mut self, line: String) {
+        self.output_lines.push(line);
+    }
+
+    pub fn scroll_up(&mut self) {
+        if self.scroll_offset > 0 {
+            self.scroll_offset -= 1;
+        }
+    }
+
+    pub fn scroll_down(&mut self) {
+        self.scroll_offset = self.scroll_offset.saturating_add(1);
+    }
+}
+
+/// State for the new pipeline dialog.
+#[derive(Debug)]
+pub struct PipelineNewState {
+    pub name_input: String,
+    pub goal_input: String,
+    /// 0 = name, 1 = goal
+    pub focused_field: usize,
+}
+
+impl PipelineNewState {
+    pub fn new() -> Self {
+        Self {
+            name_input: String::new(),
+            goal_input: String::new(),
+            focused_field: 0,
+        }
+    }
+
+    pub fn toggle_focus(&mut self) {
+        self.focused_field = if self.focused_field == 0 { 1 } else { 0 };
+    }
+}
+
 /// Overlay that can be displayed on top of the current view.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Overlay {
@@ -1719,6 +2329,7 @@ pub enum View {
     Plan,
     Execute,
     Logs,
+    Pipeline,
 }
 
 impl View {
@@ -1728,11 +2339,18 @@ impl View {
             View::Plan => "Plan",
             View::Execute => "Execute",
             View::Logs => "Logs",
+            View::Pipeline => "Pipeline",
         }
     }
 
     pub fn all() -> &'static [View] {
-        &[View::Specs, View::Plan, View::Execute, View::Logs]
+        &[
+            View::Specs,
+            View::Plan,
+            View::Execute,
+            View::Logs,
+            View::Pipeline,
+        ]
     }
 
     pub fn index(&self) -> usize {
@@ -1741,6 +2359,7 @@ impl View {
             View::Plan => 1,
             View::Execute => 2,
             View::Logs => 3,
+            View::Pipeline => 4,
         }
     }
 
@@ -1750,6 +2369,7 @@ impl View {
             1 => View::Plan,
             2 => View::Execute,
             3 => View::Logs,
+            4 => View::Pipeline,
             _ => View::Specs,
         }
     }
@@ -1823,8 +2443,37 @@ pub struct App {
     pub event_subscription: EventSubscriptionState,
     /// Full-screen logs view state.
     pub logs_view: LogsViewState,
-    /// Whether a plan decomposition is currently running.
-    pub decomposition_in_progress: bool,
+    /// Current decomposition phase (replaces decomposition_in_progress bool).
+    pub decomposition_phase: DecompositionPhase,
+    /// Decomposition output pane state (plan view during decomposition).
+    pub decomposition_output: DecompositionOutputState,
+    /// Whether the user is viewing the decomposition output in full-screen mode.
+    pub viewing_decomposition_output: bool,
+    /// When the completion/failure banner was first shown (for auto-dismiss).
+    pub completion_shown_at: Option<Instant>,
+    /// Whether the user dismissed the inline streaming preview via Esc.
+    pub streaming_preview_dismissed: bool,
+    /// Timestamp of the last received decomposition streaming event (for stale detection).
+    pub decomposition_last_event_at: Option<Instant>,
+    /// Pipeline list view state.
+    pub pipeline_list: PipelineListState,
+    /// Pipeline detail view state (if viewing a specific run).
+    pub pipeline_detail: Option<PipelineDetailState>,
+    /// Pipeline new dialog state (if creating a new pipeline run).
+    pub pipeline_new: Option<PipelineNewState>,
+    /// Streaming request ID for an active pipeline (if streaming).
+    pub pipeline_streaming_request_id: Option<String>,
+}
+
+/// Truncate a string to at most `max_chars` characters, appending "..." if truncated.
+/// Safe for multi-byte UTF-8 characters.
+fn truncate_str(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        s.to_string()
+    } else {
+        let truncated: String = s.chars().take(max_chars).collect();
+        format!("{}...", truncated)
+    }
 }
 
 impl App {
@@ -1855,7 +2504,16 @@ impl App {
             execute_confirm: None,
             event_subscription: EventSubscriptionState::new(),
             logs_view: LogsViewState::new(),
-            decomposition_in_progress: false,
+            decomposition_phase: DecompositionPhase::Idle,
+            decomposition_output: DecompositionOutputState::new(),
+            viewing_decomposition_output: false,
+            completion_shown_at: None,
+            streaming_preview_dismissed: false,
+            decomposition_last_event_at: None,
+            pipeline_list: PipelineListState::new(),
+            pipeline_detail: None,
+            pipeline_new: None,
+            pipeline_streaming_request_id: None,
         }
     }
 
@@ -1952,6 +2610,10 @@ impl App {
         self.execute_output = ExecuteOutputState::new();
         self.execute_confirm = None;
         self.logs_view = LogsViewState::new();
+        self.pipeline_list = PipelineListState::new();
+        self.pipeline_detail = None;
+        self.pipeline_new = None;
+        self.pipeline_streaming_request_id = None;
         self.current_wave = None;
         self.active_agent_count = 0;
         // Close overlay
@@ -2088,6 +2750,7 @@ impl App {
                 progress: node.progress.clone(),
                 kind: node.kind.clone(),
                 depth: node.depth,
+                error_message: node.error_message.clone(),
             });
         }
     }
@@ -2165,6 +2828,41 @@ impl App {
         self.execute_output.is_streaming
     }
 
+    /// Returns true if decomposition output is streaming.
+    pub fn in_decomposition_streaming(&self) -> bool {
+        self.decomposition_output.is_streaming
+    }
+
+    /// Returns true if decomposition is actively running (Starting, Analyzing, or BuildingItems).
+    pub fn is_decomposition_active(&self) -> bool {
+        matches!(
+            self.decomposition_phase,
+            DecompositionPhase::Starting
+                | DecompositionPhase::Analyzing
+                | DecompositionPhase::BuildingItems
+        )
+    }
+
+    /// Count plan items from the plan tree by depth (1=epic, 2=story, 3=task).
+    pub fn count_plan_items(&self) -> DecompositionSummary {
+        let mut epic_count = 0u32;
+        let mut story_count = 0u32;
+        let mut task_count = 0u32;
+        for node in &self.plan_tree.nodes {
+            match node.depth {
+                1 => epic_count += 1,
+                2 => story_count += 1,
+                3 => task_count += 1,
+                _ => {}
+            }
+        }
+        DecompositionSummary {
+            epic_count,
+            story_count,
+            task_count,
+        }
+    }
+
     /// Returns true if any execute sub-view (confirm popup) is active.
     pub fn in_execute_sub_view(&self) -> bool {
         self.execute_confirm.is_some()
@@ -2202,6 +2900,31 @@ impl App {
     pub fn exit_logs_view(&mut self) {
         self.logs_view.clear();
         self.current_view = View::Execute;
+    }
+
+    /// Returns true if viewing pipeline detail.
+    pub fn in_pipeline_detail(&self) -> bool {
+        self.pipeline_detail.is_some()
+    }
+
+    /// Returns true if the new pipeline dialog is open.
+    pub fn in_pipeline_new(&self) -> bool {
+        self.pipeline_new.is_some()
+    }
+
+    /// Open the new pipeline dialog.
+    pub fn open_pipeline_new(&mut self) {
+        self.pipeline_new = Some(PipelineNewState::new());
+    }
+
+    /// Close the new pipeline dialog.
+    pub fn close_pipeline_new(&mut self) {
+        self.pipeline_new = None;
+    }
+
+    /// Returns true if a pipeline streaming session is active.
+    pub fn in_pipeline_streaming(&self) -> bool {
+        self.pipeline_streaming_request_id.is_some()
     }
 
     /// Fetch the execute tree from the daemon.
@@ -2318,6 +3041,9 @@ mod tests {
         assert_eq!(app.current_view, View::Logs);
 
         app.next_view();
+        assert_eq!(app.current_view, View::Pipeline);
+
+        app.next_view();
         assert_eq!(app.current_view, View::Specs);
     }
 
@@ -2325,6 +3051,9 @@ mod tests {
     fn test_view_cycle_backward() {
         let mut app = App::new("test".to_string());
         assert_eq!(app.current_view, View::Specs);
+
+        app.prev_view();
+        assert_eq!(app.current_view, View::Pipeline);
 
         app.prev_view();
         assert_eq!(app.current_view, View::Logs);
@@ -3199,6 +3928,7 @@ mod tests {
             progress: None,
             kind: None,
             depth: 1,
+            error_message: None,
         });
         assert!(app.in_plan_sub_view());
     }
@@ -3220,6 +3950,7 @@ mod tests {
             progress: None,
             kind: None,
             depth: 0,
+            error_message: None,
         });
 
         app.close_plan_sub_view();

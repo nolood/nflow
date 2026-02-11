@@ -96,7 +96,6 @@ pub fn write_pid_file() -> Result<()> {
     Ok(())
 }
 
-
 /// Opens the daemon log file for appending (creates if not exists).
 pub fn open_log_file() -> Result<File> {
     ensure_log_dir()?;
@@ -214,7 +213,6 @@ fn install_shutdown_handler() -> Result<()> {
 pub fn is_shutting_down() -> bool {
     platform::is_shutting_down()
 }
-
 
 #[cfg(test)]
 mod tests {

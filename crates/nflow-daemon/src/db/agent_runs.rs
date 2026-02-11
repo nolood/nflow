@@ -222,7 +222,22 @@ pub fn count_agent_runs_for_task(conn: &Connection, work_item_id: &Uuid) -> Resu
     Ok(count)
 }
 
+
 /// Find the most recent agent run for a given task (by started_at descending).
+/// Find an agent run by its ID.
+pub fn find_agent_run_by_id(conn: &Connection, id: &Uuid) -> Result<Option<AgentRun>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, work_item_id, pid, session_id, pid_start_time, status, exit_code, log_path, error_message, started_at, finished_at
+         FROM agent_runs WHERE id = ?1",
+    )?;
+    let mut rows = stmt.query_map(params![id.to_string()], row_to_agent_run)?;
+    match rows.next() {
+        Some(Ok(run)) => Ok(Some(run)),
+        Some(Err(e)) => Err(e.into()),
+        None => Ok(None),
+    }
+}
+
 pub fn find_latest_agent_run_for_task(
     conn: &Connection,
     work_item_id: &Uuid,

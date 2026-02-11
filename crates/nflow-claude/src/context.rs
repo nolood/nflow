@@ -291,6 +291,7 @@ mod tests {
             worktree_path: None,
             mr_url: None,
             commit_hash: None,
+            error_message: None,
             created_at: now,
             updated_at: now,
         };
@@ -324,6 +325,7 @@ mod tests {
             worktree_path: None,
             mr_url: None,
             commit_hash: None,
+            error_message: None,
             created_at: now,
             updated_at: now,
         };
@@ -542,6 +544,7 @@ mod tests {
             worktree_path: None,
             mr_url: None,
             commit_hash: None,
+            error_message: None,
             created_at: now,
             updated_at: now,
         };

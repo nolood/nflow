@@ -29,7 +29,7 @@ The current project is shown in the TUI header bar. Switch projects at any time 
 
 ## Navigation
 
-The TUI has four main views, switchable via tabs:
+The TUI has five main views, switchable via tabs:
 
 | Key | Tab | Purpose |
 |-----|-----|---------|
@@ -37,6 +37,7 @@ The TUI has four main views, switchable via tabs:
 | `2` | Plan | View DAG, approve/reject plan |
 | `3` | Execute | Monitor running agents, view status |
 | `4` | Logs | Detailed agent output streaming |
+| `5` | Pipeline | Rapid dev flow (Plan→Implement→Review) |
 
 Global keys:
 - `q` — quit TUI (daemon continues running)
@@ -290,3 +291,194 @@ Note: In actual terminal rendering, these may be replaced with colored ASCII cha
 - `[x]` done (green)
 - `[!]` failed (red)
 - `[-]` cancelled (gray)
+
+---
+
+## View 5: Pipeline
+
+Rapid development flow with Plan→Implement→Review stages. Alternative to full SDD workflow for quick iterations.
+
+### Pipeline List View
+
+```
+┌─ Pipeline ───────────────────────────────────────────────┐
+│                                                          │
+│  Description                    State        Created     │
+│  ──────────────────────────────────────────────          │
+│  Add user profile page          Completed    Feb 10 12:34│
+│  Fix login redirect             Running      Feb 10 13:00│
+│  Refactor auth module           Failed       Feb 09 16:20│
+│  Add avatar upload              Cancelled    Feb 09 14:10│
+│                                                          │
+│  [n]ew  [Enter] detail  [c]ancel  [l]og                 │
+└──────────────────────────────────────────────────────────┘
+```
+
+**Actions:**
+- `n` — create new pipeline (opens dialog)
+- `Enter` — view pipeline detail
+- `c` — cancel running pipeline
+- `l` — stream logs for selected pipeline stage
+
+**State indicators:**
+- `Running` — pipeline is executing stages
+- `Completed` — all stages done, review approved
+- `Failed` — stage failed or max iterations exceeded
+- `Cancelled` — user cancelled via `c` key
+
+### Pipeline Detail View
+
+```
+┌─ Pipeline: Add user profile page ────────────────────────┐
+│                                                          │
+│  State: Running                 Iteration: 2/5          │
+│  Created: Feb 10 12:34         Updated: Feb 10 12:42    │
+│                                                          │
+│  Stages:                                                 │
+│  ┌─ Plan        [completed]  12:34:56                   │
+│  │  Approach: Create ProfilePage component with         │
+│  │  FileInput for avatar upload. Add API endpoint...    │
+│  │  Files: src/components/ProfilePage.tsx (create)      │
+│  │         src/api/profile.ts (modify)                  │
+│  │                                                       │
+│  ├─ Implement   [completed]  12:36:10 (iter 1)         │
+│  │  Changes: Created ProfilePage, added upload logic    │
+│  │  Issues: CORS config needed for S3                   │
+│  │                                                       │
+│  ├─ Review      [completed]  12:38:45 (iter 1)         │
+│  │  Approved: false                                     │
+│  │  Issues: Missing error handling for network          │
+│  │          failures, no upload preview                 │
+│  │  Tests: passed  Build: success                       │
+│  │                                                       │
+│  ├─ Implement   [completed]  12:40:20 (iter 2)         │
+│  │  Changes: Added error handling, upload preview       │
+│  │  Issues: None                                        │
+│  │                                                       │
+│  └─ Review      [in_progress]  12:42:30 (iter 2)       │
+│     Running tests...                                    │
+│                                                          │
+│  [Esc] back  [l]og stage  [c]ancel  [Enter] expand     │
+└──────────────────────────────────────────────────────────┘
+```
+
+**Features:**
+- Real-time stage updates via daemon events
+- Iteration counter shows loop-back progress
+- Stage outputs collapsed by default, expand with `Enter`
+- Log button opens full agent output for selected stage
+
+### New Pipeline Dialog
+
+```
+┌─ New Pipeline ───────────────────────────────────────────┐
+│                                                          │
+│  Description:                                            │
+│  ┌────────────────────────────────────────────────────┐ │
+│  │Add user profile page with avatar upload__         │ │
+│  └────────────────────────────────────────────────────┘ │
+│                                                          │
+│  Max Iterations: [5__]                                  │
+│                                                          │
+│  [Enter] start  [Esc] cancel  [Tab] next field          │
+└──────────────────────────────────────────────────────────┘
+```
+
+**Fields:**
+- `Description` — task description for Claude (required)
+  - Text input, multi-line supported
+  - Clear description improves plan quality
+- `Max Iterations` — maximum Implement→Review loops (default: 5)
+  - Prevents infinite loops
+  - Adjust if task is complex
+
+**Workflow:**
+1. Press `n` in list view
+2. Fill description (Tab to next field)
+3. Optionally adjust max iterations
+4. Press Enter to start
+5. Returns to detail view, shows progress
+
+### Pipeline Stage States
+
+| State | Icon | Meaning |
+|-------|------|---------|
+| `in_progress` | `🔄` | Agent is running this stage |
+| `completed` | `✅` | Stage finished successfully |
+| `failed` | `❌` | Stage failed (parse error, agent error) |
+
+### Stage Output Format
+
+**Plan stage output:**
+```
+Approach: [high-level strategy]
+Risks: [potential issues]
+Files: [files to create/modify]
+Tests: [tests needed]
+```
+
+**Implement stage output:**
+```
+Changes: [list of changes made]
+Issues: [problems encountered]
+```
+
+**Review stage output:**
+```
+Approved: [true/false]
+Issues: [problems found]
+Build: [success/failed]
+Tests: [passed/failed]
+```
+
+### Navigation Tips
+
+- Use `5` key from any tab to switch to Pipeline
+- Pipeline runs independently of SDD execution (no conflicts)
+- Only one pipeline per project can be active (Running state)
+- Previous pipelines remain visible in list (Completed/Failed/Cancelled)
+- Press `l` on detail view to stream live agent output
+
+### Comparison to SDD Flow
+
+| Feature | Pipeline | SDD |
+|---------|----------|-----|
+| Setup time | Instant (just description) | Requires spec + decompose |
+| Branching | No (in-place) | Yes (worktree per story) |
+| Parallelism | Sequential only | Parallel stories |
+| MR creation | Manual | Automatic |
+| Use case | Quick fixes, prototypes | Complex features |
+
+**When to use Pipeline:**
+- Rapid exploration of ideas
+- Small features under 100 LOC
+- Bug fixes
+- Refactoring tasks
+- When you want immediate feedback
+
+**When to use SDD:**
+- Features requiring parallel work
+- Tasks needing formal specification
+- Multi-story epics with dependencies
+- Work requiring code review workflow
+
+---
+
+## Global Shortcuts Summary
+
+| Key | Action | Context |
+|-----|--------|---------|
+| `1` | Specs tab | Global |
+| `2` | Plan tab | Global |
+| `3` | Execute tab | Global |
+| `4` | Logs tab | Global |
+| `5` | Pipeline tab | Global |
+| `q` | Quit TUI | Global |
+| `?` | Help overlay | Global |
+| `p` | Switch project | Global |
+| `Tab` | Next tab | Global |
+| `Shift+Tab` | Previous tab | Global |
+| `j/k` | Navigate up/down | Lists |
+| `Enter` | Select/expand | Context-dependent |
+| `/` | Search/filter | Context-dependent |
+| `Esc` | Back/cancel | Context-dependent |

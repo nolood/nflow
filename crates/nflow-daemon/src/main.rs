@@ -136,6 +136,7 @@ async fn main() {
                     agents_adopted = report.agents_adopted.len(),
                     socket_removed = report.socket_removed,
                     pid_file_removed = report.pid_file_removed,
+                    decomposition_sessions_discarded = report.decomposition_sessions_discarded,
                     "crash recovery complete"
                 );
             }
@@ -199,7 +200,12 @@ async fn main() {
                 "scheduler: {} story progress actions to execute",
                 progress_actions.len()
             );
-            scheduler_loop::execute_story_progress_actions(&conn, &progress_actions, Some(&event_bus)).await;
+            scheduler_loop::execute_story_progress_actions(
+                &conn,
+                &progress_actions,
+                Some(&event_bus),
+            )
+            .await;
         }
 
         if !actions.is_empty() {

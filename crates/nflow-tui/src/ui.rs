@@ -4,7 +4,25 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Row, Table, Tabs, Wrap};
 use ratatui::Frame;
 
-use crate::app::{App, ConfirmAction, DaemonState, DialogueSessionState, Overlay, View};
+use crate::app::{
+    App, ConfirmAction, DaemonState, DecompositionPhase, DialogueSessionState, Overlay, View,
+};
+
+/// Braille spinner frames for animated progress indicators.
+const SPINNER_FRAMES: &[char] = &[
+    '\u{280B}', '\u{2819}', '\u{2839}', '\u{2838}', '\u{283C}', '\u{2834}', '\u{2826}', '\u{2827}',
+    '\u{2807}', '\u{280F}',
+];
+
+/// Get the current spinner character based on wall-clock time.
+fn spinner_char() -> char {
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let frame_index = (millis / 100) as usize % SPINNER_FRAMES.len();
+    SPINNER_FRAMES[frame_index]
+}
 
 /// Convert a markdown string into styled ratatui Lines.
 ///
@@ -53,18 +71,14 @@ fn markdown_to_lines(text: &str, base_style: Style) -> Vec<Line<'static>> {
         if raw_line.starts_with("### ") {
             lines.push(Line::from(Span::styled(
                 raw_line[4..].to_string(),
-                base_style
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
+                base_style.fg(Color::Yellow).add_modifier(Modifier::BOLD),
             )));
             continue;
         }
         if raw_line.starts_with("## ") {
             lines.push(Line::from(Span::styled(
                 raw_line[3..].to_string(),
-                base_style
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
+                base_style.fg(Color::Cyan).add_modifier(Modifier::BOLD),
             )));
             continue;
         }
@@ -81,7 +95,9 @@ fn markdown_to_lines(text: &str, base_style: Style) -> Vec<Line<'static>> {
         // Horizontal rules
         let trimmed = raw_line.trim();
         if (trimmed.starts_with("---") || trimmed.starts_with("***") || trimmed.starts_with("___"))
-            && trimmed.chars().all(|c| c == '-' || c == '*' || c == '_' || c == ' ')
+            && trimmed
+                .chars()
+                .all(|c| c == '-' || c == '*' || c == '_' || c == ' ')
             && trimmed.len() >= 3
         {
             lines.push(Line::from(Span::styled(
@@ -100,7 +116,10 @@ fn markdown_to_lines(text: &str, base_style: Style) -> Vec<Line<'static>> {
             && raw_line.as_bytes()[0].is_ascii_digit()
             && raw_line[1..].starts_with(". ")
         {
-            (format!("  {}. ", raw_line.as_bytes()[0] as char), &raw_line[3..])
+            (
+                format!("  {}. ", raw_line.as_bytes()[0] as char),
+                &raw_line[3..],
+            )
         } else {
             (String::new(), raw_line)
         };
@@ -145,10 +164,7 @@ fn parse_inline_markdown(text: &str, base_style: Style) -> Vec<Span<'static>> {
                     code.push(ch);
                     chars.next();
                 }
-                spans.push(Span::styled(
-                    code,
-                    Style::default().fg(Color::Green),
-                ));
+                spans.push(Span::styled(code, Style::default().fg(Color::Green)));
             }
             '*' => {
                 // Check for ** (bold) or * (italic)
@@ -256,6 +272,11 @@ pub fn render(app: &App, frame: &mut Frame) {
     if app.execute_confirm.is_some() {
         render_execute_confirm_popup(app, frame, frame.area());
     }
+
+    // Render pipeline new dialog on top
+    if app.pipeline_new.is_some() {
+        render_pipeline_new(app, frame, frame.area());
+    }
 }
 
 /// Render the header with view tabs.
@@ -312,6 +333,13 @@ fn render_content(app: &App, frame: &mut Frame, area: Rect) {
         }
         View::Logs => {
             render_logs_view(app, frame, area);
+        }
+        View::Pipeline => {
+            if app.pipeline_detail.is_some() {
+                render_pipeline_detail(app, frame, area);
+            } else {
+                render_pipeline_list(app, frame, area);
+            }
         }
     }
 }
@@ -459,35 +487,73 @@ fn status_icon(status: &str) -> (&str, Color) {
 
 /// Render the plan tree view with collapsible hierarchy.
 fn render_plan_tree(app: &App, frame: &mut Frame, area: Rect) {
+    // If viewing decomposition output, render that instead
+    if app.viewing_decomposition_output
+        && (app.is_decomposition_active() || !app.decomposition_output.lines.is_empty())
+    {
+        render_decomposition_output(app, frame, area);
+        return;
+    }
+
     let tree = &app.plan_tree;
 
     if tree.nodes.is_empty() {
-        let block = Block::default().borders(Borders::ALL).title("Plan");
-        let text = if app.decomposition_in_progress {
-            vec![
-                Line::from(""),
-                Line::from(Span::styled(
-                    "  ▶ Generating plan...",
-                    Style::default().fg(Color::Cyan),
-                )),
-            ]
-        } else {
-            vec![
-                Line::from(""),
-                Line::from(Span::styled(
-                    "  No decomposition waves found.",
-                    Style::default().fg(Color::DarkGray),
-                )),
-                Line::from(""),
-                Line::from(Span::styled(
-                    "  Use 'nflow plan generate' to create a plan.",
-                    Style::default().fg(Color::DarkGray),
-                )),
-            ]
-        };
-        let empty = Paragraph::new(text).block(block);
-        frame.render_widget(empty, area);
-        return;
+        // When the tree is empty, render based on decomposition phase
+        match &app.decomposition_phase {
+            DecompositionPhase::Starting
+            | DecompositionPhase::Analyzing
+            | DecompositionPhase::BuildingItems => {
+                render_decomposition_progress(app, frame, area);
+                return;
+            }
+            DecompositionPhase::Completed(summary) => {
+                let block = Block::default().borders(Borders::ALL).title("Plan");
+                let text = vec![
+                    Line::from(""),
+                    Line::from(Span::styled(
+                        format!(
+                            "  \u{2713} Plan generation complete! {} epics, {} stories, {} tasks",
+                            summary.epic_count, summary.story_count, summary.task_count
+                        ),
+                        Style::default().fg(Color::Green),
+                    )),
+                ];
+                let para = Paragraph::new(text).block(block);
+                frame.render_widget(para, area);
+                return;
+            }
+            DecompositionPhase::Failed(msg) => {
+                let block = Block::default().borders(Borders::ALL).title("Plan");
+                let text = vec![
+                    Line::from(""),
+                    Line::from(Span::styled(
+                        format!("  \u{2717} Plan generation failed: {}", msg),
+                        Style::default().fg(Color::Red),
+                    )),
+                ];
+                let para = Paragraph::new(text).block(block);
+                frame.render_widget(para, area);
+                return;
+            }
+            DecompositionPhase::Idle => {
+                let block = Block::default().borders(Borders::ALL).title("Plan");
+                let text = vec![
+                    Line::from(""),
+                    Line::from(Span::styled(
+                        "  No decomposition waves found.",
+                        Style::default().fg(Color::DarkGray),
+                    )),
+                    Line::from(""),
+                    Line::from(Span::styled(
+                        "  Use 'nflow plan generate' to create a plan.",
+                        Style::default().fg(Color::DarkGray),
+                    )),
+                ];
+                let empty = Paragraph::new(text).block(block);
+                frame.render_widget(empty, area);
+                return;
+            }
+        }
     }
 
     let verify_hint = if tree.hide_verify {
@@ -675,7 +741,10 @@ fn render_execute_tree(app: &App, frame: &mut Frame, area: Rect) {
     } else {
         "h:hide verify"
     };
-    let title = format!("Tasks — j/k:nav Space:collapse {} Enter:log", verify_hint);
+    let title = format!(
+        "Tasks — j/k:nav Space:collapse {} Enter:select",
+        verify_hint
+    );
     let block = Block::default()
         .borders(Borders::ALL)
         .title(title)
@@ -799,6 +868,233 @@ fn render_execute_tree(app: &App, frame: &mut Frame, area: Rect) {
 
     let paragraph = Paragraph::new(lines).block(block);
     frame.render_widget(paragraph, area);
+}
+
+/// Render the decomposition output view (full-screen streaming logs).
+fn render_decomposition_output(app: &App, frame: &mut Frame, area: Rect) {
+    let output = &app.decomposition_output;
+
+    let specs_label = if !app.plan_tree.spec_names.is_empty() {
+        format!(" [{}]", app.plan_tree.spec_names.join(", "))
+    } else {
+        String::new()
+    };
+
+    let title = if output.is_streaming {
+        format!(
+            " Plan Generation{} (live) — Esc:back j/k:scroll ",
+            specs_label
+        )
+    } else {
+        format!(" Plan Generation{} — Esc:back j/k:scroll ", specs_label)
+    };
+
+    let border_color = if output.is_streaming {
+        Color::Cyan
+    } else {
+        Color::DarkGray
+    };
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(title)
+        .border_style(Style::default().fg(border_color));
+
+    let inner = block.inner(area);
+    let inner_height = inner.height as u16;
+
+    let content_lines: Vec<Line> = if output.lines.is_empty() && output.is_streaming {
+        vec![Line::from(Span::styled(
+            "  Waiting for Claude output...",
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::ITALIC),
+        ))]
+    } else {
+        output
+            .lines
+            .iter()
+            .map(|l| format_decomposition_line(l))
+            .collect()
+    };
+
+    let total = content_lines.len() as u16;
+    let max_scroll = total.saturating_sub(inner_height);
+    let scroll = max_scroll.saturating_sub(output.scroll_offset);
+
+    let paragraph = Paragraph::new(content_lines)
+        .block(block)
+        .wrap(Wrap { trim: false })
+        .scroll((scroll, 0));
+
+    frame.render_widget(paragraph, area);
+}
+
+/// Render an inline progress panel for active decomposition (when tree is empty).
+fn render_decomposition_progress(app: &App, frame: &mut Frame, area: Rect) {
+    let block = Block::default().borders(Borders::ALL).title("Plan");
+    let inner = block.inner(area);
+
+    let spinner = spinner_char();
+
+    let (phase_text, phase_color) = match &app.decomposition_phase {
+        DecompositionPhase::Starting => ("Starting decomposition...", Color::Yellow),
+        DecompositionPhase::Analyzing => ("Claude is analyzing specs...", Color::Cyan),
+        DecompositionPhase::BuildingItems => ("Building work items...", Color::Cyan),
+        _ => ("Processing...", Color::DarkGray),
+    };
+
+    let mut lines: Vec<Line> = Vec::new();
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled(format!("  {} ", spinner), Style::default().fg(phase_color)),
+        Span::styled(
+            phase_text,
+            Style::default()
+                .fg(phase_color)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ]));
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "  (V: fullscreen, Esc: dismiss preview)",
+        Style::default().fg(Color::DarkGray),
+    )));
+
+    // Show last few lines of streaming output as an inline preview with styling,
+    // unless the user has dismissed the preview
+    if !app.streaming_preview_dismissed {
+        let output_lines = &app.decomposition_output.lines;
+        // Skip empty lines in preview to save space
+        let non_empty: Vec<&String> = output_lines.iter().filter(|l| !l.is_empty()).collect();
+        let preview_count = 6.min(non_empty.len());
+        if preview_count > 0 {
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "  --- streaming preview ---",
+                Style::default().fg(Color::DarkGray),
+            )));
+            let start = non_empty.len().saturating_sub(preview_count);
+            // Collect truncated strings so they live long enough for borrowing
+            let max_width = (inner.width as usize).saturating_sub(4);
+            let preview_strings: Vec<String> = non_empty[start..]
+                .iter()
+                .map(|line_text| {
+                    if line_text.len() > max_width {
+                        let cut = max_width.saturating_sub(3).min(line_text.len());
+                        format!("{}...", &line_text[..cut])
+                    } else {
+                        line_text.to_string()
+                    }
+                })
+                .collect();
+            for s in &preview_strings {
+                // Use format_decomposition_line for consistent styling
+                lines.push(format_decomposition_line(s));
+            }
+        }
+    }
+
+    let paragraph = Paragraph::new(lines).block(block);
+    frame.render_widget(paragraph, area);
+}
+
+/// Format a decomposition log line with appropriate styling.
+/// Takes ownership of the line string to produce an owned `Line<'static>`.
+fn format_decomposition_line(line: &str) -> Line<'static> {
+    let styled =
+        |text: String, style: Style| -> Line<'static> { Line::from(Span::styled(text, style)) };
+
+    if line.starts_with("\u{2500}\u{2500}\u{2500}\u{2500}\u{2500} Tool: ") {
+        // Tool separator line: ───── Tool: bash ─────
+        styled(
+            line.to_string(),
+            Style::default()
+                .fg(Color::Magenta)
+                .add_modifier(Modifier::BOLD),
+        )
+    } else if line.starts_with("  \u{21B3} ") {
+        // Result arrow: ↳ output...
+        styled(line.to_string(), Style::default().fg(Color::Green))
+    } else if line == "  \u{22EF} typing..." {
+        // Typing indicator
+        styled(
+            line.to_string(),
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::ITALIC),
+        )
+    } else if line.starts_with("    ... (") && line.ends_with(" more lines)") {
+        // Truncation indicator for results
+        styled(
+            line.to_string(),
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::ITALIC),
+        )
+    } else if line.starts_with("  ... (") && line.ends_with(" more params)") {
+        // Truncation indicator for params
+        styled(
+            line.to_string(),
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::ITALIC),
+        )
+    } else if line.starts_with("  \u{21B3} (no output)") {
+        // Empty result
+        styled(
+            line.to_string(),
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::ITALIC),
+        )
+    } else if line.starts_with("  ") && line.contains(": ") && !line.starts_with("    ") {
+        // Indented tool params (2-space indent, key: value)
+        // But not result continuation lines (4-space indent)
+        if let Some(pos) = line.find(": ") {
+            // Safety: `pos` is from str::find(": ") which returns valid byte positions,
+            // and ": " is ASCII, so pos+1 is always a valid UTF-8 boundary.
+            let key_part = line[..pos + 1].to_string(); // includes the colon
+            let val_part = line[pos + 1..].to_string(); // includes leading space + value
+            Line::from(vec![
+                Span::styled(key_part, Style::default().fg(Color::Cyan)),
+                Span::styled(val_part, Style::default().fg(Color::White)),
+            ])
+        } else {
+            styled(line.to_string(), Style::default().fg(Color::Cyan))
+        }
+    } else if line.starts_with("    ") {
+        // Result continuation lines (4-space indent)
+        styled(line.to_string(), Style::default().fg(Color::Green))
+    } else if line.starts_with("[Error:") || line.starts_with("[Parse error:") {
+        styled(
+            line.to_string(),
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        )
+    } else if line.starts_with("[Decomposition complete]") {
+        styled(
+            line.to_string(),
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        )
+    } else if line.starts_with("[Connection lost]") {
+        styled(
+            line.to_string(),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )
+    } else if line.starts_with("[Tool: ") {
+        // Legacy format (backwards compatibility)
+        styled(line.to_string(), Style::default().fg(Color::Cyan))
+    } else if line.starts_with("[Tool input: ") || line.starts_with("[Result]") {
+        // Legacy format (backwards compatibility)
+        styled(line.to_string(), Style::default().fg(Color::DarkGray))
+    } else {
+        // Claude's reasoning text — plain white
+        styled(line.to_string(), Style::default().fg(Color::White))
+    }
 }
 
 /// Render the execute output pane (right pane).
@@ -1230,7 +1526,7 @@ fn render_spec_dialogue(app: &App, frame: &mut Frame, area: Rect) {
     // Calculate scroll: auto-scroll to bottom, offset adjusts
     let inner_height = chat_area.height.saturating_sub(2); // borders
     let inner_width = chat_area.width.saturating_sub(2).max(1) as usize; // borders
-    // Account for line wrapping: each Line may occupy multiple visual rows
+                                                                         // Account for line wrapping: each Line may occupy multiple visual rows
     let total_lines: u16 = chat_lines
         .iter()
         .map(|line| {
@@ -1282,6 +1578,242 @@ fn render_spec_dialogue(app: &App, frame: &mut Frame, area: Rect) {
     frame.render_widget(input, input_area);
 }
 
+/// Render the pipeline list view.
+fn render_pipeline_list(app: &App, frame: &mut Frame, area: Rect) {
+    let block = Block::default()
+        .title(" Pipeline Runs ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Blue));
+
+    if app.pipeline_list.runs.is_empty() {
+        let text = Paragraph::new("No pipeline runs. Press 'n' to create one.")
+            .style(Style::default().fg(Color::DarkGray))
+            .block(block);
+        frame.render_widget(text, area);
+        return;
+    }
+
+    let header = Row::new(vec!["Name", "Status", "Stage", "Iteration", "Created"]).style(
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
+    );
+
+    let rows: Vec<Row> = app
+        .pipeline_list
+        .runs
+        .iter()
+        .enumerate()
+        .map(|(i, run)| {
+            let (icon, _color) = pipeline_status_icon(&run.status);
+            let stage = run.current_stage.as_deref().unwrap_or("-");
+            let iter_str = format!("{}/{}", run.iteration, run.max_iterations);
+            let style = if i == app.pipeline_list.selected {
+                Style::default().bg(Color::DarkGray).fg(Color::White)
+            } else {
+                Style::default()
+            };
+            Row::new(vec![
+                run.name.clone(),
+                format!("{} {}", icon, run.status),
+                stage.to_string(),
+                iter_str,
+                run.created_at.clone(),
+            ])
+            .style(style)
+        })
+        .collect();
+
+    let widths = [
+        Constraint::Percentage(25),
+        Constraint::Percentage(20),
+        Constraint::Percentage(15),
+        Constraint::Percentage(15),
+        Constraint::Percentage(25),
+    ];
+
+    let table = Table::new(rows, widths).header(header).block(block);
+
+    frame.render_widget(table, area);
+}
+
+/// Get an icon and color for a pipeline status.
+fn pipeline_status_icon(status: &str) -> (&str, Color) {
+    match status {
+        "pending" => ("\u{25CB}", Color::DarkGray),
+        "running" => ("\u{25B6}", Color::Cyan),
+        "completed" => ("\u{2713}", Color::Green),
+        "failed" => ("\u{2717}", Color::Red),
+        "cancelled" => ("\u{2298}", Color::DarkGray),
+        _ => (" ", Color::DarkGray),
+    }
+}
+
+/// Render the pipeline detail view (stages + output).
+fn render_pipeline_detail(app: &App, frame: &mut Frame, area: Rect) {
+    let detail = match &app.pipeline_detail {
+        Some(d) => d,
+        None => return,
+    };
+
+    // Horizontal split: left = stages list, right = output
+    let chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(30), Constraint::Percentage(70)])
+        .split(area);
+
+    // Left pane: stages
+    let stages_title = if detail.is_streaming {
+        format!(" {} \u{2014} Stages [STREAMING...] ", detail.run.name)
+    } else {
+        format!(" {} \u{2014} Stages ", detail.run.name)
+    };
+    let stages_border_color = if detail.is_streaming {
+        Color::Yellow
+    } else {
+        Color::Blue
+    };
+    let stages_block = Block::default()
+        .title(stages_title)
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(stages_border_color));
+
+    let stage_rows: Vec<Row> = detail
+        .stages
+        .iter()
+        .enumerate()
+        .map(|(i, stage)| {
+            let (icon, status_color) = pipeline_status_icon(&stage.status);
+            let label = format!("{} {} (iter {})", icon, stage.stage_type, stage.iteration);
+            let style = if i == detail.selected_stage {
+                Style::default().bg(Color::DarkGray).fg(Color::White)
+            } else {
+                Style::default().fg(status_color)
+            };
+            Row::new(vec![label]).style(style)
+        })
+        .collect();
+
+    let stages_table = Table::new(stage_rows, [Constraint::Percentage(100)]).block(stages_block);
+
+    frame.render_widget(stages_table, chunks[0]);
+
+    // Right pane: output
+    let output_title = if detail.is_streaming {
+        " Output [STREAMING...] "
+    } else {
+        " Output "
+    };
+    let output_border_color = if detail.is_streaming {
+        Color::Yellow
+    } else {
+        Color::Blue
+    };
+    let output_block = Block::default()
+        .title(output_title)
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(output_border_color));
+
+    // Use stage-specific output instead of all output
+    let output_lines = detail.current_stage_output();
+    let output_text: Vec<Line> = output_lines
+        .iter()
+        .map(|l| Line::from(l.as_str()))
+        .collect();
+
+    let scroll = detail.scroll_offset;
+
+    let output = Paragraph::new(output_text)
+        .block(output_block)
+        .wrap(Wrap { trim: false })
+        .scroll((scroll, 0));
+
+    frame.render_widget(output, chunks[1]);
+}
+
+/// Render the new pipeline dialog popup.
+fn render_pipeline_new(app: &App, frame: &mut Frame, area: Rect) {
+    let new_state = match &app.pipeline_new {
+        Some(s) => s,
+        None => return,
+    };
+
+    // Center popup
+    let popup_width = 60u16.min(area.width.saturating_sub(4));
+    let popup_height = 10u16.min(area.height.saturating_sub(4));
+    let x = (area.width.saturating_sub(popup_width)) / 2;
+    let y = (area.height.saturating_sub(popup_height)) / 2;
+    let popup_area = Rect::new(x, y, popup_width, popup_height);
+
+    frame.render_widget(Clear, popup_area);
+
+    let block = Block::default()
+        .title(" New Pipeline ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan));
+
+    let inner = block.inner(popup_area);
+    frame.render_widget(block, popup_area);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1), // Name label
+            Constraint::Length(1), // Name input
+            Constraint::Length(1), // Spacer
+            Constraint::Length(1), // Goal label
+            Constraint::Length(1), // Goal input
+            Constraint::Min(0),    // Padding
+            Constraint::Length(1), // Help
+        ])
+        .split(inner);
+
+    let name_label_style = if new_state.focused_field == 0 {
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::Gray)
+    };
+    let goal_label_style = if new_state.focused_field == 1 {
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::Gray)
+    };
+
+    frame.render_widget(Paragraph::new("Name:").style(name_label_style), chunks[0]);
+
+    let name_display = if new_state.focused_field == 0 {
+        format!("{}\u{258C}", &new_state.name_input)
+    } else {
+        new_state.name_input.clone()
+    };
+    frame.render_widget(
+        Paragraph::new(name_display).style(Style::default().fg(Color::White)),
+        chunks[1],
+    );
+
+    frame.render_widget(Paragraph::new("Goal:").style(goal_label_style), chunks[3]);
+
+    let goal_display = if new_state.focused_field == 1 {
+        format!("{}\u{258C}", &new_state.goal_input)
+    } else {
+        new_state.goal_input.clone()
+    };
+    frame.render_widget(
+        Paragraph::new(goal_display).style(Style::default().fg(Color::White)),
+        chunks[4],
+    );
+
+    frame.render_widget(
+        Paragraph::new("Tab: switch field | Enter: start | Esc: cancel")
+            .style(Style::default().fg(Color::DarkGray)),
+        chunks[6],
+    );
+}
+
 /// Render the status bar at the bottom.
 fn render_status_bar(app: &App, frame: &mut Frame, area: Rect) {
     // If filter is active or being edited, show filter bar instead
@@ -1314,12 +1846,46 @@ fn render_status_bar(app: &App, frame: &mut Frame, area: Rect) {
         ));
     }
 
-    if app.decomposition_in_progress {
-        spans.push(Span::raw(" | "));
-        spans.push(Span::styled(
-            "Generating...",
-            Style::default().fg(Color::Yellow),
-        ));
+    match &app.decomposition_phase {
+        DecompositionPhase::Starting => {
+            spans.push(Span::raw(" | "));
+            let s = spinner_char();
+            spans.push(Span::styled(
+                format!("{} Starting...", s),
+                Style::default().fg(Color::Yellow),
+            ));
+        }
+        DecompositionPhase::Analyzing => {
+            spans.push(Span::raw(" | "));
+            let s = spinner_char();
+            spans.push(Span::styled(
+                format!("{} Analyzing...", s),
+                Style::default().fg(Color::Cyan),
+            ));
+        }
+        DecompositionPhase::BuildingItems => {
+            spans.push(Span::raw(" | "));
+            let s = spinner_char();
+            spans.push(Span::styled(
+                format!("{} Building items...", s),
+                Style::default().fg(Color::Cyan),
+            ));
+        }
+        DecompositionPhase::Completed(_) => {
+            spans.push(Span::raw(" | "));
+            spans.push(Span::styled(
+                "\u{2713} Complete",
+                Style::default().fg(Color::Green),
+            ));
+        }
+        DecompositionPhase::Failed(_) => {
+            spans.push(Span::raw(" | "));
+            spans.push(Span::styled(
+                "\u{2717} Failed",
+                Style::default().fg(Color::Red),
+            ));
+        }
+        DecompositionPhase::Idle => {}
     }
 
     // Running counts from execute tree
@@ -1372,6 +1938,7 @@ fn render_status_bar(app: &App, frame: &mut Frame, area: Rect) {
         View::Plan => "Enter:detail Space:collapse g:gen a:approve",
         View::Execute => "Enter:log r:run s:stop e:escalate",
         View::Logs => "Enter:view Esc:back",
+        View::Pipeline => "n:new Enter:detail c:cancel",
     };
     spans.push(Span::styled(
         view_hints,
@@ -1418,6 +1985,10 @@ fn render_filter_bar(app: &App, frame: &mut Frame, area: Rect) {
         View::Execute | View::Logs => {
             let visible = app.execute_tree.visible_nodes_filtered(query);
             (visible.len(), app.execute_tree.nodes.len())
+        }
+        View::Pipeline => {
+            let total = app.pipeline_list.runs.len();
+            (total, total)
         }
     };
 
@@ -1535,6 +2106,14 @@ fn view_keybindings(view: View) -> Vec<Line<'static>> {
             help_key("j/k", "Navigate task list"),
             help_key("Enter", "View full task log"),
             help_key("Esc", "Exit log detail"),
+        ],
+        View::Pipeline => vec![
+            help_key("j/k", "Navigate pipeline list / stages"),
+            help_key("J/K", "Scroll output (detail view)"),
+            help_key("n", "New pipeline"),
+            help_key("Enter", "View pipeline detail"),
+            help_key("c", "Cancel running pipeline"),
+            help_key("Esc", "Exit detail view"),
         ],
     }
 }
@@ -2003,6 +2582,17 @@ fn render_detail_popup(app: &App, frame: &mut Frame, area: Rect) {
                 detail.depends_on.join(", "),
                 Style::default().fg(Color::Yellow),
             ),
+        ]));
+    }
+
+    if let Some(ref error_msg) = detail.error_message {
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![
+            Span::styled(
+                "  Error: ",
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(error_msg.as_str(), Style::default().fg(Color::Red)),
         ]));
     }
 

@@ -346,8 +346,91 @@ CREATE TABLE IF NOT EXISTS schema_version (
 );
 ```
 
+### pipeline_runs
+
+Tracks pipeline executions (rapid development flow: Plan → Implement → Review).
+
+```sql
+CREATE TABLE pipeline_runs (
+    id TEXT PRIMARY KEY,                    -- UUID
+    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    description TEXT NOT NULL,              -- task description from user
+    state TEXT NOT NULL,                    -- Running, Completed, Failed, Cancelled
+    current_iteration INTEGER NOT NULL DEFAULT 1, -- current Implement→Review loop
+    max_iterations INTEGER NOT NULL DEFAULT 5,    -- max loops before giving up
+    created_at TEXT NOT NULL,               -- ISO 8601
+    updated_at TEXT NOT NULL                -- ISO 8601
+);
+
+CREATE INDEX idx_pipeline_runs_project_id ON pipeline_runs(project_id);
+CREATE INDEX idx_pipeline_runs_state ON pipeline_runs(state);
+```
+
+**State transitions:**
+- `Running` → pipeline is executing stages
+- `Completed` → all stages done, review approved
+- `Failed` → stage failed or max iterations exceeded
+- `Cancelled` → user cancelled via pipeline.cancel command
+
+### pipeline_stages
+
+Records individual stage executions within a pipeline run.
+
+```sql
+CREATE TABLE pipeline_stages (
+    id TEXT PRIMARY KEY,                    -- UUID
+    pipeline_id TEXT NOT NULL REFERENCES pipeline_runs(id) ON DELETE CASCADE,
+    stage_type TEXT NOT NULL,               -- Plan, Implement, Review
+    iteration INTEGER NOT NULL,             -- iteration number (1-based)
+    state TEXT NOT NULL,                    -- in_progress, completed, failed
+    output_json TEXT,                       -- structured JSON output from Claude
+    agent_run_id TEXT REFERENCES agent_runs(id), -- links to agent_runs for PID tracking
+    created_at TEXT NOT NULL,               -- ISO 8601
+    completed_at TEXT                       -- ISO 8601, NULL if in_progress
+);
+
+CREATE INDEX idx_pipeline_stages_pipeline_id ON pipeline_stages(pipeline_id);
+```
+
+**Stage types:**
+- `Plan` — analyze task, create implementation plan (iteration always 1)
+- `Implement` — execute plan, make code changes (iteration N)
+- `Review` — verify implementation, approve or provide feedback (iteration N)
+
+**Output JSON schemas:**
+
+Plan stage:
+```json
+{
+  "approach": "string",
+  "risks": ["string"],
+  "files_to_modify": ["string"],
+  "files_to_create": ["string"],
+  "tests_needed": ["string"]
+}
+```
+
+Implement stage:
+```json
+{
+  "changes_made": ["string"],
+  "issues_found": ["string"]
+}
+```
+
+Review stage:
+```json
+{
+  "approved": boolean,
+  "issues": ["string"],
+  "build_status": "success|failed",
+  "tests_status": "passed|failed"
+}
+```
+
 ## Notes
 
 - All IDs are UUID v4 strings
 - All timestamps are ISO 8601 in UTC
 - Migrations are applied on daemon start
+- Pipeline flow is independent of SDD flow (no dependencies between tables)

@@ -227,6 +227,7 @@ mod tests {
             wave_number,
             status,
             claude_session_id: Some("test-claude-session-id".to_string()),
+            error_message: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };

@@ -72,6 +72,18 @@ pub enum ViewAction {
     ProjectSwitcherOpen,
     /// User selected a project in the switcher.
     ProjectSelect(String),
+    /// User switched to a different tab — refresh data for that view.
+    TabSwitched(View),
+    /// Request to start a new pipeline run.
+    PipelineNew { name: String, goal: String },
+    /// Request to cancel a pipeline run.
+    PipelineCancel(String),
+    /// Request to view a pipeline run's detail.
+    PipelineViewDetail(String),
+    /// User selected a different stage in the pipeline detail view.
+    PipelineSelectStage,
+    /// User exited a pipeline sub-view (detail or new dialog).
+    PipelineSubViewExit,
 }
 
 /// Handle a key event, returning true if the app should continue, false to quit.
@@ -124,6 +136,16 @@ pub fn handle_key_event(app: &mut App, key: KeyEvent) -> (bool, ViewAction) {
         return (true, action);
     }
 
+    // If in pipeline new dialog or detail view, handle exclusively
+    if app.in_pipeline_new() {
+        let action = handle_pipeline_new_key(app, key);
+        return (true, action);
+    }
+    if app.in_pipeline_detail() {
+        let action = handle_pipeline_detail_key(app, key);
+        return (true, action);
+    }
+
     // Escape closes any open overlay or clears filter
     if key.code == KeyCode::Esc {
         if app.has_overlay() {
@@ -168,19 +190,23 @@ pub fn handle_key_event(app: &mut App, key: KeyEvent) -> (bool, ViewAction) {
         // View switching by number (only when no overlay)
         KeyCode::Char('1') if !app.has_overlay() => {
             app.switch_view(View::Specs);
-            (true, ViewAction::None)
+            (true, ViewAction::TabSwitched(View::Specs))
         }
         KeyCode::Char('2') if !app.has_overlay() => {
             app.switch_view(View::Plan);
-            (true, ViewAction::None)
+            (true, ViewAction::TabSwitched(View::Plan))
         }
         KeyCode::Char('3') if !app.has_overlay() => {
             app.switch_view(View::Execute);
-            (true, ViewAction::None)
+            (true, ViewAction::TabSwitched(View::Execute))
         }
         KeyCode::Char('4') if !app.has_overlay() => {
             app.switch_view(View::Logs);
-            (true, ViewAction::None)
+            (true, ViewAction::TabSwitched(View::Logs))
+        }
+        KeyCode::Char('5') if !app.has_overlay() => {
+            app.switch_view(View::Pipeline);
+            (true, ViewAction::TabSwitched(View::Pipeline))
         }
 
         // Tab/Shift+Tab for view cycling (only when no overlay)
@@ -190,11 +216,13 @@ pub fn handle_key_event(app: &mut App, key: KeyEvent) -> (bool, ViewAction) {
             } else {
                 app.next_view();
             }
-            (true, ViewAction::None)
+            let target_view = app.current_view;
+            (true, ViewAction::TabSwitched(target_view))
         }
         KeyCode::BackTab if !app.has_overlay() => {
             app.prev_view();
-            (true, ViewAction::None)
+            let target_view = app.current_view;
+            (true, ViewAction::TabSwitched(target_view))
         }
 
         // View-specific keybindings (only when no overlay)
@@ -385,11 +413,31 @@ fn handle_view_key(app: &mut App, key: KeyEvent) -> ViewAction {
         View::Plan => handle_plan_key(app, key),
         View::Execute => handle_execute_key(app, key),
         View::Logs => handle_logs_key(app, key),
+        View::Pipeline => handle_pipeline_key(app, key),
     }
 }
 
 /// Handle key events in the Plan tree view.
 fn handle_plan_key(app: &mut App, key: KeyEvent) -> ViewAction {
+    // If viewing decomposition output, handle scrolling and exit
+    if app.viewing_decomposition_output {
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') => {
+                app.decomposition_output.scroll_up();
+                return ViewAction::None;
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                app.decomposition_output.scroll_down();
+                return ViewAction::None;
+            }
+            KeyCode::Esc => {
+                app.viewing_decomposition_output = false;
+                return ViewAction::None;
+            }
+            _ => return ViewAction::None,
+        }
+    }
+
     // Get the active filter query (editing query if editing, otherwise applied query)
     let filter_query = if app.filter_state.editing {
         &app.filter_state.query
@@ -440,6 +488,18 @@ fn handle_plan_key(app: &mut App, key: KeyEvent) -> ViewAction {
         // d: discard current draft wave (with confirmation)
         KeyCode::Char('d') => {
             app.open_confirm(ConfirmAction::DiscardPlan);
+            ViewAction::None
+        }
+        // Esc: dismiss inline streaming preview during active decomposition
+        KeyCode::Esc if app.is_decomposition_active() && !app.viewing_decomposition_output => {
+            app.streaming_preview_dismissed = true;
+            ViewAction::None
+        }
+        // V: toggle decomposition output view (when decomposition is active or output has lines)
+        KeyCode::Char('v') | KeyCode::Char('V')
+            if app.is_decomposition_active() || !app.decomposition_output.lines.is_empty() =>
+        {
+            app.viewing_decomposition_output = !app.viewing_decomposition_output;
             ViewAction::None
         }
         _ => ViewAction::None,
@@ -647,6 +707,26 @@ fn handle_execute_key(app: &mut App, key: KeyEvent) -> ViewAction {
             if let Some(task_id) = app.execute_tree.selected_task_id() {
                 ViewAction::ExecuteSelectTask(task_id)
             } else {
+                // Check if selected node can be expanded
+                let visible = app.execute_tree.visible_nodes_filtered(filter_query);
+                let can_expand = visible
+                    .get(app.execute_tree.selected)
+                    .map(|&(real_idx, _)| app.execute_tree.nodes[real_idx].has_children)
+                    .unwrap_or(false);
+
+                if can_expand {
+                    app.execute_tree.toggle_collapse_filtered(filter_query);
+                } else {
+                    // Check if this is an in_progress wave (depth 0)
+                    if let Some(&(real_idx, _)) = visible.get(app.execute_tree.selected) {
+                        let node = &app.execute_tree.nodes[real_idx];
+                        if node.depth == 0 && node.status == "in_progress" {
+                            app.status_message =
+                                "Decomposition in progress — tasks will appear when complete"
+                                    .to_string();
+                        }
+                    }
+                }
                 ViewAction::None
             }
         }
@@ -772,6 +852,169 @@ fn handle_logs_detail_key(app: &mut App, key: KeyEvent) -> ViewAction {
         // g: jump to top
         KeyCode::Char('g') => {
             app.logs_view.scroll_to_top(visible_height);
+            ViewAction::None
+        }
+        _ => ViewAction::None,
+    }
+}
+
+/// Handle key events in the Pipeline view.
+fn handle_pipeline_key(app: &mut App, key: KeyEvent) -> ViewAction {
+    // If in new pipeline dialog
+    if app.in_pipeline_new() {
+        return handle_pipeline_new_key(app, key);
+    }
+
+    // If in detail view
+    if app.in_pipeline_detail() {
+        return handle_pipeline_detail_key(app, key);
+    }
+
+    // Pipeline list view
+    match key.code {
+        KeyCode::Up | KeyCode::Char('k') => {
+            app.pipeline_list.select_prev();
+            ViewAction::None
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            app.pipeline_list.select_next();
+            ViewAction::None
+        }
+        KeyCode::Char('n') => {
+            app.open_pipeline_new();
+            ViewAction::None
+        }
+        KeyCode::Enter => {
+            if let Some(item) = app.pipeline_list.selected_item() {
+                ViewAction::PipelineViewDetail(item.id.clone())
+            } else {
+                ViewAction::None
+            }
+        }
+        KeyCode::Char('c') => {
+            if let Some(item) = app.pipeline_list.selected_item() {
+                if item.status == "running" {
+                    ViewAction::PipelineCancel(item.id.clone())
+                } else {
+                    app.status_message = "Can only cancel running pipelines".to_string();
+                    ViewAction::None
+                }
+            } else {
+                ViewAction::None
+            }
+        }
+        _ => ViewAction::None,
+    }
+}
+
+/// Handle key events in the new pipeline dialog.
+fn handle_pipeline_new_key(app: &mut App, key: KeyEvent) -> ViewAction {
+    let new_state = match &mut app.pipeline_new {
+        Some(s) => s,
+        None => return ViewAction::None,
+    };
+
+    match key.code {
+        KeyCode::Esc => {
+            app.close_pipeline_new();
+            ViewAction::PipelineSubViewExit
+        }
+        KeyCode::Tab => {
+            new_state.toggle_focus();
+            ViewAction::None
+        }
+        KeyCode::Enter => {
+            let name = new_state.name_input.trim().to_string();
+            let goal = new_state.goal_input.trim().to_string();
+            if name.is_empty() || goal.is_empty() {
+                app.status_message = "Name and goal are required".to_string();
+                return ViewAction::None;
+            }
+            app.close_pipeline_new();
+            ViewAction::PipelineNew { name, goal }
+        }
+        KeyCode::Backspace => {
+            if new_state.focused_field == 0 {
+                new_state.name_input.pop();
+            } else {
+                new_state.goal_input.pop();
+            }
+            ViewAction::None
+        }
+        KeyCode::Char(c) => {
+            if new_state.focused_field == 0 {
+                new_state.name_input.push(c);
+            } else {
+                new_state.goal_input.push(c);
+            }
+            ViewAction::None
+        }
+        _ => ViewAction::None,
+    }
+}
+
+/// Handle key events in the pipeline detail view.
+fn handle_pipeline_detail_key(app: &mut App, key: KeyEvent) -> ViewAction {
+    match key.code {
+        KeyCode::Esc => {
+            app.pipeline_detail = None;
+            ViewAction::PipelineSubViewExit
+        }
+        KeyCode::BackTab => {
+            if let Some(detail) = &mut app.pipeline_detail {
+                detail.select_prev_stage();
+            }
+            ViewAction::PipelineSelectStage
+        }
+        KeyCode::Tab => {
+            if let Some(detail) = &mut app.pipeline_detail {
+                detail.select_next_stage();
+            }
+            ViewAction::PipelineSelectStage
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            if let Some(detail) = &mut app.pipeline_detail {
+                detail.scroll_down();
+            }
+            ViewAction::None
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            if let Some(detail) = &mut app.pipeline_detail {
+                detail.scroll_up();
+            }
+            ViewAction::None
+        }
+        // Page down (Ctrl+d)
+        KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            if let Some(detail) = &mut app.pipeline_detail {
+                // Scroll down by page (approximate)
+                for _ in 0..20 {
+                    detail.scroll_down();
+                }
+            }
+            ViewAction::None
+        }
+        // Page up (Ctrl+u)
+        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            if let Some(detail) = &mut app.pipeline_detail {
+                for _ in 0..20 {
+                    detail.scroll_up();
+                }
+            }
+            ViewAction::None
+        }
+        // Jump to bottom (G)
+        KeyCode::Char('G') => {
+            if let Some(detail) = &mut app.pipeline_detail {
+                detail.scroll_offset = u16::MAX; // Will be clamped in render
+            }
+            ViewAction::None
+        }
+        // Jump to top (g)
+        KeyCode::Char('g') => {
+            if let Some(detail) = &mut app.pipeline_detail {
+                detail.scroll_offset = 0;
+            }
             ViewAction::None
         }
         _ => ViewAction::None,
@@ -925,7 +1168,7 @@ mod tests {
         assert_eq!(app.current_view, View::Specs);
 
         handle_key_event(&mut app, make_key(KeyCode::BackTab));
-        assert_eq!(app.current_view, View::Logs);
+        assert_eq!(app.current_view, View::Pipeline);
     }
 
     #[test]

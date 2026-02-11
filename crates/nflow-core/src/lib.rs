@@ -3,6 +3,7 @@ pub mod dag;
 pub mod db;
 pub mod decomposition;
 pub mod error;
+pub mod pipeline;
 pub mod project;
 pub mod scheduler;
 pub mod short_id;

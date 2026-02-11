@@ -11,6 +11,7 @@ fn status_to_str(s: DecompositionStatus) -> &'static str {
         DecompositionStatus::InProgress => "in_progress",
         DecompositionStatus::Approved => "approved",
         DecompositionStatus::Discarded => "discarded",
+        DecompositionStatus::Failed => "failed",
     }
 }
 
@@ -18,6 +19,7 @@ fn status_from_str(s: &str) -> DecompositionStatus {
     match s {
         "approved" => DecompositionStatus::Approved,
         "discarded" => DecompositionStatus::Discarded,
+        "failed" => DecompositionStatus::Failed,
         _ => DecompositionStatus::InProgress,
     }
 }
@@ -36,6 +38,7 @@ fn row_to_session(row: &Row<'_>) -> rusqlite::Result<DecompositionSession> {
     let wave_number: u32 = row.get("wave_number")?;
     let status_str: String = row.get("status")?;
     let claude_session_id: Option<String> = row.get("claude_session_id")?;
+    let error_message: Option<String> = row.get("error_message")?;
     let created_at_str: String = row.get("created_at")?;
     let updated_at_str: String = row.get("updated_at")?;
 
@@ -45,6 +48,7 @@ fn row_to_session(row: &Row<'_>) -> rusqlite::Result<DecompositionSession> {
         wave_number,
         status: status_from_str(&status_str),
         claude_session_id,
+        error_message,
         created_at: parse_datetime(&created_at_str),
         updated_at: parse_datetime(&updated_at_str),
     })
@@ -55,14 +59,15 @@ pub fn insert_decomposition_session(
     session: &DecompositionSession,
 ) -> Result<()> {
     conn.execute(
-        "INSERT INTO decomposition_sessions (id, project_id, wave_number, status, claude_session_id, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        "INSERT INTO decomposition_sessions (id, project_id, wave_number, status, claude_session_id, error_message, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         params![
             session.id.to_string(),
             session.project_id.to_string(),
             session.wave_number,
             status_to_str(session.status),
             session.claude_session_id,
+            session.error_message,
             session.created_at.to_rfc3339(),
             session.updated_at.to_rfc3339(),
         ],
@@ -83,7 +88,7 @@ pub fn get_decomposition_session(
     id: &Uuid,
 ) -> Result<Option<DecompositionSession>> {
     let mut stmt = conn.prepare(
-        "SELECT id, project_id, wave_number, status, claude_session_id, created_at, updated_at
+        "SELECT id, project_id, wave_number, status, claude_session_id, error_message, created_at, updated_at
          FROM decomposition_sessions WHERE id = ?1",
     )?;
     let mut rows = stmt.query_map(params![id.to_string()], row_to_session)?;
@@ -98,7 +103,7 @@ pub fn find_draft_session(
     project_id: &Uuid,
 ) -> Result<Option<DecompositionSession>> {
     let mut stmt = conn.prepare(
-        "SELECT id, project_id, wave_number, status, claude_session_id, created_at, updated_at
+        "SELECT id, project_id, wave_number, status, claude_session_id, error_message, created_at, updated_at
          FROM decomposition_sessions WHERE project_id = ?1 AND status = 'in_progress'
          ORDER BY created_at DESC LIMIT 1",
     )?;
@@ -114,7 +119,7 @@ pub fn list_sessions_by_project(
     project_id: &Uuid,
 ) -> Result<Vec<DecompositionSession>> {
     let mut stmt = conn.prepare(
-        "SELECT id, project_id, wave_number, status, claude_session_id, created_at, updated_at
+        "SELECT id, project_id, wave_number, status, claude_session_id, error_message, created_at, updated_at
          FROM decomposition_sessions WHERE project_id = ?1 ORDER BY wave_number",
     )?;
     let rows = stmt.query_map(params![project_id.to_string()], row_to_session)?;
@@ -141,13 +146,26 @@ pub fn update_session_status(
     Ok(())
 }
 
+/// Set session status to failed with an error message in a single query.
+pub fn update_session_error(conn: &Connection, id: &Uuid, error_message: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE decomposition_sessions SET status = 'failed', error_message = ?1, updated_at = ?2 WHERE id = ?3",
+        params![
+            error_message,
+            Utc::now().to_rfc3339(),
+            id.to_string(),
+        ],
+    )?;
+    Ok(())
+}
+
 pub fn get_session_by_wave(
     conn: &Connection,
     project_id: &Uuid,
     wave_number: u32,
 ) -> Result<Option<DecompositionSession>> {
     let mut stmt = conn.prepare(
-        "SELECT id, project_id, wave_number, status, claude_session_id, created_at, updated_at
+        "SELECT id, project_id, wave_number, status, claude_session_id, error_message, created_at, updated_at
          FROM decomposition_sessions WHERE project_id = ?1 AND wave_number = ?2",
     )?;
     let mut rows = stmt.query_map(params![project_id.to_string(), wave_number], row_to_session)?;
@@ -191,6 +209,45 @@ pub fn next_wave_number(conn: &Connection, project_id: &Uuid) -> Result<u32> {
     Ok(max.unwrap_or(0) + 1)
 }
 
+pub fn find_in_progress_sessions(conn: &Connection) -> Result<Vec<DecompositionSession>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, project_id, wave_number, status, claude_session_id, error_message, created_at, updated_at
+         FROM decomposition_sessions WHERE status = 'in_progress'",
+    )?;
+    let rows = stmt.query_map([], row_to_session)?;
+    let mut sessions = Vec::new();
+    for row in rows {
+        sessions.push(row?);
+    }
+    Ok(sessions)
+}
+
+pub fn find_approved_sessions(conn: &Connection) -> Result<Vec<DecompositionSession>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, project_id, wave_number, status, claude_session_id, error_message, created_at, updated_at
+         FROM decomposition_sessions WHERE status = 'approved'",
+    )?;
+    let rows = stmt.query_map([], row_to_session)?;
+    let mut sessions = Vec::new();
+    for row in rows {
+        sessions.push(row?);
+    }
+    Ok(sessions)
+}
+
+pub fn find_failed_sessions(conn: &Connection) -> Result<Vec<DecompositionSession>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, project_id, wave_number, status, claude_session_id, error_message, created_at, updated_at
+         FROM decomposition_sessions WHERE status = 'failed'",
+    )?;
+    let rows = stmt.query_map([], row_to_session)?;
+    let mut sessions = Vec::new();
+    for row in rows {
+        sessions.push(row?);
+    }
+    Ok(sessions)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -222,6 +279,7 @@ mod tests {
             wave_number,
             status: DecompositionStatus::InProgress,
             claude_session_id: None,
+            error_message: None,
             created_at: now,
             updated_at: now,
         }

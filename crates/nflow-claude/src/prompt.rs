@@ -9,6 +9,9 @@ const EMBEDDED_DECOMPOSE: &str = include_str!("../../../prompts/decompose.md");
 const EMBEDDED_TASK_EXECUTION: &str = include_str!("../../../prompts/task_execution.md");
 const EMBEDDED_VERIFY_TASK: &str = include_str!("../../../prompts/verify_task.md");
 const EMBEDDED_MR_BODY: &str = include_str!("../../../prompts/mr_body.md");
+const EMBEDDED_PIPELINE_PLAN: &str = include_str!("../../../prompts/pipeline_plan.md");
+const EMBEDDED_PIPELINE_IMPLEMENT: &str = include_str!("../../../prompts/pipeline_implement.md");
+const EMBEDDED_PIPELINE_REVIEW: &str = include_str!("../../../prompts/pipeline_review.md");
 
 /// Known template names.
 const KNOWN_TEMPLATES: &[(&str, &str)] = &[
@@ -17,6 +20,9 @@ const KNOWN_TEMPLATES: &[(&str, &str)] = &[
     ("task_execution", EMBEDDED_TASK_EXECUTION),
     ("verify_task", EMBEDDED_VERIFY_TASK),
     ("mr_body", EMBEDDED_MR_BODY),
+    ("pipeline_plan", EMBEDDED_PIPELINE_PLAN),
+    ("pipeline_implement", EMBEDDED_PIPELINE_IMPLEMENT),
+    ("pipeline_review", EMBEDDED_PIPELINE_REVIEW),
 ];
 
 /// Get the embedded template content for a given template name.
