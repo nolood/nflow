@@ -6734,6 +6734,39 @@ fn handle_pipeline_start(req: Request, state: &HandlerState) -> HandlerResult {
                         review: review_output.review.clone(),
                     });
                 }
+                // Manual mode approval gates — will be fully implemented in US-008
+                nflow_core::pipeline::PipelineAction::WaitForApproval
+                | nflow_core::pipeline::PipelineAction::WaitForFinalApproval => {
+                    // For now, treat as complete (auto mode won't reach here)
+                    if let Ok(conn) = db::open_connection(&db_path) {
+                        let _ = db::pipeline::update_pipeline_run(
+                            &conn,
+                            &run_id,
+                            "completed",
+                            None,
+                            iteration,
+                        );
+                    }
+                    if let Some(bus) = &event_bus {
+                        bus.broadcast(crate::events::Event::PipelineCompleted {
+                            pipeline_run_id: run_id.to_string(),
+                            project_id: project_id.to_string(),
+                            status: "completed".to_string(),
+                            iterations: iteration,
+                        });
+                    }
+                    let _ = tx
+                        .send(StreamingResponseLine::done(
+                            initial_id,
+                            serde_json::json!({
+                                "pipeline_run_id": run_id.to_string(),
+                                "status": "completed",
+                                "iterations": iteration,
+                            }),
+                        ))
+                        .await;
+                    return;
+                }
             }
         }
 

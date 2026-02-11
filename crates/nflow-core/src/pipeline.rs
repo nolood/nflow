@@ -24,10 +24,12 @@ impl fmt::Display for PipelineMode {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 pub enum PipelineStatus {
     Pending,
     Running,
+    WaitingForApproval,
+    WaitingForFinalApproval,
     Completed,
     Failed,
     Cancelled,
@@ -38,6 +40,8 @@ impl fmt::Display for PipelineStatus {
         match self {
             PipelineStatus::Pending => write!(f, "pending"),
             PipelineStatus::Running => write!(f, "running"),
+            PipelineStatus::WaitingForApproval => write!(f, "waiting_for_approval"),
+            PipelineStatus::WaitingForFinalApproval => write!(f, "waiting_for_final_approval"),
             PipelineStatus::Completed => write!(f, "completed"),
             PipelineStatus::Failed => write!(f, "failed"),
             PipelineStatus::Cancelled => write!(f, "cancelled"),
@@ -228,6 +232,8 @@ pub struct IterationRecord {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PipelineAction {
     StartStage(PipelineStageType),
+    WaitForApproval,
+    WaitForFinalApproval,
     LoopBack { feedback: String },
     Complete,
     MaxIterationsReached,
@@ -235,10 +241,17 @@ pub enum PipelineAction {
 
 /// Determine the next action after a stage completes.
 ///
-/// State machine:
+/// State machine (Auto mode):
 /// - Plan completed → start Implement
 /// - Implement completed → start Review
 /// - Review passed → Complete
+/// - Review failed + iterations left → LoopBack
+/// - Review failed + no iterations → MaxIterationsReached
+///
+/// State machine (Manual mode):
+/// - Plan completed → WaitForApproval (user must approve plan before Implement)
+/// - Implement completed → start Review
+/// - Review passed → WaitForFinalApproval (user must approve final result)
 /// - Review failed + iterations left → LoopBack
 /// - Review failed + no iterations → MaxIterationsReached
 pub fn next_action(
@@ -247,7 +260,10 @@ pub fn next_action(
     output: &StageOutput,
 ) -> PipelineAction {
     match completed_stage {
-        PipelineStageType::Plan => PipelineAction::StartStage(PipelineStageType::Implement),
+        PipelineStageType::Plan => match run.mode {
+            PipelineMode::Manual => PipelineAction::WaitForApproval,
+            PipelineMode::Auto => PipelineAction::StartStage(PipelineStageType::Implement),
+        },
         PipelineStageType::Implement => PipelineAction::StartStage(PipelineStageType::Review),
         PipelineStageType::Review => {
             let passed = output
@@ -257,7 +273,10 @@ pub fn next_action(
                 .unwrap_or(output.success);
 
             if passed {
-                PipelineAction::Complete
+                match run.mode {
+                    PipelineMode::Manual => PipelineAction::WaitForFinalApproval,
+                    PipelineMode::Auto => PipelineAction::Complete,
+                }
             } else if run.iteration >= run.max_iterations {
                 PipelineAction::MaxIterationsReached
             } else {
@@ -486,6 +505,14 @@ mod tests {
     fn pipeline_status_display() {
         assert_eq!(PipelineStatus::Pending.to_string(), "pending");
         assert_eq!(PipelineStatus::Running.to_string(), "running");
+        assert_eq!(
+            PipelineStatus::WaitingForApproval.to_string(),
+            "waiting_for_approval"
+        );
+        assert_eq!(
+            PipelineStatus::WaitingForFinalApproval.to_string(),
+            "waiting_for_final_approval"
+        );
         assert_eq!(PipelineStatus::Completed.to_string(), "completed");
         assert_eq!(PipelineStatus::Failed.to_string(), "failed");
         assert_eq!(PipelineStatus::Cancelled.to_string(), "cancelled");
@@ -587,5 +614,108 @@ mod tests {
             PipelineMode::Manual,
         );
         assert_eq!(run.mode, PipelineMode::Manual);
+    }
+
+    // ─── Manual mode next_action tests ──────────────────
+
+    fn make_manual_run(iteration: u32, max_iterations: u32) -> PipelineRun {
+        let now = Utc::now();
+        PipelineRun {
+            id: Uuid::new_v4(),
+            project_id: Uuid::new_v4(),
+            name: "test".to_string(),
+            goal: "test goal".to_string(),
+            mode: PipelineMode::Manual,
+            status: PipelineStatus::Running,
+            current_stage: Some(PipelineStageType::Plan),
+            iteration,
+            max_iterations,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    #[test]
+    fn manual_plan_completed_waits_for_approval() {
+        let run = make_manual_run(1, 5);
+        let output = success_output();
+        assert_eq!(
+            next_action(&run, PipelineStageType::Plan, &output),
+            PipelineAction::WaitForApproval
+        );
+    }
+
+    #[test]
+    fn manual_implement_completed_starts_review() {
+        let run = make_manual_run(1, 5);
+        let output = success_output();
+        assert_eq!(
+            next_action(&run, PipelineStageType::Implement, &output),
+            PipelineAction::StartStage(PipelineStageType::Review)
+        );
+    }
+
+    #[test]
+    fn manual_review_passed_waits_for_final_approval() {
+        let run = make_manual_run(1, 5);
+        let output = review_passed_output();
+        assert_eq!(
+            next_action(&run, PipelineStageType::Review, &output),
+            PipelineAction::WaitForFinalApproval
+        );
+    }
+
+    #[test]
+    fn manual_review_failed_with_iterations_left_loops_back() {
+        let run = make_manual_run(1, 5);
+        let output = review_failed_output();
+        let action = next_action(&run, PipelineStageType::Review, &output);
+        match action {
+            PipelineAction::LoopBack { feedback } => {
+                assert_eq!(feedback, "fix the tests");
+            }
+            other => panic!("expected LoopBack, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn manual_review_failed_at_max_iterations() {
+        let run = make_manual_run(5, 5);
+        let output = review_failed_output();
+        assert_eq!(
+            next_action(&run, PipelineStageType::Review, &output),
+            PipelineAction::MaxIterationsReached
+        );
+    }
+
+    // ─── PipelineStatus serialization tests ─────────────
+
+    #[test]
+    fn pipeline_status_serialization_round_trip() {
+        let statuses = vec![
+            (PipelineStatus::Pending, "\"pending\""),
+            (PipelineStatus::Running, "\"running\""),
+            (
+                PipelineStatus::WaitingForApproval,
+                "\"waiting_for_approval\"",
+            ),
+            (
+                PipelineStatus::WaitingForFinalApproval,
+                "\"waiting_for_final_approval\"",
+            ),
+            (PipelineStatus::Completed, "\"completed\""),
+            (PipelineStatus::Failed, "\"failed\""),
+            (PipelineStatus::Cancelled, "\"cancelled\""),
+        ];
+        for (status, expected_json) in statuses {
+            let json = serde_json::to_string(&status).unwrap();
+            assert_eq!(json, expected_json, "serialization failed for {:?}", status);
+            let parsed: PipelineStatus = serde_json::from_str(&json).unwrap();
+            assert_eq!(
+                parsed, status,
+                "deserialization failed for {:?}",
+                status
+            );
+        }
     }
 }

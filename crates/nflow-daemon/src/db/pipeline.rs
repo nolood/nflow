@@ -28,6 +28,8 @@ fn pipeline_status_to_str(s: PipelineStatus) -> &'static str {
     match s {
         PipelineStatus::Pending => "pending",
         PipelineStatus::Running => "running",
+        PipelineStatus::WaitingForApproval => "waiting_for_approval",
+        PipelineStatus::WaitingForFinalApproval => "waiting_for_final_approval",
         PipelineStatus::Completed => "completed",
         PipelineStatus::Failed => "failed",
         PipelineStatus::Cancelled => "cancelled",
@@ -37,6 +39,8 @@ fn pipeline_status_to_str(s: PipelineStatus) -> &'static str {
 fn pipeline_status_from_str(s: &str) -> PipelineStatus {
     match s {
         "running" => PipelineStatus::Running,
+        "waiting_for_approval" => PipelineStatus::WaitingForApproval,
+        "waiting_for_final_approval" => PipelineStatus::WaitingForFinalApproval,
         "completed" => PipelineStatus::Completed,
         "failed" => PipelineStatus::Failed,
         "cancelled" => PipelineStatus::Cancelled,
