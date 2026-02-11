@@ -90,6 +90,15 @@ pub enum ViewAction {
         question_id: String,
         answer: String,
     },
+    /// User approved a pipeline plan or final result.
+    PipelineApprove {
+        pipeline_run_id: String,
+    },
+    /// User rejected a pipeline plan or final result with feedback.
+    PipelineReject {
+        pipeline_run_id: String,
+        feedback: String,
+    },
 }
 
 /// Handle a key event, returning true if the app should continue, false to quit.
@@ -145,6 +154,12 @@ pub fn handle_key_event(app: &mut App, key: KeyEvent) -> (bool, ViewAction) {
     // If pipeline question overlay is open, handle exclusively
     if app.in_pipeline_question_overlay() {
         let action = handle_pipeline_question_overlay_key(app, key);
+        return (true, action);
+    }
+
+    // If pipeline approval overlay is open, handle exclusively
+    if app.in_pipeline_approval_overlay() {
+        let action = handle_pipeline_approval_overlay_key(app, key);
         return (true, action);
     }
 
@@ -1127,6 +1142,100 @@ fn handle_pipeline_question_overlay_key(app: &mut App, key: KeyEvent) -> ViewAct
             ViewAction::None
         }
         _ => ViewAction::None,
+    }
+}
+
+/// Handle key events in the pipeline approval overlay.
+fn handle_pipeline_approval_overlay_key(app: &mut App, key: KeyEvent) -> ViewAction {
+    if app.pipeline_approval_overlay.is_none() {
+        return ViewAction::None;
+    }
+
+    // Check if we're in rejection feedback input mode
+    let is_rejecting = app
+        .pipeline_approval_overlay
+        .as_ref()
+        .map_or(false, |o| o.rejecting);
+
+    if is_rejecting {
+        match key.code {
+            KeyCode::Esc => {
+                // Cancel rejection, go back to approve/reject view
+                if let Some(overlay) = &mut app.pipeline_approval_overlay {
+                    overlay.rejecting = false;
+                    overlay.feedback_input.clear();
+                }
+                ViewAction::None
+            }
+            KeyCode::Enter => {
+                // Submit rejection with feedback
+                let (run_id, feedback) = {
+                    let overlay = app.pipeline_approval_overlay.as_ref().unwrap();
+                    (
+                        overlay.pipeline_run_id.clone(),
+                        overlay.feedback_input.trim().to_string(),
+                    )
+                };
+                app.close_pipeline_approval_overlay();
+                ViewAction::PipelineReject {
+                    pipeline_run_id: run_id,
+                    feedback,
+                }
+            }
+            KeyCode::Backspace => {
+                if let Some(overlay) = &mut app.pipeline_approval_overlay {
+                    overlay.feedback_input.pop();
+                }
+                ViewAction::None
+            }
+            KeyCode::Char(c) => {
+                if let Some(overlay) = &mut app.pipeline_approval_overlay {
+                    overlay.feedback_input.push(c);
+                }
+                ViewAction::None
+            }
+            _ => ViewAction::None,
+        }
+    } else {
+        match key.code {
+            KeyCode::Esc => {
+                app.close_pipeline_approval_overlay();
+                ViewAction::None
+            }
+            KeyCode::Char('a') => {
+                // Approve
+                let run_id = app
+                    .pipeline_approval_overlay
+                    .as_ref()
+                    .unwrap()
+                    .pipeline_run_id
+                    .clone();
+                app.close_pipeline_approval_overlay();
+                ViewAction::PipelineApprove {
+                    pipeline_run_id: run_id,
+                }
+            }
+            KeyCode::Char('r') => {
+                // Enter rejection mode
+                if let Some(overlay) = &mut app.pipeline_approval_overlay {
+                    overlay.rejecting = true;
+                }
+                ViewAction::None
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if let Some(overlay) = &mut app.pipeline_approval_overlay {
+                    overlay.scroll_offset = overlay.scroll_offset.saturating_add(1);
+                }
+                ViewAction::None
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                if let Some(overlay) = &mut app.pipeline_approval_overlay {
+                    overlay.scroll_offset = overlay.scroll_offset.saturating_sub(1);
+                }
+                ViewAction::None
+            }
+            _ => ViewAction::None,
+        }
     }
 }
 

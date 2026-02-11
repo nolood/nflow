@@ -374,6 +374,12 @@ async fn event_loop(
                 event::ViewAction::PipelineAnswer { pipeline_run_id, question_id, answer } => {
                     handle_pipeline_answer(app, client, &pipeline_run_id, &question_id, &answer).await;
                 }
+                event::ViewAction::PipelineApprove { pipeline_run_id } => {
+                    handle_pipeline_approve(app, client, &pipeline_run_id).await;
+                }
+                event::ViewAction::PipelineReject { pipeline_run_id, feedback } => {
+                    handle_pipeline_reject(app, client, &pipeline_run_id, &feedback).await;
+                }
                 event::ViewAction::TabSwitched(view) => match view {
                     View::Execute | View::Logs => {
                         app.fetch_execute(client).await.ok();
@@ -1493,6 +1499,100 @@ async fn handle_daemon_event(
                 app.remove_pending_question(question_id);
             }
         }
+        "pipeline_plan_ready" => {
+            if let Some(run_id) = event.get("pipeline_run_id").and_then(|v| v.as_str()) {
+                let summary = event
+                    .get("plan_summary")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("Plan is ready for review.")
+                    .to_string();
+
+                // Update pipeline status in list and detail views
+                if let Some(item) = app.pipeline_list.runs.iter_mut().find(|r| r.id == run_id) {
+                    item.status = "waiting_for_approval".to_string();
+                }
+                if let Some(detail) = &mut app.pipeline_detail {
+                    if detail.run.id == run_id {
+                        detail.run.status = "waiting_for_approval".to_string();
+                    }
+                }
+
+                // Auto-open approval overlay if viewing this pipeline
+                if app.pipeline_detail.as_ref().map_or(false, |d| d.run.id == run_id) {
+                    app.open_pipeline_approval_overlay(
+                        run_id.to_string(),
+                        crate::app::ApprovalKind::Plan,
+                        summary,
+                    );
+                }
+            }
+        }
+        "pipeline_final_approval_ready" => {
+            if let Some(run_id) = event.get("pipeline_run_id").and_then(|v| v.as_str()) {
+                let summary = event
+                    .get("summary")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("All stages completed. Review the results.")
+                    .to_string();
+
+                // Update pipeline status in list and detail views
+                if let Some(item) = app.pipeline_list.runs.iter_mut().find(|r| r.id == run_id) {
+                    item.status = "waiting_for_final_approval".to_string();
+                }
+                if let Some(detail) = &mut app.pipeline_detail {
+                    if detail.run.id == run_id {
+                        detail.run.status = "waiting_for_final_approval".to_string();
+                    }
+                }
+
+                // Auto-open approval overlay if viewing this pipeline
+                if app.pipeline_detail.as_ref().map_or(false, |d| d.run.id == run_id) {
+                    app.open_pipeline_approval_overlay(
+                        run_id.to_string(),
+                        crate::app::ApprovalKind::Final,
+                        summary,
+                    );
+                }
+            }
+        }
+        "pipeline_plan_approved" | "pipeline_final_approved" => {
+            if let Some(run_id) = event.get("pipeline_run_id").and_then(|v| v.as_str()) {
+                // Update status back to running (or completed for final)
+                let new_status = if event_type == "pipeline_final_approved" {
+                    "completed"
+                } else {
+                    "running"
+                };
+                if let Some(item) = app.pipeline_list.runs.iter_mut().find(|r| r.id == run_id) {
+                    item.status = new_status.to_string();
+                }
+                if let Some(detail) = &mut app.pipeline_detail {
+                    if detail.run.id == run_id {
+                        detail.run.status = new_status.to_string();
+                    }
+                }
+                // Close approval overlay if it's for this run
+                if app.pipeline_approval_overlay.as_ref().map_or(false, |o| o.pipeline_run_id == run_id) {
+                    app.close_pipeline_approval_overlay();
+                }
+            }
+        }
+        "pipeline_plan_rejected" | "pipeline_final_rejected" => {
+            if let Some(run_id) = event.get("pipeline_run_id").and_then(|v| v.as_str()) {
+                if let Some(item) = app.pipeline_list.runs.iter_mut().find(|r| r.id == run_id) {
+                    item.status = "running".to_string();
+                }
+                if let Some(detail) = &mut app.pipeline_detail {
+                    if detail.run.id == run_id {
+                        detail.run.status = "running".to_string();
+                    }
+                }
+                // Close approval overlay if it's for this run
+                if app.pipeline_approval_overlay.as_ref().map_or(false, |o| o.pipeline_run_id == run_id) {
+                    app.close_pipeline_approval_overlay();
+                }
+            }
+        }
         _ => {
             // Unknown event type -- ignore
         }
@@ -1690,6 +1790,64 @@ async fn handle_pipeline_answer(
                     .and_then(|v| v.as_str())
                     .unwrap_or("unknown error");
                 app.status_message = format!("Error answering: {}", msg);
+            }
+        }
+        Err(e) => {
+            app.status_message = format!("Error: {}", e);
+        }
+    }
+}
+
+/// Approve a pipeline plan or final result.
+async fn handle_pipeline_approve(app: &mut App, client: &mut SocketClient, pipeline_run_id: &str) {
+    let params = serde_json::json!({
+        "pipeline_run_id": pipeline_run_id,
+    });
+
+    match client.send_command("pipeline.approve", params).await {
+        Ok(resp) => {
+            if resp.status == ResponseStatus::Ok {
+                app.status_message = "Approved".to_string();
+                fetch_pipeline_list(app, client).await;
+            } else {
+                let msg = resp
+                    .data
+                    .get("message")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown error");
+                app.status_message = format!("Error approving: {}", msg);
+            }
+        }
+        Err(e) => {
+            app.status_message = format!("Error: {}", e);
+        }
+    }
+}
+
+/// Reject a pipeline plan or final result with feedback.
+async fn handle_pipeline_reject(
+    app: &mut App,
+    client: &mut SocketClient,
+    pipeline_run_id: &str,
+    feedback: &str,
+) {
+    let params = serde_json::json!({
+        "pipeline_run_id": pipeline_run_id,
+        "feedback": feedback,
+    });
+
+    match client.send_command("pipeline.reject", params).await {
+        Ok(resp) => {
+            if resp.status == ResponseStatus::Ok {
+                app.status_message = "Rejected with feedback".to_string();
+                fetch_pipeline_list(app, client).await;
+            } else {
+                let msg = resp
+                    .data
+                    .get("message")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown error");
+                app.status_message = format!("Error rejecting: {}", msg);
             }
         }
         Err(e) => {
@@ -2038,6 +2196,34 @@ async fn poll_pipeline_streaming_data(app: &mut App, client: &mut SocketClient) 
                             if !app.in_pipeline_question_overlay() {
                                 app.open_pipeline_question_overlay();
                             }
+                        }
+                    }
+                    Some("waiting_for_approval") => {
+                        let run_id = line.data.get("pipeline_run_id").and_then(|v| v.as_str()).unwrap_or("");
+                        let summary = line.data.get("plan_summary").and_then(|v| v.as_str())
+                            .unwrap_or("Plan is ready for review.")
+                            .to_string();
+                        detail.run.status = "waiting_for_approval".to_string();
+                        if !run_id.is_empty() && !app.in_pipeline_approval_overlay() {
+                            app.open_pipeline_approval_overlay(
+                                run_id.to_string(),
+                                crate::app::ApprovalKind::Plan,
+                                summary,
+                            );
+                        }
+                    }
+                    Some("waiting_for_final_approval") => {
+                        let run_id = line.data.get("pipeline_run_id").and_then(|v| v.as_str()).unwrap_or("");
+                        let summary = line.data.get("summary").and_then(|v| v.as_str())
+                            .unwrap_or("All stages completed. Review the results.")
+                            .to_string();
+                        detail.run.status = "waiting_for_final_approval".to_string();
+                        if !run_id.is_empty() && !app.in_pipeline_approval_overlay() {
+                            app.open_pipeline_approval_overlay(
+                                run_id.to_string(),
+                                crate::app::ApprovalKind::Final,
+                                summary,
+                            );
                         }
                     }
                     _ => {

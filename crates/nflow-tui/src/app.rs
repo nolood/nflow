@@ -2360,12 +2360,45 @@ impl PipelineQuestionOverlayState {
     }
 }
 
+/// Whether the approval overlay is for plan approval or final approval.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApprovalKind {
+    Plan,
+    Final,
+}
+
+/// State for the pipeline approval overlay (plan or final).
+#[derive(Debug, Clone)]
+pub struct PipelineApprovalOverlayState {
+    pub pipeline_run_id: String,
+    pub kind: ApprovalKind,
+    pub summary: String,
+    /// true when user pressed 'r' and is typing rejection feedback
+    pub rejecting: bool,
+    pub feedback_input: String,
+    pub scroll_offset: u16,
+}
+
+impl PipelineApprovalOverlayState {
+    pub fn new(pipeline_run_id: String, kind: ApprovalKind, summary: String) -> Self {
+        Self {
+            pipeline_run_id,
+            kind,
+            summary,
+            rejecting: false,
+            feedback_input: String::new(),
+            scroll_offset: 0,
+        }
+    }
+}
+
 /// Overlay that can be displayed on top of the current view.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Overlay {
     Help,
     ProjectSwitcher,
     PipelineQuestion,
+    PipelineApproval,
 }
 
 /// The active view in the TUI.
@@ -2519,6 +2552,8 @@ pub struct App {
     pub pipeline_pending_questions: Vec<PendingQuestion>,
     /// Pipeline question overlay dialog state (if open).
     pub pipeline_question_overlay: Option<PipelineQuestionOverlayState>,
+    /// Pipeline approval overlay state (plan or final approval).
+    pub pipeline_approval_overlay: Option<PipelineApprovalOverlayState>,
 }
 
 /// Truncate a string to at most `max_chars` characters, appending "..." if truncated.
@@ -2575,6 +2610,7 @@ impl App {
             pipeline_auto_scroll: true,
             pipeline_pending_questions: Vec::new(),
             pipeline_question_overlay: None,
+            pipeline_approval_overlay: None,
         }
     }
 
@@ -3016,6 +3052,34 @@ impl App {
     /// Get the number of pending questions for a specific pipeline run.
     pub fn pending_question_count_for_run(&self, run_id: &str) -> usize {
         self.pipeline_pending_questions.iter().filter(|q| q.pipeline_run_id == run_id).count()
+    }
+
+    /// Returns true if the pipeline approval overlay is open.
+    pub fn in_pipeline_approval_overlay(&self) -> bool {
+        self.pipeline_approval_overlay.is_some()
+    }
+
+    /// Open the pipeline approval overlay.
+    pub fn open_pipeline_approval_overlay(
+        &mut self,
+        pipeline_run_id: String,
+        kind: ApprovalKind,
+        summary: String,
+    ) {
+        self.pipeline_approval_overlay = Some(PipelineApprovalOverlayState::new(
+            pipeline_run_id,
+            kind,
+            summary,
+        ));
+        self.overlay = Some(Overlay::PipelineApproval);
+    }
+
+    /// Close the pipeline approval overlay.
+    pub fn close_pipeline_approval_overlay(&mut self) {
+        self.pipeline_approval_overlay = None;
+        if self.overlay == Some(Overlay::PipelineApproval) {
+            self.overlay = None;
+        }
     }
 
     /// Returns true if a pipeline streaming session is active.

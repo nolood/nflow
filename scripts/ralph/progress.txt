@@ -27,6 +27,9 @@ Started: Wed Feb 11 06:57:15 PM MSK 2026
 - Borrow checker tip: when modifying overlay state and app state in same handler, extract data into locals first (immutable borrow), then modify (mutable borrows)
 - Daemon events arrive via two paths: (1) event bus subscription (handle_daemon_event), (2) streaming response data (poll_pipeline_streaming_data) — both must handle new event types
 - Pipeline question badge in list view: `pending_question_count_for_run()` helper counts per-run pending questions, shown as "[N ?]" in status column
+- Pipeline approval overlay: `PipelineApprovalOverlayState` in app.rs, `ApprovalKind` enum (Plan/Final), opened via `open_pipeline_approval_overlay()`, keybinds 'a' approve/'r' reject
+- Approval overlay has two modes: view mode (a/r/j/k/Esc) and rejection mode (text input with Enter/Esc) — controlled by `rejecting` bool field
+- Pipeline status strings for approval gates: "waiting_for_approval" and "waiting_for_final_approval" — used in status bar indicator and detail view
 
 ---
 
@@ -204,4 +207,33 @@ Started: Wed Feb 11 06:57:15 PM MSK 2026
   - Borrow checker challenge: handler functions that mutate overlay state and app state simultaneously need to extract data into locals first (immutable borrow), then modify (mutable borrows)
   - Two event paths in TUI: daemon event bus (handle_daemon_event) and streaming response data (poll_pipeline_streaming_data) — both must handle new event types
   - `pending_question_count_for_run()` enables per-run question counts for badge display without extra state
+---
+
+## 2026-02-11 - US-015
+- Implemented plan approval and final approval UI in TUI
+- Added `ApprovalKind` enum (Plan, Final) and `PipelineApprovalOverlayState` struct to app.rs
+- Added `Overlay::PipelineApproval` variant to the Overlay enum
+- Added `pipeline_approval_overlay: Option<PipelineApprovalOverlayState>` field to App with helper methods (open/close/in_check)
+- Added `ViewAction::PipelineApprove` and `ViewAction::PipelineReject` to event.rs
+- Added `handle_pipeline_approval_overlay_key()` handler in event.rs:
+  - View mode: 'a' approves, 'r' enters rejection mode, j/k scroll, Esc closes
+  - Rejection mode: text input for feedback, Enter submits rejection, Esc cancels back to view mode
+- Added `render_pipeline_approval_overlay()` in ui.rs: centered 70x70% popup with dimmed background, plan/summary text, approve/reject controls
+- Added pipeline waiting status indicator to status bar: "Awaiting plan approval" (yellow) and "Awaiting final approval" (yellow)
+- Handled new events in handle_daemon_event (main.rs):
+  - `pipeline_plan_ready`: updates status to waiting_for_approval, auto-opens approval overlay
+  - `pipeline_final_approval_ready`: updates status to waiting_for_final_approval, auto-opens approval overlay
+  - `pipeline_plan_approved/pipeline_final_approved`: updates status, closes overlay
+  - `pipeline_plan_rejected/pipeline_final_rejected`: updates status, closes overlay
+- Handled same events in streaming data path (poll_pipeline_streaming_data): waiting_for_approval and waiting_for_final_approval types
+- Added `handle_pipeline_approve()` and `handle_pipeline_reject()` async functions: send pipeline.approve/pipeline.reject commands to daemon
+- Files changed: crates/nflow-tui/src/app.rs, crates/nflow-tui/src/event.rs, crates/nflow-tui/src/main.rs, crates/nflow-tui/src/ui.rs, scripts/ralph/prd.json
+- All 152 non-daemon tests pass
+- `cargo build --workspace` succeeds, `cargo clippy --workspace --all-targets` passes (no new warnings)
+- **Learnings for future iterations:**
+  - Approval overlay follows same pattern as question overlay: state struct on App, Overlay enum variant, exclusive key handler, render function
+  - Two-mode overlay (view + rejection input) uses a `rejecting` boolean to switch between normal key handling and text input mode
+  - Pipeline status strings "waiting_for_approval" and "waiting_for_final_approval" match daemon DB values
+  - Events flow through both daemon event bus AND streaming data — must handle in both paths for consistent behavior
+  - Status bar checks `pipeline_detail.run.status` for waiting indicators — only shown when detail view is open
 ---

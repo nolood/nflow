@@ -5,7 +5,8 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph, Row, Table, Tabs, Wrap}
 use ratatui::Frame;
 
 use crate::app::{
-    App, ConfirmAction, DaemonState, DecompositionPhase, DialogueSessionState, Overlay, View,
+    App, ApprovalKind, ConfirmAction, DaemonState, DecompositionPhase, DialogueSessionState,
+    Overlay, View,
 };
 
 /// Braille spinner frames for animated progress indicators.
@@ -1995,6 +1996,27 @@ fn render_status_bar(app: &App, frame: &mut Frame, area: Rect) {
         ));
     }
 
+    // Pipeline approval waiting indicator
+    if let Some(detail) = &app.pipeline_detail {
+        match detail.run.status.as_str() {
+            "waiting_for_approval" => {
+                spans.push(Span::raw(" | "));
+                spans.push(Span::styled(
+                    "Awaiting plan approval",
+                    Style::default().fg(Color::Yellow),
+                ));
+            }
+            "waiting_for_final_approval" => {
+                spans.push(Span::raw(" | "));
+                spans.push(Span::styled(
+                    "Awaiting final approval",
+                    Style::default().fg(Color::Yellow),
+                ));
+            }
+            _ => {}
+        }
+    }
+
     // View-specific keyboard hints
     spans.push(Span::raw(" | "));
     let view_hints = match app.current_view {
@@ -2113,6 +2135,7 @@ fn render_overlay(overlay: &Overlay, app: &App, frame: &mut Frame, area: Rect) {
         Overlay::Help => render_help_overlay(app.current_view, frame, area),
         Overlay::ProjectSwitcher => render_project_switcher_overlay(app, frame, area),
         Overlay::PipelineQuestion => render_pipeline_question_overlay(app, frame, area),
+        Overlay::PipelineApproval => render_pipeline_approval_overlay(app, frame, area),
     }
 }
 
@@ -2423,6 +2446,124 @@ fn render_pipeline_question_overlay(app: &App, frame: &mut Frame, area: Rect) {
         .block(block)
         .wrap(Wrap { trim: false });
     frame.render_widget(paragraph, popup_area);
+}
+
+/// Render the pipeline approval overlay (plan approval or final approval).
+fn render_pipeline_approval_overlay(app: &App, frame: &mut Frame, area: Rect) {
+    let overlay = match &app.pipeline_approval_overlay {
+        Some(o) => o,
+        None => return,
+    };
+
+    // Dim background
+    let dim_style = Style::default().fg(Color::DarkGray);
+    let buf = frame.buffer_mut();
+    for y in area.top()..area.bottom() {
+        for x in area.left()..area.right() {
+            if let Some(cell) = buf.cell_mut((x, y)) {
+                cell.set_style(dim_style);
+            }
+        }
+    }
+
+    let popup_area = centered_rect(70, 70, area);
+    frame.render_widget(Clear, popup_area);
+
+    let title = match overlay.kind {
+        ApprovalKind::Plan => {
+            if overlay.rejecting {
+                " Plan Approval \u{2014} Enter:submit Esc:cancel "
+            } else {
+                " Plan Approval \u{2014} a:approve r:reject Esc:close j/k:scroll "
+            }
+        }
+        ApprovalKind::Final => {
+            if overlay.rejecting {
+                " Final Approval \u{2014} Enter:submit Esc:cancel "
+            } else {
+                " Final Approval \u{2014} a:approve r:reject Esc:close j/k:scroll "
+            }
+        }
+    };
+
+    let border_color = Color::Yellow;
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(title)
+        .title_style(
+            Style::default()
+                .fg(border_color)
+                .add_modifier(Modifier::BOLD),
+        )
+        .border_style(Style::default().fg(border_color));
+
+    let inner = block.inner(popup_area);
+
+    // Build content lines
+    let mut lines: Vec<Line<'static>> = Vec::new();
+
+    let heading = match overlay.kind {
+        ApprovalKind::Plan => "Plan Summary",
+        ApprovalKind::Final => "Final Result Summary",
+    };
+    lines.push(Line::from(Span::styled(
+        format!("  {}", heading),
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    )));
+    lines.push(Line::from(""));
+
+    // Render summary text
+    for line in overlay.summary.lines() {
+        lines.push(Line::from(Span::styled(
+            format!("  {}", line),
+            Style::default().fg(Color::White),
+        )));
+    }
+
+    if overlay.rejecting {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "  Rejection feedback:".to_string(),
+            Style::default()
+                .fg(Color::Red)
+                .add_modifier(Modifier::BOLD),
+        )));
+        let input_display = if overlay.feedback_input.is_empty() {
+            "  \u{2588}".to_string()
+        } else {
+            format!("  {}\u{2588}", overlay.feedback_input)
+        };
+        lines.push(Line::from(Span::styled(
+            input_display,
+            Style::default().fg(Color::White),
+        )));
+    }
+
+    let paragraph = Paragraph::new(lines)
+        .block(block)
+        .wrap(Wrap { trim: false })
+        .scroll((overlay.scroll_offset, 0));
+    frame.render_widget(paragraph, popup_area);
+
+    // If not in rejection mode, show the approve/reject instructions at the bottom of inner area
+    if !overlay.rejecting {
+        let help_area = Rect::new(
+            inner.x,
+            inner.y + inner.height.saturating_sub(1),
+            inner.width,
+            1,
+        );
+        let help_text = match overlay.kind {
+            ApprovalKind::Plan => "Press 'a' to approve plan, 'r' to reject with feedback",
+            ApprovalKind::Final => "Press 'a' to approve final result, 'r' to reject with feedback",
+        };
+        frame.render_widget(
+            Paragraph::new(help_text).style(Style::default().fg(Color::DarkGray)),
+            help_area,
+        );
+    }
 }
 
 /// Render the plan generate dialog (select specs + with_codebase checkbox).
