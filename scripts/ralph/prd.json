@@ -145,7 +145,7 @@
         "cargo build --workspace succeeds"
       ],
       "priority": 8,
-      "passes": false,
+      "passes": true,
       "notes": ""
     },
     {

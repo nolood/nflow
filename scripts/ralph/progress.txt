@@ -10,6 +10,9 @@ Started: Wed Feb 11 06:57:15 PM MSK 2026
 - Pipeline question DB functions: insert_question(), get_pending_questions(pipeline_run_id), answer_question(id, answer, answered_by) — answer_question returns bool
 - `get_pending_questions()` filters `answered = 0` in SQL, so returns only unanswered questions
 - The daemon lock test (`test_acquire_lock_contention`) is flaky when daemon is running — pre-existing issue
+- `HandlerState` has `pipeline_signals: PipelineSignals` field — must be initialized with `Arc::new(Mutex::new(HashMap::new()))` in all constructors/tests
+- For async signaling between handlers and executor tasks, use `tokio::sync::watch` channels keyed by pipeline_run_id in the shared `pipeline_signals` map
+- When updating test files that construct `HandlerState`, all 5 test modules (protocol, e2e, commands_exec, commands_plan, commands_project_spec) must be updated
 
 ---
 
@@ -40,4 +43,26 @@ Started: Wed Feb 11 06:57:15 PM MSK 2026
 - **Learnings for future iterations:**
   - Check if handlers were already committed before implementing — git log shows commit history
   - The `pipeline.questions` handler is simpler than others — no state validation needed since listing is read-only
+---
+
+## 2026-02-11 - US-008
+- Implemented pipeline executor manual mode approval gates in handlers.rs
+- Added `PipelineApprovalSignal` enum (None, Approved, Rejected{feedback}) and `PipelineSignals` type alias
+- Added `pipeline_signals: PipelineSignals` field to `HandlerState` — shared map of `tokio::sync::watch::Sender<PipelineApprovalSignal>` keyed by pipeline_run_id
+- **Plan approval gate**: After Plan stage in manual mode, executor updates DB to `waiting_for_approval`, emits `PipelinePlanReady`, creates watch channel in shared map, and waits for signal. On `Approved` → proceeds to Implement. On `Rejected` → continues loop to re-run Plan.
+- **Final approval gate**: After Review passes in manual mode, executor updates DB to `waiting_for_final_approval`, emits `PipelineFinalApprovalReady`, creates watch channel, waits. On `Approved` → marks completed, returns. On `Rejected` → checks if pipeline is failed (max_iterations), otherwise loops back.
+- Updated `handle_pipeline_approve` to send `PipelineApprovalSignal::Approved` via watch channel after DB update
+- Updated `handle_pipeline_reject` to send `PipelineApprovalSignal::Rejected` via watch channel after DB update
+- Updated `handle_pipeline_start` to parse `mode` param from request and pass actual mode to executor task
+- Updated all `PipelineRun` constructions in executor to use actual `mode` instead of hardcoded `PipelineMode::Auto`
+- Updated `HandlerState` in main.rs and all 5 test files to include `pipeline_signals` field
+- Files changed: handlers.rs, main.rs, protocol_tests.rs, e2e_tests.rs, commands_exec_tests.rs, commands_plan_tests.rs, commands_project_spec_tests.rs
+- All 554 daemon tests pass, all 152 non-daemon tests pass
+- `cargo build --workspace` succeeds, `cargo clippy --workspace --all-targets` passes (no new warnings)
+- **Learnings for future iterations:**
+  - `HandlerState` has `pipeline_signals: PipelineSignals` field — must be initialized with `Arc::new(Mutex::new(HashMap::new()))` in all constructors/tests
+  - Use `tokio::sync::watch` for signaling between handlers and executor tasks — it supports carrying data (approve/reject/feedback) unlike plain Notify
+  - When updating `HandlerState`, must update 7 locations: main.rs, handlers.rs (struct def + 6 test constructions), plus 5 external test files
+  - Signal channels are inserted into the shared map just before waiting, and removed after signal is received — prevents stale entries
+  - For final rejection with max_iterations exceeded, the executor must check DB status after receiving rejection signal to detect if pipeline was marked as failed
 ---

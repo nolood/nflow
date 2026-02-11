@@ -1,5 +1,6 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use nflow_core::config::{self as core_config, Config, PartialConfig};
 use nflow_core::decomposition::{DecompositionSession, DecompositionSpec, DecompositionStatus};
@@ -11,6 +12,21 @@ use nflow_core::work_item::{
 
 use crate::db;
 use crate::socket::{HandlerResult, Request, Response, StreamingResponseLine};
+
+/// Signal sent from approve/reject handlers to the pipeline executor task.
+#[derive(Debug, Clone)]
+pub enum PipelineApprovalSignal {
+    /// No signal yet (initial state).
+    None,
+    /// Plan or final result approved.
+    Approved,
+    /// Plan or final result rejected with feedback.
+    Rejected { feedback: String },
+}
+
+/// Shared map of pipeline approval signal senders, keyed by pipeline_run_id.
+pub type PipelineSignals =
+    Arc<Mutex<HashMap<uuid::Uuid, tokio::sync::watch::Sender<PipelineApprovalSignal>>>>;
 
 /// Helper to convert GitProvider to string for JSON response.
 fn git_provider_str(provider: GitProvider) -> &'static str {
@@ -26,6 +42,8 @@ pub struct HandlerState {
     pub db_path: PathBuf,
     /// Event bus for broadcasting events to connected clients.
     pub event_bus: Option<crate::events::SharedEventBus>,
+    /// Approval signal channels for manual mode pipelines (keyed by pipeline_run_id).
+    pub pipeline_signals: PipelineSignals,
 }
 
 /// Creates the main command handler that dispatches to specific handlers.
@@ -6388,6 +6406,11 @@ fn handle_pipeline_start(req: Request, state: &HandlerState) -> HandlerResult {
         .and_then(|v| v.as_u64())
         .unwrap_or(5) as u32;
 
+    let mode = match req.params.get("mode").and_then(|v| v.as_str()) {
+        Some("manual") => nflow_core::pipeline::PipelineMode::Manual,
+        _ => nflow_core::pipeline::PipelineMode::Auto,
+    };
+
     let conn = match db::open_connection(&state.db_path) {
         Ok(c) => c,
         Err(e) => {
@@ -6426,7 +6449,7 @@ fn handle_pipeline_start(req: Request, state: &HandlerState) -> HandlerResult {
         name.clone(),
         goal.clone(),
         max_iterations,
-        nflow_core::pipeline::PipelineMode::Auto,
+        mode,
     );
     pipeline_run.status = nflow_core::pipeline::PipelineStatus::Running;
     pipeline_run.iteration = 1;
@@ -6439,6 +6462,7 @@ fn handle_pipeline_start(req: Request, state: &HandlerState) -> HandlerResult {
     let (tx, rx) = tokio::sync::mpsc::channel(64);
     let db_path = state.db_path.clone();
     let event_bus = state.event_bus.clone();
+    let pipeline_signals = state.pipeline_signals.clone();
     let run_id = pipeline_run.id;
     let project_id = project.id;
     let project_path = project.path.clone();
@@ -6451,6 +6475,7 @@ fn handle_pipeline_start(req: Request, state: &HandlerState) -> HandlerResult {
                 serde_json::json!({
                     "pipeline_run_id": run_id.to_string(),
                     "name": name,
+                    "mode": mode.to_string(),
                     "status": "running",
                     "max_iterations": max_iterations,
                 }),
@@ -6481,7 +6506,7 @@ fn handle_pipeline_start(req: Request, state: &HandlerState) -> HandlerResult {
                     project_id,
                     name: name.clone(),
                     goal: goal.clone(),
-                    mode: nflow_core::pipeline::PipelineMode::Auto,
+                    mode,
                     status: nflow_core::pipeline::PipelineStatus::Running,
                     current_stage: Some(nflow_core::pipeline::PipelineStageType::Plan),
                     iteration,
@@ -6518,6 +6543,127 @@ fn handle_pipeline_start(req: Request, state: &HandlerState) -> HandlerResult {
 
             let plan_json = serde_json::to_string_pretty(&plan_output).unwrap_or_default();
 
+            // ── MANUAL MODE: Plan approval gate ──
+            if mode == nflow_core::pipeline::PipelineMode::Manual {
+                // Determine next action after plan
+                let plan_action = nflow_core::pipeline::next_action(
+                    &nflow_core::pipeline::PipelineRun {
+                        id: run_id,
+                        project_id,
+                        name: name.clone(),
+                        goal: goal.clone(),
+                        mode,
+                        status: nflow_core::pipeline::PipelineStatus::Running,
+                        current_stage: Some(nflow_core::pipeline::PipelineStageType::Plan),
+                        iteration,
+                        max_iterations,
+                        created_at: chrono::Utc::now(),
+                        updated_at: chrono::Utc::now(),
+                    },
+                    nflow_core::pipeline::PipelineStageType::Plan,
+                    &plan_output,
+                );
+
+                if plan_action == nflow_core::pipeline::PipelineAction::WaitForApproval {
+                    // Update DB to WaitingForApproval
+                    if let Ok(conn) = db::open_connection(&db_path) {
+                        let _ = db::pipeline::update_pipeline_run(
+                            &conn,
+                            &run_id,
+                            "waiting_for_approval",
+                            Some("plan"),
+                            iteration,
+                        );
+                    }
+
+                    // Emit PipelinePlanReady event
+                    let plan_summary = plan_output.summary.clone();
+                    if let Some(bus) = &event_bus {
+                        bus.broadcast(crate::events::Event::PipelinePlanReady {
+                            pipeline_run_id: run_id.to_string(),
+                            project_id: project_id.to_string(),
+                            plan_summary: plan_summary.clone(),
+                        });
+                    }
+
+                    let _ = tx
+                        .send(StreamingResponseLine::data(
+                            initial_id.clone(),
+                            serde_json::json!({
+                                "type": "waiting_for_approval",
+                                "pipeline_run_id": run_id.to_string(),
+                                "approval_type": "plan",
+                                "plan_summary": plan_summary,
+                            }),
+                        ))
+                        .await;
+
+                    // Create watch channel and register in shared map
+                    let (signal_tx, mut signal_rx) =
+                        tokio::sync::watch::channel(PipelineApprovalSignal::None);
+                    {
+                        let mut signals = pipeline_signals.lock().unwrap();
+                        signals.insert(run_id, signal_tx);
+                    }
+
+                    // Wait for approval/rejection signal
+                    loop {
+                        signal_rx.changed().await.ok();
+                        let signal = signal_rx.borrow().clone();
+                        match signal {
+                            PipelineApprovalSignal::None => continue,
+                            PipelineApprovalSignal::Approved => break,
+                            PipelineApprovalSignal::Rejected { feedback: reject_feedback } => {
+                                // Clean up signal channel
+                                {
+                                    let mut signals = pipeline_signals.lock().unwrap();
+                                    signals.remove(&run_id);
+                                }
+                                // Restart Plan with feedback — continue the outer for loop
+                                // The reject handler already updated DB to running/plan
+                                let _ = tx
+                                    .send(StreamingResponseLine::data(
+                                        initial_id.clone(),
+                                        serde_json::json!({
+                                            "type": "plan_rejected",
+                                            "pipeline_run_id": run_id.to_string(),
+                                            "feedback": reject_feedback,
+                                        }),
+                                    ))
+                                    .await;
+                                // We need to restart this iteration — use continue on outer loop
+                                break;
+                            }
+                        }
+                    }
+
+                    // Check final signal to decide: approved → proceed, rejected → re-loop
+                    let final_signal = signal_rx.borrow().clone();
+
+                    // Clean up signal channel
+                    {
+                        let mut signals = pipeline_signals.lock().unwrap();
+                        signals.remove(&run_id);
+                    }
+
+                    match final_signal {
+                        PipelineApprovalSignal::Rejected { .. } => {
+                            // Plan was rejected — continue to next iteration of the for loop
+                            // which will re-run the Plan stage. The reject handler already
+                            // reset the DB status to running/plan.
+                            continue;
+                        }
+                        PipelineApprovalSignal::Approved => {
+                            // Plan approved — fall through to Implement stage
+                        }
+                        PipelineApprovalSignal::None => {
+                            // Shouldn't happen, but handle gracefully
+                            continue;
+                        }
+                    }
+                }
+            }
+
             if let Ok(conn) = db::open_connection(&db_path) {
                 let _ = db::pipeline::update_pipeline_run(
                     &conn,
@@ -6539,7 +6685,7 @@ fn handle_pipeline_start(req: Request, state: &HandlerState) -> HandlerResult {
                     project_id,
                     name: name.clone(),
                     goal: goal.clone(),
-                    mode: nflow_core::pipeline::PipelineMode::Auto,
+                    mode,
                     status: nflow_core::pipeline::PipelineStatus::Running,
                     current_stage: Some(nflow_core::pipeline::PipelineStageType::Implement),
                     iteration,
@@ -6597,7 +6743,7 @@ fn handle_pipeline_start(req: Request, state: &HandlerState) -> HandlerResult {
                     project_id,
                     name: name.clone(),
                     goal: goal.clone(),
-                    mode: nflow_core::pipeline::PipelineMode::Auto,
+                    mode,
                     status: nflow_core::pipeline::PipelineStatus::Running,
                     current_stage: Some(nflow_core::pipeline::PipelineStageType::Review),
                     iteration,
@@ -6638,7 +6784,7 @@ fn handle_pipeline_start(req: Request, state: &HandlerState) -> HandlerResult {
                 project_id,
                 name: name.clone(),
                 goal: goal.clone(),
-                mode: nflow_core::pipeline::PipelineMode::Auto,
+                mode,
                 status: nflow_core::pipeline::PipelineStatus::Running,
                 current_stage: Some(nflow_core::pipeline::PipelineStageType::Review),
                 iteration,
@@ -6738,38 +6884,165 @@ fn handle_pipeline_start(req: Request, state: &HandlerState) -> HandlerResult {
                         review: review_output.review.clone(),
                     });
                 }
-                // Manual mode approval gates — will be fully implemented in US-008
-                nflow_core::pipeline::PipelineAction::WaitForApproval
-                | nflow_core::pipeline::PipelineAction::WaitForFinalApproval => {
-                    // For now, treat as complete (auto mode won't reach here)
+                // WaitForApproval after Review shouldn't occur (plan approval is handled
+                // before the Implement stage), but handle gracefully if it does.
+                nflow_core::pipeline::PipelineAction::WaitForApproval => {
+                    // Shouldn't happen — plan approval is checked after Plan stage.
+                    // Treat like a no-op and continue to next iteration.
+                    history.push(nflow_core::pipeline::IterationRecord {
+                        iteration,
+                        plan: plan_output.plan.clone(),
+                        implementation: implement_output.implementation.clone(),
+                        review: review_output.review.clone(),
+                    });
+                }
+                // Manual mode: final approval gate after review passes
+                nflow_core::pipeline::PipelineAction::WaitForFinalApproval => {
+                    // Update DB to WaitingForFinalApproval
                     if let Ok(conn) = db::open_connection(&db_path) {
                         let _ = db::pipeline::update_pipeline_run(
                             &conn,
                             &run_id,
-                            "completed",
-                            None,
+                            "waiting_for_final_approval",
+                            Some("review"),
                             iteration,
                         );
                     }
+
+                    // Emit PipelineFinalApprovalReady event
+                    let summary = review_output.summary.clone();
                     if let Some(bus) = &event_bus {
-                        bus.broadcast(crate::events::Event::PipelineCompleted {
+                        bus.broadcast(crate::events::Event::PipelineFinalApprovalReady {
                             pipeline_run_id: run_id.to_string(),
                             project_id: project_id.to_string(),
-                            status: "completed".to_string(),
-                            iterations: iteration,
+                            summary: summary.clone(),
                         });
                     }
+
                     let _ = tx
-                        .send(StreamingResponseLine::done(
-                            initial_id,
+                        .send(StreamingResponseLine::data(
+                            initial_id.clone(),
                             serde_json::json!({
+                                "type": "waiting_for_final_approval",
                                 "pipeline_run_id": run_id.to_string(),
-                                "status": "completed",
-                                "iterations": iteration,
+                                "approval_type": "final",
+                                "summary": summary,
                             }),
                         ))
                         .await;
-                    return;
+
+                    // Create watch channel and register in shared map
+                    let (signal_tx, mut signal_rx) =
+                        tokio::sync::watch::channel(PipelineApprovalSignal::None);
+                    {
+                        let mut signals = pipeline_signals.lock().unwrap();
+                        signals.insert(run_id, signal_tx);
+                    }
+
+                    // Wait for approval/rejection signal
+                    loop {
+                        signal_rx.changed().await.ok();
+                        let signal = signal_rx.borrow().clone();
+                        match signal {
+                            PipelineApprovalSignal::None => continue,
+                            PipelineApprovalSignal::Approved => break,
+                            PipelineApprovalSignal::Rejected { .. } => break,
+                        }
+                    }
+
+                    let final_signal = signal_rx.borrow().clone();
+
+                    // Clean up signal channel
+                    {
+                        let mut signals = pipeline_signals.lock().unwrap();
+                        signals.remove(&run_id);
+                    }
+
+                    match final_signal {
+                        PipelineApprovalSignal::Approved => {
+                            // Final approved → mark completed
+                            // The approve handler already updated DB to completed
+                            if let Some(bus) = &event_bus {
+                                bus.broadcast(crate::events::Event::PipelineCompleted {
+                                    pipeline_run_id: run_id.to_string(),
+                                    project_id: project_id.to_string(),
+                                    status: "completed".to_string(),
+                                    iterations: iteration,
+                                });
+                            }
+                            let _ = tx
+                                .send(StreamingResponseLine::done(
+                                    initial_id,
+                                    serde_json::json!({
+                                        "pipeline_run_id": run_id.to_string(),
+                                        "status": "completed",
+                                        "iterations": iteration,
+                                    }),
+                                ))
+                                .await;
+                            return;
+                        }
+                        PipelineApprovalSignal::Rejected { feedback: reject_feedback } => {
+                            // Check if pipeline was marked as failed (max iterations exceeded)
+                            let is_failed = if let Ok(conn) = db::open_connection(&db_path) {
+                                db::pipeline::get_pipeline_run(&conn, &run_id)
+                                    .ok()
+                                    .flatten()
+                                    .map(|r| r.status == nflow_core::pipeline::PipelineStatus::Failed)
+                                    .unwrap_or(false)
+                            } else {
+                                false
+                            };
+
+                            if is_failed {
+                                // Max iterations exceeded — the reject handler already
+                                // updated DB to failed and emitted PipelineCompleted
+                                let _ = tx
+                                    .send(StreamingResponseLine::done(
+                                        initial_id,
+                                        serde_json::json!({
+                                            "pipeline_run_id": run_id.to_string(),
+                                            "status": "failed",
+                                            "reason": "max_iterations_exceeded",
+                                            "iterations": iteration,
+                                        }),
+                                    ))
+                                    .await;
+                                return;
+                            }
+
+                            // Final rejected → loop back to Implement
+                            // The reject handler already updated DB to running/implement
+                            // and incremented the iteration
+                            let _ = tx
+                                .send(StreamingResponseLine::data(
+                                    initial_id.clone(),
+                                    serde_json::json!({
+                                        "type": "final_rejected",
+                                        "pipeline_run_id": run_id.to_string(),
+                                        "feedback": reject_feedback,
+                                    }),
+                                ))
+                                .await;
+
+                            history.push(nflow_core::pipeline::IterationRecord {
+                                iteration,
+                                plan: plan_output.plan.clone(),
+                                implementation: implement_output.implementation.clone(),
+                                review: review_output.review.clone(),
+                            });
+                            // Continue to next iteration of the for loop
+                        }
+                        PipelineApprovalSignal::None => {
+                            // Shouldn't happen — continue to next iteration
+                            history.push(nflow_core::pipeline::IterationRecord {
+                                iteration,
+                                plan: plan_output.plan.clone(),
+                                implementation: implement_output.implementation.clone(),
+                                review: review_output.review.clone(),
+                            });
+                        }
+                    }
                 }
             }
         }
@@ -7171,6 +7444,13 @@ fn handle_pipeline_approve(req: Request, state: &HandlerState) -> Response {
                 });
             }
 
+            // Signal the executor task to resume
+            if let Ok(signals) = state.pipeline_signals.lock() {
+                if let Some(signal_tx) = signals.get(&run_id) {
+                    let _ = signal_tx.send(PipelineApprovalSignal::Approved);
+                }
+            }
+
             Response::ok(
                 id,
                 serde_json::json!({
@@ -7197,6 +7477,13 @@ fn handle_pipeline_approve(req: Request, state: &HandlerState) -> Response {
                 bus.broadcast(crate::events::Event::PipelineFinalApproved {
                     pipeline_run_id: run_id.to_string(),
                 });
+            }
+
+            // Signal the executor task to resume
+            if let Ok(signals) = state.pipeline_signals.lock() {
+                if let Some(signal_tx) = signals.get(&run_id) {
+                    let _ = signal_tx.send(PipelineApprovalSignal::Approved);
+                }
             }
 
             Response::ok(
@@ -7284,6 +7571,15 @@ fn handle_pipeline_reject(req: Request, state: &HandlerState) -> Response {
                 });
             }
 
+            // Signal the executor task to resume with rejection
+            if let Ok(signals) = state.pipeline_signals.lock() {
+                if let Some(signal_tx) = signals.get(&run_id) {
+                    let _ = signal_tx.send(PipelineApprovalSignal::Rejected {
+                        feedback: feedback.clone(),
+                    });
+                }
+            }
+
             Response::ok(
                 id,
                 serde_json::json!({
@@ -7320,6 +7616,15 @@ fn handle_pipeline_reject(req: Request, state: &HandlerState) -> Response {
                     });
                 }
 
+                // Signal with rejection so executor can clean up (even though pipeline is failed)
+                if let Ok(signals) = state.pipeline_signals.lock() {
+                    if let Some(signal_tx) = signals.get(&run_id) {
+                        let _ = signal_tx.send(PipelineApprovalSignal::Rejected {
+                            feedback: feedback.clone(),
+                        });
+                    }
+                }
+
                 return Response::ok(
                     id,
                     serde_json::json!({
@@ -7347,6 +7652,15 @@ fn handle_pipeline_reject(req: Request, state: &HandlerState) -> Response {
                     pipeline_run_id: run_id.to_string(),
                     feedback: feedback.clone(),
                 });
+            }
+
+            // Signal the executor task to resume with rejection
+            if let Ok(signals) = state.pipeline_signals.lock() {
+                if let Some(signal_tx) = signals.get(&run_id) {
+                    let _ = signal_tx.send(PipelineApprovalSignal::Rejected {
+                        feedback: feedback.clone(),
+                    });
+                }
             }
 
             Response::ok(
@@ -7682,6 +7996,7 @@ mod tests {
         let state = HandlerState {
             db_path: db_path.clone(),
             event_bus: None,
+            pipeline_signals: Arc::new(Mutex::new(HashMap::new())),
         };
 
         let req = Request {
@@ -7759,6 +8074,7 @@ mod tests {
         let state = HandlerState {
             db_path: db_path.clone(),
             event_bus: None,
+            pipeline_signals: Arc::new(Mutex::new(HashMap::new())),
         };
 
         // Create first project
@@ -7824,6 +8140,7 @@ mod tests {
         let state = HandlerState {
             db_path: db_path.clone(),
             event_bus: None,
+            pipeline_signals: Arc::new(Mutex::new(HashMap::new())),
         };
 
         let req = Request {
@@ -7892,6 +8209,7 @@ mod tests {
         let state = HandlerState {
             db_path: db_path.clone(),
             event_bus: None,
+            pipeline_signals: Arc::new(Mutex::new(HashMap::new())),
         };
 
         let req = Request {
@@ -7944,6 +8262,7 @@ mod tests {
         HandlerState {
             db_path: PathBuf::from("/nonexistent/test.db"),
             event_bus: None,
+            pipeline_signals: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -7961,6 +8280,7 @@ mod tests {
         let state = HandlerState {
             db_path: db_path.clone(),
             event_bus: None,
+            pipeline_signals: Arc::new(Mutex::new(HashMap::new())),
         };
         (state, db_dir)
     }

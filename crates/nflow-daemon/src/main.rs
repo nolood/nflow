@@ -152,6 +152,7 @@ async fn main() {
     let state = Arc::new(HandlerState {
         db_path: db_path.clone(),
         event_bus: Some(event_bus.clone()),
+        pipeline_signals: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
     });
     let handler = create_handler(state);
     let config = SocketServerConfig {

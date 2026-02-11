@@ -57,6 +57,7 @@ mod tests {
         let state = Arc::new(HandlerState {
             db_path: db_path.to_path_buf(),
             event_bus: None,
+            pipeline_signals: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         });
         let handler = create_handler(state);
         let config = SocketServerConfig {
