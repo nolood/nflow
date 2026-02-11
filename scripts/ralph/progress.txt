@@ -57,3 +57,15 @@ Branch: ralph/pipeline-interactive-mode
   - answer_question() uses `AND answered = 0` in WHERE clause to prevent double-answering (returns bool indicating success)
   - New DB functions in db/pipeline.rs will show as "unused" warnings until handler code references them (expected for incremental implementation)
 ---
+
+## 2026-02-11 - US-005
+- What was implemented: `pipeline.answer` command handler in handlers.rs that accepts `{ pipeline_run_id, question_id, answer }`, validates the pipeline is in Running state with current_stage=Plan, calls `db::pipeline::answer_question()` to save the answer, emits `PipelineQuestionAnswered` event via event bus, and returns `{ answered: true }`. Returns errors for missing/invalid params, not-found pipeline/question, invalid state (not running or not in Plan stage), and already-answered questions.
+- Files changed:
+  - crates/nflow-daemon/src/handlers.rs (added `pipeline.answer` dispatch route + `handle_pipeline_answer` function)
+  - scripts/ralph/prd.json (US-004 and US-005 marked as passes)
+- **Learnings for future iterations:**
+  - Handler pattern: parse params → parse UUIDs → open DB → validate pipeline state → perform action → emit event → return response
+  - `answer_question()` returns `bool` (false if already answered or not found) — use this to detect duplicate/invalid answers without a separate query
+  - The `answered_by` field is hardcoded to "user" in the handler; auto-agent answering will use a different code path (US-010)
+  - Pre-existing flaky test: `test_acquire_lock_contention` in nflow-cli fails when daemon is running — not related to pipeline work
+---

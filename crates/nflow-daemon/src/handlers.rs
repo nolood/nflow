@@ -75,6 +75,7 @@ fn dispatch(req: Request, state: &HandlerState) -> HandlerResult {
         "pipeline.list" => HandlerResult::Single(handle_pipeline_list(req, state)),
         "pipeline.cancel" => HandlerResult::Single(handle_pipeline_cancel(req, state)),
         "pipeline.log" => HandlerResult::Single(handle_pipeline_log(req, state)),
+        "pipeline.answer" => HandlerResult::Single(handle_pipeline_answer(req, state)),
         _ => HandlerResult::Single(Response::error(
             req.id,
             &format!("unknown command: {}", req.command),
@@ -7106,6 +7107,121 @@ fn handle_pipeline_log(req: Request, state: &HandlerState) -> Response {
         serde_json::json!({
             "pipeline_run_id": run_id_str,
             "logs": logs,
+        }),
+    )
+}
+
+/// Handle "pipeline.answer" command — submit an answer to a planning question.
+///
+/// Receives: { pipeline_run_id, question_id, answer }
+/// Returns: { answered: true }
+fn handle_pipeline_answer(req: Request, state: &HandlerState) -> Response {
+    let id = req.id.clone();
+
+    let run_id_str = match req.params.get("pipeline_run_id").and_then(|v| v.as_str()) {
+        Some(s) => s.to_string(),
+        None => {
+            return Response::error(id, "missing required parameter: pipeline_run_id");
+        }
+    };
+
+    let run_id = match uuid::Uuid::parse_str(&run_id_str) {
+        Ok(u) => u,
+        Err(_) => {
+            return Response::error(id, "INVALID_PARAMS: invalid pipeline_run_id format");
+        }
+    };
+
+    let question_id_str = match req.params.get("question_id").and_then(|v| v.as_str()) {
+        Some(s) => s.to_string(),
+        None => {
+            return Response::error(id, "missing required parameter: question_id");
+        }
+    };
+
+    let question_id = match uuid::Uuid::parse_str(&question_id_str) {
+        Ok(u) => u,
+        Err(_) => {
+            return Response::error(id, "INVALID_PARAMS: invalid question_id format");
+        }
+    };
+
+    let answer = match req.params.get("answer").and_then(|v| v.as_str()) {
+        Some(s) => s.to_string(),
+        None => {
+            return Response::error(id, "missing required parameter: answer");
+        }
+    };
+
+    let conn = match db::open_connection(&state.db_path) {
+        Ok(c) => c,
+        Err(e) => return Response::error(id, &format!("database error: {}", e)),
+    };
+
+    // Validate pipeline exists and is in Running state with current_stage=Plan
+    let run = match db::pipeline::get_pipeline_run(&conn, &run_id) {
+        Ok(Some(r)) => r,
+        Ok(None) => {
+            return Response::error(
+                id,
+                &format!("NOT_FOUND: pipeline run '{}' not found", run_id_str),
+            );
+        }
+        Err(e) => return Response::error(id, &format!("database error: {}", e)),
+    };
+
+    if run.status != nflow_core::pipeline::PipelineStatus::Running {
+        return Response::error(
+            id,
+            &format!(
+                "INVALID_STATE: pipeline run is not running (status: {})",
+                run.status
+            ),
+        );
+    }
+
+    if run.current_stage != Some(nflow_core::pipeline::PipelineStageType::Plan) {
+        return Response::error(
+            id,
+            &format!(
+                "INVALID_STATE: pipeline is not in Plan stage (current_stage: {})",
+                run.current_stage
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| "none".to_string())
+            ),
+        );
+    }
+
+    // Answer the question
+    let updated = match db::pipeline::answer_question(&conn, &question_id, &answer, "user") {
+        Ok(b) => b,
+        Err(e) => return Response::error(id, &format!("database error: {}", e)),
+    };
+
+    if !updated {
+        return Response::error(
+            id,
+            &format!(
+                "NOT_FOUND: question '{}' not found or already answered",
+                question_id_str
+            ),
+        );
+    }
+
+    // Emit event
+    if let Some(bus) = &state.event_bus {
+        bus.broadcast(crate::events::Event::PipelineQuestionAnswered {
+            pipeline_run_id: run_id.to_string(),
+            question_id: question_id.to_string(),
+            answer: answer.clone(),
+            answered_by: "user".to_string(),
+        });
+    }
+
+    Response::ok(
+        id,
+        serde_json::json!({
+            "answered": true,
         }),
     )
 }
