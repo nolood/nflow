@@ -6385,6 +6385,7 @@ async fn run_pipeline_stage(
             stage_type: stage_type_str.clone(),
             iteration,
             new_status: "running".to_string(),
+            mode: run.mode.to_string(),
         });
     }
 
@@ -6584,6 +6585,7 @@ async fn run_pipeline_stage(
             stage_type: stage_type_str.clone(),
             iteration,
             new_status: "completed".to_string(),
+            mode: run.mode.to_string(),
         });
     }
 
@@ -7190,6 +7192,7 @@ fn handle_pipeline_start(req: Request, state: &HandlerState) -> HandlerResult {
                             project_id: project_id.to_string(),
                             status: "completed".to_string(),
                             iterations: iteration,
+                            mode: mode.to_string(),
                         });
                     }
                     let _ = tx
@@ -7216,6 +7219,7 @@ fn handle_pipeline_start(req: Request, state: &HandlerState) -> HandlerResult {
                             project_id: project_id.to_string(),
                             status: "failed".to_string(),
                             iterations: iteration,
+                            mode: mode.to_string(),
                         });
                     }
                     let _ = tx
@@ -7342,6 +7346,7 @@ fn handle_pipeline_start(req: Request, state: &HandlerState) -> HandlerResult {
                                     project_id: project_id.to_string(),
                                     status: "completed".to_string(),
                                     iterations: iteration,
+                                    mode: mode.to_string(),
                                 });
                             }
                             let _ = tx
@@ -7432,6 +7437,7 @@ fn handle_pipeline_start(req: Request, state: &HandlerState) -> HandlerResult {
                 project_id: project_id.to_string(),
                 status: "failed".to_string(),
                 iterations: max_iterations,
+                mode: mode.to_string(),
             });
         }
         let _ = tx
@@ -7648,6 +7654,7 @@ fn handle_pipeline_cancel(req: Request, state: &HandlerState) -> Response {
             project_id: run.project_id.to_string(),
             status: "cancelled".to_string(),
             iterations: run.iteration,
+            mode: run.mode.to_string(),
         });
     }
 
@@ -7989,6 +7996,7 @@ fn handle_pipeline_reject(req: Request, state: &HandlerState) -> Response {
                         project_id: run.project_id.to_string(),
                         status: "failed".to_string(),
                         iterations: run.iteration,
+                        mode: run.mode.to_string(),
                     });
                 }
 

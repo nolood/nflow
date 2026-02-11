@@ -39,6 +39,7 @@ pub enum Event {
         stage_type: String,
         iteration: u32,
         new_status: String,
+        mode: String,
     },
     /// A pipeline run completed.
     PipelineCompleted {
@@ -46,6 +47,7 @@ pub enum Event {
         project_id: String,
         status: String,
         iterations: u32,
+        mode: String,
     },
     /// Output from a pipeline agent process.
     PipelineAgentOutput {
@@ -633,6 +635,71 @@ mod tests {
         match deserialized {
             Event::PipelineFinalRejected { feedback, .. } => {
                 assert_eq!(feedback, "Tests are failing");
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn test_event_serialization_pipeline_stage_change() {
+        let event = Event::PipelineStageChange {
+            pipeline_run_id: "pr-1".to_string(),
+            project_id: "proj-1".to_string(),
+            stage_type: "plan".to_string(),
+            iteration: 1,
+            new_status: "running".to_string(),
+            mode: "manual".to_string(),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains(r#""type":"pipeline_stage_change""#));
+        assert!(json.contains(r#""mode":"manual""#));
+        assert!(json.contains(r#""stage_type":"plan""#));
+
+        let deserialized: Event = serde_json::from_str(&json).unwrap();
+        match deserialized {
+            Event::PipelineStageChange {
+                pipeline_run_id,
+                mode,
+                stage_type,
+                new_status,
+                ..
+            } => {
+                assert_eq!(pipeline_run_id, "pr-1");
+                assert_eq!(mode, "manual");
+                assert_eq!(stage_type, "plan");
+                assert_eq!(new_status, "running");
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn test_event_serialization_pipeline_completed() {
+        let event = Event::PipelineCompleted {
+            pipeline_run_id: "pr-1".to_string(),
+            project_id: "proj-1".to_string(),
+            status: "completed".to_string(),
+            iterations: 3,
+            mode: "auto".to_string(),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains(r#""type":"pipeline_completed""#));
+        assert!(json.contains(r#""mode":"auto""#));
+        assert!(json.contains(r#""iterations":3"#));
+
+        let deserialized: Event = serde_json::from_str(&json).unwrap();
+        match deserialized {
+            Event::PipelineCompleted {
+                pipeline_run_id,
+                status,
+                iterations,
+                mode,
+                ..
+            } => {
+                assert_eq!(pipeline_run_id, "pr-1");
+                assert_eq!(status, "completed");
+                assert_eq!(iterations, 3);
+                assert_eq!(mode, "auto");
             }
             _ => panic!("wrong variant"),
         }

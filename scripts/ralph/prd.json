@@ -363,7 +363,7 @@
         "cargo build --workspace succeeds"
       ],
       "priority": 20,
-      "passes": false,
+      "passes": true,
       "notes": "This should be done early but depends on US-001 mode field being in place"
     },
     {

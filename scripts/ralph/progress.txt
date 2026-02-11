@@ -335,5 +335,23 @@ Started: Wed Feb 11 06:57:15 PM MSK 2026
   - Cannot reuse the main `SocketClient` during streaming — it's borrowed by `StreamingReader`. Use a separate connection for interactive commands.
   - `libc::isatty()` is already available via the `libc` crate in nflow-cli dependencies
   - Event `type` field values for interactive events: `pipeline_question`, `waiting_for_approval`, `waiting_for_final_approval` — these match what the daemon emits in streaming responses
+- `PipelineStageChange` and `PipelineCompleted` events include `mode: String` field — clients can use this for mode-aware routing
   - `read_user_input_with_prompt()` is generic enough for reuse in future interactive CLI features
+---
+
+## 2026-02-11 - US-020
+- Updated `PipelineStageChange` and `PipelineCompleted` events to include `mode: String` field for client routing
+- Most of US-020 was already implemented in prior stories: mode parsing (US-008), PipelineRun::new with mode (US-008), DB storage (US-001), list/status responses (US-017)
+- The only missing piece was the `mode` field in the two event types
+- Added `mode: String` to `PipelineStageChange` in events.rs (line 42)
+- Added `mode: String` to `PipelineCompleted` in events.rs (line 49)
+- Updated 2 `PipelineStageChange` emissions in handlers.rs (run_pipeline_stage function)
+- Updated 6 `PipelineCompleted` emissions in handlers.rs: executor complete/fail paths (4), cancel handler (1), reject max-iterations handler (1)
+- Added 2 new serialization round-trip tests: `test_event_serialization_pipeline_stage_change`, `test_event_serialization_pipeline_completed`
+- Files changed: crates/nflow-daemon/src/events.rs, crates/nflow-daemon/src/handlers.rs, scripts/ralph/prd.json, scripts/ralph/progress.txt
+- All 560 daemon tests pass, `cargo build --workspace` succeeds, `cargo clippy --workspace --all-targets` passes (no new warnings)
+- **Learnings for future iterations:**
+  - `PipelineStageChange` and `PipelineCompleted` events now include `mode` field — clients can use this for mode-aware routing without querying pipeline status
+  - In the executor task, `mode` is a captured local variable (PipelineMode enum); in handler functions, use `run.mode.to_string()`
+  - Event fields are strings (not enums) for JSON serialization simplicity — mode values are "auto" or "manual"
 ---
