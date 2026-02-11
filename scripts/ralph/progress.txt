@@ -66,3 +66,17 @@ Started: Wed Feb 11 06:57:15 PM MSK 2026
   - Signal channels are inserted into the shared map just before waiting, and removed after signal is received — prevents stale entries
   - For final rejection with max_iterations exceeded, the executor must check DB status after receiving rejection signal to detect if pipeline was marked as failed
 ---
+
+## 2026-02-11 - US-009
+- Updated `prompts/pipeline_plan.md` to add structured question output format
+- Added 3-step workflow: (1) Explore codebase, (2) Ask questions with PIPELINE_QUESTIONS marker, (3) Create the plan
+- Questions format: PIPELINE_QUESTIONS marker followed by ```json block with `{ "questions": [{ "question": "...", "context": "..." }] }`
+- If no questions needed, agent skips the questions block entirely
+- Prompts are embedded at compile time via `include_str!` in `nflow-claude/src/prompt.rs`
+- `cargo build --workspace` succeeds (nflow-claude recompiled)
+- Files changed: prompts/pipeline_plan.md
+- **Learnings for future iterations:**
+  - Prompts are embedded at compile time — changing a prompt file triggers recompilation of nflow-claude crate
+  - The PIPELINE_QUESTIONS marker is what the daemon will use to detect and parse questions from stream output (US-011 will implement the parser)
+  - Keep prompt changes backward-compatible — the plan JSON output format at the end is unchanged
+---

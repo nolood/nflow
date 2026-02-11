@@ -160,7 +160,7 @@
         "cargo build --workspace succeeds (prompts are embedded at compile time)"
       ],
       "priority": 9,
-      "passes": false,
+      "passes": true,
       "notes": ""
     },
     {
