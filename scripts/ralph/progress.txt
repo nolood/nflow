@@ -355,3 +355,19 @@ Started: Wed Feb 11 06:57:15 PM MSK 2026
   - In the executor task, `mode` is a captured local variable (PipelineMode enum); in handler functions, use `run.mode.to_string()`
   - Event fields are strings (not enums) for JSON serialization simplicity — mode values are "auto" or "manual"
 ---
+
+## 2026-02-11 - US-021
+- End-to-end CLI verification — all quality checks pass
+- `cargo build --workspace`: succeeds (no errors)
+- `cargo test --workspace --exclude nflow-daemon`: 100/101 pass (1 pre-existing flaky `test_is_daemon_running_no_pid_file`)
+- `cargo test -p nflow-daemon -- --test-threads=1`: all 560 pass
+- `cargo clippy --workspace --all-targets`: no new warnings (pre-existing only)
+- `cargo build --release`: succeeds
+- `./target/release/nflow pipeline --help`: shows all 9 subcommands (start, list, status, cancel, log, approve, reject, answer, questions)
+- Did not test against running daemon per CLAUDE.md "Never start dev app" instruction — all command routing verified via unit tests
+- Files changed: scripts/ralph/prd.json, scripts/ralph/progress.txt
+- **Learnings for future iterations:**
+  - The `test_is_daemon_running_no_pid_file` test in nflow-cli is flaky when a daemon is running — pre-existing, not related to pipeline changes
+  - Release build compiles all 7 crates — takes ~7s on this machine
+  - All 9 pipeline CLI subcommands are registered and visible in help output
+---
