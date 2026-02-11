@@ -371,6 +371,9 @@ async fn event_loop(
                     // Refresh list
                     fetch_pipeline_list(app, client).await;
                 }
+                event::ViewAction::PipelineAnswer { pipeline_run_id, question_id, answer } => {
+                    handle_pipeline_answer(app, client, &pipeline_run_id, &question_id, &answer).await;
+                }
                 event::ViewAction::TabSwitched(view) => match view {
                     View::Execute | View::Logs => {
                         app.fetch_execute(client).await.ok();
@@ -1459,6 +1462,37 @@ async fn handle_daemon_event(
                 }
             }
         }
+        "pipeline_question" => {
+            if let Some(run_id) = event.get("pipeline_run_id").and_then(|v| v.as_str()) {
+                let question_id = event.get("question_id").and_then(|v| v.as_str()).unwrap_or("");
+                let question = event.get("question").and_then(|v| v.as_str()).unwrap_or("");
+                let context = event.get("context").and_then(|v| v.as_str()).map(|s| s.to_string());
+
+                if !question_id.is_empty() && !question.is_empty() {
+                    let pending = crate::app::PendingQuestion {
+                        question_id: question_id.to_string(),
+                        pipeline_run_id: run_id.to_string(),
+                        question: question.to_string(),
+                        context,
+                    };
+
+                    // Add to pending questions list (avoid duplicates)
+                    if !app.pipeline_pending_questions.iter().any(|q| q.question_id == question_id) {
+                        app.pipeline_pending_questions.push(pending);
+                    }
+
+                    // Auto-open question overlay if we're viewing this pipeline's detail in manual mode
+                    if app.pipeline_detail.is_some() && !app.in_pipeline_question_overlay() {
+                        app.open_pipeline_question_overlay();
+                    }
+                }
+            }
+        }
+        "pipeline_question_answered" => {
+            if let Some(question_id) = event.get("question_id").and_then(|v| v.as_str()) {
+                app.remove_pending_question(question_id);
+            }
+        }
         _ => {
             // Unknown event type -- ignore
         }
@@ -1622,6 +1656,40 @@ async fn handle_pipeline_cancel(app: &mut App, client: &mut SocketClient, id: &s
                     .and_then(|v| v.as_str())
                     .unwrap_or("unknown error");
                 app.status_message = format!("Error: {}", msg);
+            }
+        }
+        Err(e) => {
+            app.status_message = format!("Error: {}", e);
+        }
+    }
+}
+
+/// Answer a pipeline question.
+async fn handle_pipeline_answer(
+    app: &mut App,
+    client: &mut SocketClient,
+    pipeline_run_id: &str,
+    question_id: &str,
+    answer: &str,
+) {
+    let params = serde_json::json!({
+        "pipeline_run_id": pipeline_run_id,
+        "question_id": question_id,
+        "answer": answer,
+    });
+
+    match client.send_command("pipeline.answer", params).await {
+        Ok(resp) => {
+            if resp.status == ResponseStatus::Ok {
+                app.status_message = "Answer submitted".to_string();
+                app.remove_pending_question(question_id);
+            } else {
+                let msg = resp
+                    .data
+                    .get("message")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown error");
+                app.status_message = format!("Error answering: {}", msg);
             }
         }
         Err(e) => {
@@ -1948,6 +2016,28 @@ async fn poll_pipeline_streaming_data(app: &mut App, client: &mut SocketClient) 
                                 *iteration,
                                 format!("=== {} completed ===\n", stage)
                             );
+                        }
+                    }
+                    Some("pipeline_question") => {
+                        let question_id = line.data.get("question_id").and_then(|v| v.as_str()).unwrap_or("");
+                        let question = line.data.get("question").and_then(|v| v.as_str()).unwrap_or("");
+                        let context = line.data.get("context").and_then(|v| v.as_str()).map(|s| s.to_string());
+                        let run_id = line.data.get("pipeline_run_id").and_then(|v| v.as_str()).unwrap_or("");
+
+                        if !question_id.is_empty() && !question.is_empty() {
+                            let pending = crate::app::PendingQuestion {
+                                question_id: question_id.to_string(),
+                                pipeline_run_id: run_id.to_string(),
+                                question: question.to_string(),
+                                context,
+                            };
+                            if !app.pipeline_pending_questions.iter().any(|q| q.question_id == question_id) {
+                                app.pipeline_pending_questions.push(pending);
+                            }
+                            // Auto-open overlay if not already open
+                            if !app.in_pipeline_question_overlay() {
+                                app.open_pipeline_question_overlay();
+                            }
                         }
                     }
                     _ => {

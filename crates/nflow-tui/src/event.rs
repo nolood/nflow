@@ -84,6 +84,12 @@ pub enum ViewAction {
     PipelineSelectStage,
     /// User exited a pipeline sub-view (detail or new dialog).
     PipelineSubViewExit,
+    /// User answered a pipeline question.
+    PipelineAnswer {
+        pipeline_run_id: String,
+        question_id: String,
+        answer: String,
+    },
 }
 
 /// Handle a key event, returning true if the app should continue, false to quit.
@@ -133,6 +139,12 @@ pub fn handle_key_event(app: &mut App, key: KeyEvent) -> (bool, ViewAction) {
     // If in execute sub-view (confirm popup), handle exclusively
     if app.in_execute_sub_view() {
         let action = handle_execute_confirm_key(app, key);
+        return (true, action);
+    }
+
+    // If pipeline question overlay is open, handle exclusively
+    if app.in_pipeline_question_overlay() {
+        let action = handle_pipeline_question_overlay_key(app, key);
         return (true, action);
     }
 
@@ -1040,6 +1052,78 @@ fn handle_pipeline_detail_key(app: &mut App, key: KeyEvent) -> ViewAction {
             }
             app.pipeline_output_scroll = 0;
             app.pipeline_auto_scroll = false;
+            ViewAction::None
+        }
+        // 'q': re-open pipeline question overlay if there are pending questions
+        KeyCode::Char('q') => {
+            if !app.pipeline_pending_questions.is_empty() {
+                app.open_pipeline_question_overlay();
+            }
+            ViewAction::None
+        }
+        _ => ViewAction::None,
+    }
+}
+
+/// Handle key events in the pipeline question overlay.
+fn handle_pipeline_question_overlay_key(app: &mut App, key: KeyEvent) -> ViewAction {
+    if app.pipeline_question_overlay.is_none() {
+        return ViewAction::None;
+    }
+
+    match key.code {
+        KeyCode::Esc => {
+            app.close_pipeline_question_overlay();
+            ViewAction::None
+        }
+        KeyCode::Enter => {
+            // Extract answer and question data before modifying app state
+            let (answer, question_data) = {
+                let overlay = app.pipeline_question_overlay.as_ref().unwrap();
+                let answer = overlay.answer_input.trim().to_string();
+                let question_data = overlay.current_question().cloned();
+                (answer, question_data)
+            };
+
+            if answer.is_empty() {
+                return ViewAction::None;
+            }
+
+            let question = match question_data {
+                Some(q) => q,
+                None => return ViewAction::None,
+            };
+
+            // Advance the overlay to next question
+            if let Some(overlay) = &mut app.pipeline_question_overlay {
+                overlay.advance();
+            }
+
+            // Remove the answered question from pending list
+            app.remove_pending_question(&question.question_id);
+
+            // Check if all done and close
+            let is_done = app.pipeline_question_overlay.as_ref().map_or(true, |o| o.is_done());
+            if is_done {
+                app.close_pipeline_question_overlay();
+            }
+
+            ViewAction::PipelineAnswer {
+                pipeline_run_id: question.pipeline_run_id,
+                question_id: question.question_id,
+                answer,
+            }
+        }
+        KeyCode::Backspace => {
+            if let Some(overlay) = &mut app.pipeline_question_overlay {
+                overlay.answer_input.pop();
+            }
+            ViewAction::None
+        }
+        KeyCode::Char(c) => {
+            if let Some(overlay) = &mut app.pipeline_question_overlay {
+                overlay.answer_input.push(c);
+            }
             ViewAction::None
         }
         _ => ViewAction::None,

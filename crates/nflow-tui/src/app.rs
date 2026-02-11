@@ -2316,11 +2316,56 @@ impl PipelineNewState {
     }
 }
 
+/// A pending pipeline question shown in the TUI.
+#[derive(Debug, Clone)]
+pub struct PendingQuestion {
+    pub question_id: String,
+    pub pipeline_run_id: String,
+    pub question: String,
+    pub context: Option<String>,
+}
+
+/// State for the pipeline question overlay dialog.
+#[derive(Debug, Clone)]
+pub struct PipelineQuestionOverlayState {
+    pub questions: Vec<PendingQuestion>,
+    pub current_index: usize,
+    pub answer_input: String,
+}
+
+impl PipelineQuestionOverlayState {
+    pub fn new(questions: Vec<PendingQuestion>) -> Self {
+        Self {
+            questions,
+            current_index: 0,
+            answer_input: String::new(),
+        }
+    }
+
+    pub fn current_question(&self) -> Option<&PendingQuestion> {
+        self.questions.get(self.current_index)
+    }
+
+    pub fn advance(&mut self) {
+        self.answer_input.clear();
+        self.current_index += 1;
+    }
+
+    pub fn is_done(&self) -> bool {
+        self.current_index >= self.questions.len()
+    }
+
+    pub fn remaining(&self) -> usize {
+        self.questions.len().saturating_sub(self.current_index)
+    }
+}
+
 /// Overlay that can be displayed on top of the current view.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Overlay {
     Help,
     ProjectSwitcher,
+    PipelineQuestion,
 }
 
 /// The active view in the TUI.
@@ -2470,6 +2515,10 @@ pub struct App {
     pub pipeline_output_scroll: usize,
     /// Whether the output pane auto-scrolls to the bottom.
     pub pipeline_auto_scroll: bool,
+    /// Pending pipeline questions (accumulated for badge display and overlay).
+    pub pipeline_pending_questions: Vec<PendingQuestion>,
+    /// Pipeline question overlay dialog state (if open).
+    pub pipeline_question_overlay: Option<PipelineQuestionOverlayState>,
 }
 
 /// Truncate a string to at most `max_chars` characters, appending "..." if truncated.
@@ -2524,6 +2573,8 @@ impl App {
             pipeline_output_buffer: VecDeque::with_capacity(1000),
             pipeline_output_scroll: 0,
             pipeline_auto_scroll: true,
+            pipeline_pending_questions: Vec::new(),
+            pipeline_question_overlay: None,
         }
     }
 
@@ -2933,6 +2984,38 @@ impl App {
     /// Close the new pipeline dialog.
     pub fn close_pipeline_new(&mut self) {
         self.pipeline_new = None;
+    }
+
+    /// Returns true if the pipeline question overlay is open.
+    pub fn in_pipeline_question_overlay(&self) -> bool {
+        self.pipeline_question_overlay.is_some()
+    }
+
+    /// Open the pipeline question overlay with current pending questions.
+    pub fn open_pipeline_question_overlay(&mut self) {
+        if !self.pipeline_pending_questions.is_empty() {
+            let questions = self.pipeline_pending_questions.clone();
+            self.pipeline_question_overlay = Some(PipelineQuestionOverlayState::new(questions));
+            self.overlay = Some(Overlay::PipelineQuestion);
+        }
+    }
+
+    /// Close the pipeline question overlay (dismiss temporarily).
+    pub fn close_pipeline_question_overlay(&mut self) {
+        self.pipeline_question_overlay = None;
+        if self.overlay == Some(Overlay::PipelineQuestion) {
+            self.overlay = None;
+        }
+    }
+
+    /// Remove a question from the pending list by question_id (after answering).
+    pub fn remove_pending_question(&mut self, question_id: &str) {
+        self.pipeline_pending_questions.retain(|q| q.question_id != question_id);
+    }
+
+    /// Get the number of pending questions for a specific pipeline run.
+    pub fn pending_question_count_for_run(&self, run_id: &str) -> usize {
+        self.pipeline_pending_questions.iter().filter(|q| q.pipeline_run_id == run_id).count()
     }
 
     /// Returns true if a pipeline streaming session is active.

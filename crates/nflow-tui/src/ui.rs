@@ -1608,6 +1608,12 @@ fn render_pipeline_list(app: &App, frame: &mut Frame, area: Rect) {
             let (icon, _color) = pipeline_status_icon(&run.status);
             let stage = run.current_stage.as_deref().unwrap_or("-");
             let iter_str = format!("{}/{}", run.iteration, run.max_iterations);
+            let question_count = app.pending_question_count_for_run(&run.id);
+            let status_str = if question_count > 0 {
+                format!("{} {} [{} ?]", icon, run.status, question_count)
+            } else {
+                format!("{} {}", icon, run.status)
+            };
             let style = if i == app.pipeline_list.selected {
                 Style::default().bg(Color::DarkGray).fg(Color::White)
             } else {
@@ -1615,7 +1621,7 @@ fn render_pipeline_list(app: &App, frame: &mut Frame, area: Rect) {
             };
             Row::new(vec![
                 run.name.clone(),
-                format!("{} {}", icon, run.status),
+                status_str,
                 stage.to_string(),
                 iter_str,
                 run.created_at.clone(),
@@ -2106,6 +2112,7 @@ fn render_overlay(overlay: &Overlay, app: &App, frame: &mut Frame, area: Rect) {
     match overlay {
         Overlay::Help => render_help_overlay(app.current_view, frame, area),
         Overlay::ProjectSwitcher => render_project_switcher_overlay(app, frame, area),
+        Overlay::PipelineQuestion => render_pipeline_question_overlay(app, frame, area),
     }
 }
 
@@ -2312,6 +2319,105 @@ fn render_project_switcher_overlay(app: &App, frame: &mut Frame, area: Rect) {
     }
 
     lines.push(Line::from(""));
+
+    let paragraph = Paragraph::new(lines)
+        .block(block)
+        .wrap(Wrap { trim: false });
+    frame.render_widget(paragraph, popup_area);
+}
+
+/// Render the pipeline question overlay dialog.
+fn render_pipeline_question_overlay(app: &App, frame: &mut Frame, area: Rect) {
+    let overlay = match &app.pipeline_question_overlay {
+        Some(o) => o,
+        None => return,
+    };
+
+    let current = match overlay.current_question() {
+        Some(q) => q,
+        None => return,
+    };
+
+    // Dim background
+    let dim_style = Style::default().fg(Color::DarkGray);
+    let buf = frame.buffer_mut();
+    for y in area.top()..area.bottom() {
+        for x in area.left()..area.right() {
+            if let Some(cell) = buf.cell_mut((x, y)) {
+                cell.set_style(dim_style);
+            }
+        }
+    }
+
+    let popup_area = centered_rect(60, 50, area);
+    frame.render_widget(Clear, popup_area);
+
+    let remaining = overlay.remaining();
+    let title = if remaining > 1 {
+        format!(" Pipeline Question ({} remaining) \u{2014} Enter:submit Esc:dismiss ", remaining)
+    } else {
+        " Pipeline Question \u{2014} Enter:submit Esc:dismiss ".to_string()
+    };
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(title)
+        .title_style(
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )
+        .border_style(Style::default().fg(Color::Yellow));
+
+    // Build content
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    lines.push(Line::from(""));
+
+    // Question text
+    lines.push(Line::from(Span::styled(
+        "  Question:".to_string(),
+        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+    )));
+    lines.push(Line::from(""));
+    // Wrap question text across lines
+    for line in current.question.lines() {
+        lines.push(Line::from(Span::styled(
+            format!("  {}", line),
+            Style::default().fg(Color::White),
+        )));
+    }
+
+    // Context (if any)
+    if let Some(ctx) = &current.context {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "  Context:".to_string(),
+            Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD),
+        )));
+        for line in ctx.lines() {
+            lines.push(Line::from(Span::styled(
+                format!("  {}", line),
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "  Your answer:".to_string(),
+        Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+    )));
+
+    // Input field with cursor
+    let input_display = if overlay.answer_input.is_empty() {
+        "  \u{2588}".to_string()
+    } else {
+        format!("  {}\u{2588}", overlay.answer_input)
+    };
+    lines.push(Line::from(Span::styled(
+        input_display,
+        Style::default().fg(Color::White),
+    )));
 
     let paragraph = Paragraph::new(lines)
         .block(block)

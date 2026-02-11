@@ -22,6 +22,11 @@ Started: Wed Feb 11 06:57:15 PM MSK 2026
 - Question routing: Auto mode spawns parallel auto-answerer tasks (tokio::spawn), Manual mode polls DB every 500ms until all questions answered
 - TUI ring buffers: pipeline_output_buffer is on App (not detail state) — survives detail state recreation when opening pipeline detail views
 - `pipeline_stage_icon()` in ui.rs returns dynamic spinner for running stages via `spinner_char()`, static icons for other states
+- TUI overlays: Overlay enum in app.rs, rendered by render_overlay() dispatch in ui.rs, key handling goes through handle_key_event's exclusive handler chain
+- Pipeline question overlay: PipelineQuestionOverlayState in app.rs, questions stored in pipeline_pending_questions on App, overlay opened/closed via helper methods
+- Borrow checker tip: when modifying overlay state and app state in same handler, extract data into locals first (immutable borrow), then modify (mutable borrows)
+- Daemon events arrive via two paths: (1) event bus subscription (handle_daemon_event), (2) streaming response data (poll_pipeline_streaming_data) — both must handle new event types
+- Pipeline question badge in list view: `pending_question_count_for_run()` helper counts per-run pending questions, shown as "[N ?]" in status column
 
 ---
 
@@ -171,4 +176,32 @@ Started: Wed Feb 11 06:57:15 PM MSK 2026
   - `pipeline_stage_icon()` returns a `String` (not `&str`) because spinner_char() returns a dynamic char
   - The live output pane uses the ring buffer directly; the right pane uses the per-stage `stage_outputs` HashMap — they're complementary views
   - Auto-scroll is managed both in the render function (compute scroll offset) and in key handlers (enable/disable flag)
+---
+
+## 2026-02-11 - US-014
+- Implemented pipeline question dialog overlay in TUI for manual mode Q&A
+- Added `PendingQuestion` struct and `PipelineQuestionOverlayState` to app.rs for tracking questions and overlay state
+- Added `Overlay::PipelineQuestion` variant to the Overlay enum
+- Added `pipeline_pending_questions: Vec<PendingQuestion>` and `pipeline_question_overlay: Option<PipelineQuestionOverlayState>` fields to App
+- Added helper methods: `open_pipeline_question_overlay()`, `close_pipeline_question_overlay()`, `remove_pending_question()`, `pending_question_count_for_run()`
+- Added `ViewAction::PipelineAnswer { pipeline_run_id, question_id, answer }` to event.rs
+- Added `handle_pipeline_question_overlay_key()` handler: Enter submits answer, Esc dismisses, Backspace/Char for text input
+- Questions shown one at a time with progress indicator ("N remaining")
+- After answering, overlay auto-advances to next question or closes if all answered
+- Added 'q' key in pipeline detail view to re-open question overlay when pending questions exist
+- In main.rs: handle `pipeline_question` event from both daemon event bus and streaming data paths
+- Handle `pipeline_question_answered` event to remove answered questions from pending list
+- Added `handle_pipeline_answer()` async function: sends `pipeline.answer` command to daemon
+- Auto-opens overlay when PipelineQuestion events arrive while viewing pipeline detail
+- Rendered `render_pipeline_question_overlay()` in ui.rs: centered popup with dimmed background, shows question text, optional context, and text input with cursor
+- Added question count badge `[N ?]` in pipeline list view status column
+- Files changed: crates/nflow-tui/src/app.rs, crates/nflow-tui/src/event.rs, crates/nflow-tui/src/main.rs, crates/nflow-tui/src/ui.rs, scripts/ralph/prd.json
+- All tests pass: 558 daemon, 782+ non-daemon
+- `cargo build --workspace` succeeds, `cargo clippy --workspace --all-targets` passes (no new warnings)
+- **Learnings for future iterations:**
+  - Overlay enum in app.rs is the mechanism for TUI overlays; rendering dispatch is in render_overlay() in ui.rs
+  - Question overlay state is separate from the pending questions list — overlay can be dismissed and reopened
+  - Borrow checker challenge: handler functions that mutate overlay state and app state simultaneously need to extract data into locals first (immutable borrow), then modify (mutable borrows)
+  - Two event paths in TUI: daemon event bus (handle_daemon_event) and streaming response data (poll_pipeline_streaming_data) — both must handle new event types
+  - `pending_question_count_for_run()` enables per-run question counts for badge display without extra state
 ---
