@@ -1,71 +1,19 @@
 # Ralph Progress Log
-Started: Wed Feb 11 2026
-Branch: ralph/pipeline-interactive-mode
+Started: Wed Feb 11 06:57:15 PM MSK 2026
 ---
 
-## Codebase Patterns
-- PipelineRun struct fields must be updated in: nflow-core/src/pipeline.rs (struct + new()), db/pipeline.rs (row_to_pipeline_run, insert_pipeline_run, all SELECT queries), handlers.rs (all inline PipelineRun{} constructors and PipelineRun::new() calls)
-- Clippy prefers `#[derive(Default)]` with `#[default]` attribute over manual `impl Default` for enums
-- SELECT queries for pipeline_runs are replicated in: get_pipeline_run, list_pipeline_runs, get_active_pipeline_run — all must be updated together
-- TUI uses its own PipelineRunItem display struct, not the core PipelineRun — adding fields to core doesn't require immediate TUI changes
-- Migrations go in crates/nflow-daemon/migrations/ with numbered prefix (e.g., 004_pipeline_mode.sql)
-- Branch should be created from `dev` (not `main`), since `main` only has initial docs commit
-- PipelineStatus uses `#[serde(rename_all = "snake_case")]` for serialization (e.g., waiting_for_approval)
-- PipelineAction match in handlers.rs (~line 6652) must handle all variants — when adding new PipelineAction variants, add match arms even if they're placeholder/unreachable for the current mode
-- The `next_action()` function uses `run.mode` to decide flow — auto mode completes directly, manual mode pauses at approval gates
-- New DB tables can share a migration file (e.g., pipeline_questions added to 004_pipeline_mode.sql alongside ALTER TABLE)
-- Pipeline question DB functions: insert_question(), get_pending_questions(pipeline_run_id), answer_question(id, answer, answered_by) — answer_question returns bool (true if row was updated, false if already answered or not found)
-- Pre-existing test failure: nflow-claude render_full_spec_session_template (missing spec_file_path variable) — unrelated to pipeline work
-
----
-
-## 2026-02-11 - US-001
-- What was implemented: PipelineMode enum (Manual/Auto) with Display, Default, Serialize, Deserialize; mode field on PipelineRun; updated PipelineRun::new() signature; DB helpers (pipeline_mode_to_str/from_str); updated row mapper and insert; migration 004_pipeline_mode.sql; updated all handler call sites
-- Files changed:
-  - crates/nflow-core/src/pipeline.rs (PipelineMode enum, mode field, updated new(), updated tests)
-  - crates/nflow-daemon/src/db/pipeline.rs (mode helpers, updated row mapper, insert, all SELECT queries)
-  - crates/nflow-daemon/src/handlers.rs (5 PipelineRun constructor sites updated with mode field)
-  - crates/nflow-daemon/migrations/004_pipeline_mode.sql (new migration)
+## 2026-02-11 - US-006
+- Implemented `pipeline.approve` and `pipeline.reject` command handlers in handlers.rs
+- Added both handlers to the command dispatch table
+- `pipeline.approve`: handles WaitingForApproval (→ Running/Implement) and WaitingForFinalApproval (→ Completed)
+- `pipeline.reject`: handles WaitingForApproval (→ restart Plan with feedback) and WaitingForFinalApproval (→ increment iteration, back to Implement)
+- Reject enforces max_iterations check — marks Failed when exceeded
+- Both handlers emit appropriate events (PipelinePlanApproved/Rejected, PipelineFinalApproved/Rejected)
+- Files changed: crates/nflow-daemon/src/handlers.rs
 - **Learnings for future iterations:**
-  - The handlers.rs file has 4 inline `PipelineRun { ... }` constructs plus 1 `PipelineRun::new()` call — all need updating when adding fields
-  - The old prd.json from dev branch must be overwritten with the new PRD when creating a new branch
-  - All 4 SELECT queries in db/pipeline.rs must include new columns (get, list, get_active + find_stages doesn't apply to pipeline_runs)
----
-
-## 2026-02-11 - US-002
-- What was implemented: Added WaitingForApproval and WaitingForFinalApproval variants to PipelineStatus enum; added WaitForApproval and WaitForFinalApproval variants to PipelineAction enum; updated next_action() to be mode-aware (Manual mode pauses at approval gates, Auto mode unchanged); updated Display impl; updated DB status_to_str/from_str helpers; added exhaustive match arms in handlers.rs
-- Files changed:
-  - crates/nflow-core/src/pipeline.rs (PipelineStatus new variants, PipelineAction new variants, mode-aware next_action(), new tests)
-  - crates/nflow-daemon/src/db/pipeline.rs (pipeline_status_to_str/from_str updated)
-  - crates/nflow-daemon/src/handlers.rs (added match arms for WaitForApproval/WaitForFinalApproval in pipeline action match)
-- **Learnings for future iterations:**
-  - PipelineStatus serde uses `rename_all = "snake_case"` — new variants like WaitingForApproval serialize as "waiting_for_approval"
-  - When adding PipelineAction variants, the match statement in handlers.rs (~line 6652) must be updated with arms for the new variants or Rust won't compile
-  - The temp_run in handlers.rs currently hardcodes mode to Auto — it will need to use the actual run mode once manual mode pipeline execution is implemented (US-008)
-  - All existing auto-mode tests pass unchanged since make_run() defaults to PipelineMode::Auto
----
-
-## 2026-02-11 - US-003
-- What was implemented: PipelineQuestion struct in nflow-core/src/pipeline.rs with id, pipeline_run_id, question, context, answered, answer, answered_by, created_at, answered_at fields; PipelineQuestion::new() constructor; pipeline_questions DB table in migration 004; DB functions insert_question(), get_pending_questions(), answer_question(); row_to_pipeline_question() mapper; unit tests for constructor, context handling, and serialization round-trip
-- Files changed:
-  - crates/nflow-core/src/pipeline.rs (PipelineQuestion struct, new() constructor, 3 unit tests)
-  - crates/nflow-daemon/migrations/004_pipeline_mode.sql (added CREATE TABLE pipeline_questions)
-  - crates/nflow-daemon/src/db/pipeline.rs (row_to_pipeline_question mapper, insert_question, get_pending_questions, answer_question)
-- **Learnings for future iterations:**
-  - Multiple table creations can share a single migration file — just append CREATE TABLE statements
-  - The `answered` field uses INTEGER (0/1) in SQLite but maps to `bool` in Rust via rusqlite's automatic conversion
-  - answer_question() uses `AND answered = 0` in WHERE clause to prevent double-answering (returns bool indicating success)
-  - New DB functions in db/pipeline.rs will show as "unused" warnings until handler code references them (expected for incremental implementation)
----
-
-## 2026-02-11 - US-005
-- What was implemented: `pipeline.answer` command handler in handlers.rs that accepts `{ pipeline_run_id, question_id, answer }`, validates the pipeline is in Running state with current_stage=Plan, calls `db::pipeline::answer_question()` to save the answer, emits `PipelineQuestionAnswered` event via event bus, and returns `{ answered: true }`. Returns errors for missing/invalid params, not-found pipeline/question, invalid state (not running or not in Plan stage), and already-answered questions.
-- Files changed:
-  - crates/nflow-daemon/src/handlers.rs (added `pipeline.answer` dispatch route + `handle_pipeline_answer` function)
-  - scripts/ralph/prd.json (US-004 and US-005 marked as passes)
-- **Learnings for future iterations:**
-  - Handler pattern: parse params → parse UUIDs → open DB → validate pipeline state → perform action → emit event → return response
-  - `answer_question()` returns `bool` (false if already answered or not found) — use this to detect duplicate/invalid answers without a separate query
-  - The `answered_by` field is hardcoded to "user" in the handler; auto-agent answering will use a different code path (US-010)
-  - Pre-existing flaky test: `test_acquire_lock_contention` in nflow-cli fails when daemon is running — not related to pipeline work
+  - Handler pattern: extract params → validate UUID → open DB → get run → validate state → update DB → emit event → return response
+  - `update_pipeline_run()` takes string status values (e.g., "running", "completed") not enum variants — use the string literals directly
+  - Event bus is `Option<SharedEventBus>` — always check with `if let Some(bus) = &state.event_bus`
+  - Pre-existing warnings exist in clippy/build — don't try to fix them unless they're in your changed code
+  - The daemon lock test (`test_acquire_lock_contention`) is flaky when daemon is running — it's a pre-existing issue
 ---

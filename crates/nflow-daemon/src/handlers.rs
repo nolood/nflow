@@ -76,6 +76,8 @@ fn dispatch(req: Request, state: &HandlerState) -> HandlerResult {
         "pipeline.cancel" => HandlerResult::Single(handle_pipeline_cancel(req, state)),
         "pipeline.log" => HandlerResult::Single(handle_pipeline_log(req, state)),
         "pipeline.answer" => HandlerResult::Single(handle_pipeline_answer(req, state)),
+        "pipeline.approve" => HandlerResult::Single(handle_pipeline_approve(req, state)),
+        "pipeline.reject" => HandlerResult::Single(handle_pipeline_reject(req, state)),
         _ => HandlerResult::Single(Response::error(
             req.id,
             &format!("unknown command: {}", req.command),
@@ -7109,6 +7111,263 @@ fn handle_pipeline_log(req: Request, state: &HandlerState) -> Response {
             "logs": logs,
         }),
     )
+}
+
+/// Handle "pipeline.approve" command — approve a plan or final result.
+///
+/// Receives: { pipeline_run_id }
+/// - If WaitingForApproval → transition to Running (Implement stage), emit PipelinePlanApproved
+/// - If WaitingForFinalApproval → transition to Completed, emit PipelineFinalApproved
+fn handle_pipeline_approve(req: Request, state: &HandlerState) -> Response {
+    let id = req.id.clone();
+
+    let run_id_str = match req.params.get("pipeline_run_id").and_then(|v| v.as_str()) {
+        Some(s) => s.to_string(),
+        None => {
+            return Response::error(id, "missing required parameter: pipeline_run_id");
+        }
+    };
+
+    let run_id = match uuid::Uuid::parse_str(&run_id_str) {
+        Ok(u) => u,
+        Err(_) => {
+            return Response::error(id, "INVALID_PARAMS: invalid pipeline_run_id format");
+        }
+    };
+
+    let conn = match db::open_connection(&state.db_path) {
+        Ok(c) => c,
+        Err(e) => return Response::error(id, &format!("database error: {}", e)),
+    };
+
+    let run = match db::pipeline::get_pipeline_run(&conn, &run_id) {
+        Ok(Some(r)) => r,
+        Ok(None) => {
+            return Response::error(
+                id,
+                &format!("NOT_FOUND: pipeline run '{}' not found", run_id_str),
+            );
+        }
+        Err(e) => return Response::error(id, &format!("database error: {}", e)),
+    };
+
+    match run.status {
+        nflow_core::pipeline::PipelineStatus::WaitingForApproval => {
+            // Plan approved → transition to Running with Implement stage
+            if let Err(e) = db::pipeline::update_pipeline_run(
+                &conn,
+                &run_id,
+                "running",
+                Some("implement"),
+                run.iteration,
+            ) {
+                return Response::error(id, &format!("database error: {}", e));
+            }
+
+            if let Some(bus) = &state.event_bus {
+                bus.broadcast(crate::events::Event::PipelinePlanApproved {
+                    pipeline_run_id: run_id.to_string(),
+                });
+            }
+
+            Response::ok(
+                id,
+                serde_json::json!({
+                    "pipeline_run_id": run_id.to_string(),
+                    "status": "running",
+                    "current_stage": "implement",
+                    "approved": "plan",
+                }),
+            )
+        }
+        nflow_core::pipeline::PipelineStatus::WaitingForFinalApproval => {
+            // Final result approved → transition to Completed
+            if let Err(e) = db::pipeline::update_pipeline_run(
+                &conn,
+                &run_id,
+                "completed",
+                None,
+                run.iteration,
+            ) {
+                return Response::error(id, &format!("database error: {}", e));
+            }
+
+            if let Some(bus) = &state.event_bus {
+                bus.broadcast(crate::events::Event::PipelineFinalApproved {
+                    pipeline_run_id: run_id.to_string(),
+                });
+            }
+
+            Response::ok(
+                id,
+                serde_json::json!({
+                    "pipeline_run_id": run_id.to_string(),
+                    "status": "completed",
+                    "approved": "final",
+                }),
+            )
+        }
+        _ => Response::error(
+            id,
+            &format!(
+                "INVALID_STATE: pipeline run is not waiting for approval (status: {})",
+                run.status
+            ),
+        ),
+    }
+}
+
+/// Handle "pipeline.reject" command — reject a plan or final result with feedback.
+///
+/// Receives: { pipeline_run_id, feedback }
+/// - If WaitingForApproval → restart Plan stage with feedback, emit PipelinePlanRejected
+/// - If WaitingForFinalApproval → increment iteration, go back to Implement with feedback, emit PipelineFinalRejected
+/// - If max_iterations exceeded → mark Failed
+fn handle_pipeline_reject(req: Request, state: &HandlerState) -> Response {
+    let id = req.id.clone();
+
+    let run_id_str = match req.params.get("pipeline_run_id").and_then(|v| v.as_str()) {
+        Some(s) => s.to_string(),
+        None => {
+            return Response::error(id, "missing required parameter: pipeline_run_id");
+        }
+    };
+
+    let run_id = match uuid::Uuid::parse_str(&run_id_str) {
+        Ok(u) => u,
+        Err(_) => {
+            return Response::error(id, "INVALID_PARAMS: invalid pipeline_run_id format");
+        }
+    };
+
+    let feedback = match req.params.get("feedback").and_then(|v| v.as_str()) {
+        Some(s) => s.to_string(),
+        None => {
+            return Response::error(id, "missing required parameter: feedback");
+        }
+    };
+
+    let conn = match db::open_connection(&state.db_path) {
+        Ok(c) => c,
+        Err(e) => return Response::error(id, &format!("database error: {}", e)),
+    };
+
+    let run = match db::pipeline::get_pipeline_run(&conn, &run_id) {
+        Ok(Some(r)) => r,
+        Ok(None) => {
+            return Response::error(
+                id,
+                &format!("NOT_FOUND: pipeline run '{}' not found", run_id_str),
+            );
+        }
+        Err(e) => return Response::error(id, &format!("database error: {}", e)),
+    };
+
+    match run.status {
+        nflow_core::pipeline::PipelineStatus::WaitingForApproval => {
+            // Plan rejected → restart Plan stage with feedback
+            if let Err(e) = db::pipeline::update_pipeline_run(
+                &conn,
+                &run_id,
+                "running",
+                Some("plan"),
+                run.iteration,
+            ) {
+                return Response::error(id, &format!("database error: {}", e));
+            }
+
+            if let Some(bus) = &state.event_bus {
+                bus.broadcast(crate::events::Event::PipelinePlanRejected {
+                    pipeline_run_id: run_id.to_string(),
+                    feedback: feedback.clone(),
+                });
+            }
+
+            Response::ok(
+                id,
+                serde_json::json!({
+                    "pipeline_run_id": run_id.to_string(),
+                    "status": "running",
+                    "current_stage": "plan",
+                    "rejected": "plan",
+                    "feedback": feedback,
+                }),
+            )
+        }
+        nflow_core::pipeline::PipelineStatus::WaitingForFinalApproval => {
+            // Final rejected → increment iteration, go back to Implement
+            let new_iteration = run.iteration + 1;
+
+            if new_iteration > run.max_iterations {
+                // Max iterations exceeded → mark Failed
+                if let Err(e) = db::pipeline::update_pipeline_run(
+                    &conn,
+                    &run_id,
+                    "failed",
+                    None,
+                    run.iteration,
+                ) {
+                    return Response::error(id, &format!("database error: {}", e));
+                }
+
+                if let Some(bus) = &state.event_bus {
+                    bus.broadcast(crate::events::Event::PipelineCompleted {
+                        pipeline_run_id: run_id.to_string(),
+                        project_id: run.project_id.to_string(),
+                        status: "failed".to_string(),
+                        iterations: run.iteration,
+                    });
+                }
+
+                return Response::ok(
+                    id,
+                    serde_json::json!({
+                        "pipeline_run_id": run_id.to_string(),
+                        "status": "failed",
+                        "reason": "max_iterations_exceeded",
+                        "iterations": run.iteration,
+                        "max_iterations": run.max_iterations,
+                    }),
+                );
+            }
+
+            if let Err(e) = db::pipeline::update_pipeline_run(
+                &conn,
+                &run_id,
+                "running",
+                Some("implement"),
+                new_iteration,
+            ) {
+                return Response::error(id, &format!("database error: {}", e));
+            }
+
+            if let Some(bus) = &state.event_bus {
+                bus.broadcast(crate::events::Event::PipelineFinalRejected {
+                    pipeline_run_id: run_id.to_string(),
+                    feedback: feedback.clone(),
+                });
+            }
+
+            Response::ok(
+                id,
+                serde_json::json!({
+                    "pipeline_run_id": run_id.to_string(),
+                    "status": "running",
+                    "current_stage": "implement",
+                    "rejected": "final",
+                    "feedback": feedback,
+                    "iteration": new_iteration,
+                }),
+            )
+        }
+        _ => Response::error(
+            id,
+            &format!(
+                "INVALID_STATE: pipeline run is not waiting for approval (status: {})",
+                run.status
+            ),
+        ),
+    }
 }
 
 /// Handle "pipeline.answer" command — submit an answer to a planning question.
