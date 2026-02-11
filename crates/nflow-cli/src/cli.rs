@@ -363,6 +363,39 @@ pub enum PipelineCommand {
         #[arg(long)]
         iteration: Option<u32>,
     },
+
+    /// Approve a pipeline plan or final result (manual mode)
+    Approve {
+        /// Pipeline run ID
+        pipeline_id: String,
+    },
+
+    /// Reject a pipeline plan or final result with feedback (manual mode)
+    Reject {
+        /// Pipeline run ID
+        pipeline_id: String,
+
+        /// Rejection feedback explaining what needs to change
+        feedback: String,
+    },
+
+    /// Answer a pending pipeline question (manual mode)
+    Answer {
+        /// Pipeline run ID
+        pipeline_id: String,
+
+        /// Question ID to answer
+        question_id: String,
+
+        /// Your answer to the question
+        answer: String,
+    },
+
+    /// List pending questions for a pipeline run
+    Questions {
+        /// Pipeline run ID
+        pipeline_id: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]

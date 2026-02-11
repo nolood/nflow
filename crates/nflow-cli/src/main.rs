@@ -503,6 +503,40 @@ fn build_command(
             Ok(("pipeline.log".to_string(), params))
         }
 
+        Commands::Pipeline(PipelineCommand::Approve { pipeline_id }) => Ok((
+            "pipeline.approve".to_string(),
+            serde_json::json!({ "pipeline_run_id": pipeline_id }),
+        )),
+
+        Commands::Pipeline(PipelineCommand::Reject {
+            pipeline_id,
+            feedback,
+        }) => Ok((
+            "pipeline.reject".to_string(),
+            serde_json::json!({
+                "pipeline_run_id": pipeline_id,
+                "feedback": feedback,
+            }),
+        )),
+
+        Commands::Pipeline(PipelineCommand::Answer {
+            pipeline_id,
+            question_id,
+            answer,
+        }) => Ok((
+            "pipeline.answer".to_string(),
+            serde_json::json!({
+                "pipeline_run_id": pipeline_id,
+                "question_id": question_id,
+                "answer": answer,
+            }),
+        )),
+
+        Commands::Pipeline(PipelineCommand::Questions { pipeline_id }) => Ok((
+            "pipeline.questions".to_string(),
+            serde_json::json!({ "pipeline_run_id": pipeline_id }),
+        )),
+
         Commands::Tui => {
             // TUI launch is handled separately — not a daemon command
             Err(CliError::Socket("TUI is not yet implemented".to_string()))
@@ -735,5 +769,63 @@ mod tests {
         assert_eq!(params["pipeline_run_id"], "abc-123");
         assert!(params.get("stage_type").is_none());
         assert!(params.get("iteration").is_none());
+    }
+
+    #[test]
+    fn test_build_command_pipeline_approve() {
+        let (cmd, params) = build_command(
+            &None,
+            Commands::Pipeline(cli::PipelineCommand::Approve {
+                pipeline_id: "abc-123".to_string(),
+            }),
+        )
+        .unwrap();
+        assert_eq!(cmd, "pipeline.approve");
+        assert_eq!(params["pipeline_run_id"], "abc-123");
+    }
+
+    #[test]
+    fn test_build_command_pipeline_reject() {
+        let (cmd, params) = build_command(
+            &None,
+            Commands::Pipeline(cli::PipelineCommand::Reject {
+                pipeline_id: "abc-123".to_string(),
+                feedback: "needs more detail".to_string(),
+            }),
+        )
+        .unwrap();
+        assert_eq!(cmd, "pipeline.reject");
+        assert_eq!(params["pipeline_run_id"], "abc-123");
+        assert_eq!(params["feedback"], "needs more detail");
+    }
+
+    #[test]
+    fn test_build_command_pipeline_answer() {
+        let (cmd, params) = build_command(
+            &None,
+            Commands::Pipeline(cli::PipelineCommand::Answer {
+                pipeline_id: "abc-123".to_string(),
+                question_id: "q-456".to_string(),
+                answer: "use redis".to_string(),
+            }),
+        )
+        .unwrap();
+        assert_eq!(cmd, "pipeline.answer");
+        assert_eq!(params["pipeline_run_id"], "abc-123");
+        assert_eq!(params["question_id"], "q-456");
+        assert_eq!(params["answer"], "use redis");
+    }
+
+    #[test]
+    fn test_build_command_pipeline_questions() {
+        let (cmd, params) = build_command(
+            &None,
+            Commands::Pipeline(cli::PipelineCommand::Questions {
+                pipeline_id: "abc-123".to_string(),
+            }),
+        )
+        .unwrap();
+        assert_eq!(cmd, "pipeline.questions");
+        assert_eq!(params["pipeline_run_id"], "abc-123");
     }
 }

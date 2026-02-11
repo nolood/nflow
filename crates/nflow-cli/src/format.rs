@@ -185,6 +185,12 @@ fn print_object(data: &serde_json::Value, command: &str) {
         return;
     }
 
+    // pipeline.questions format
+    if obj.contains_key("questions") && !obj.contains_key("wave_number") {
+        print_pipeline_questions(data);
+        return;
+    }
+
     // Generic object: print key-value pairs
     for (key, value) in obj {
         match value {
@@ -725,6 +731,58 @@ fn print_pipeline_logs(data: &serde_json::Value) {
     }
 }
 
+/// Render pipeline.questions as a table.
+fn print_pipeline_questions(data: &serde_json::Value) {
+    let questions = match data.get("questions").and_then(|v| v.as_array()) {
+        Some(q) => q,
+        None => {
+            println!("{}", styled("(no pending questions)", &[DIM]));
+            return;
+        }
+    };
+
+    if questions.is_empty() {
+        println!("{}", styled("(no pending questions)", &[DIM]));
+        return;
+    }
+
+    // Print header
+    println!(
+        "  {:<38} {:<50} {}",
+        styled("ID", &[BOLD]),
+        styled("Question", &[BOLD]),
+        styled("Context", &[BOLD]),
+    );
+
+    for q in questions {
+        let qid = q.get("id").and_then(|v| v.as_str()).unwrap_or("?");
+        let question = q.get("question").and_then(|v| v.as_str()).unwrap_or("");
+        let context = q
+            .get("context")
+            .and_then(|v| v.as_str())
+            .unwrap_or("-");
+
+        let question_truncated = if question.len() > 48 {
+            format!("{}...", &question[..45])
+        } else {
+            question.to_string()
+        };
+
+        let context_truncated = if context.len() > 40 {
+            format!("{}...", &context[..37])
+        } else {
+            context.to_string()
+        };
+
+        println!(
+            "  {:<38} {:<50} {}",
+            styled(&qid[..8.min(qid.len())], &[CYAN]),
+            question_truncated,
+            styled(&context_truncated, &[DIM]),
+        );
+    }
+}
+
 /// Format a streaming pipeline event with colors.
 pub fn format_pipeline_event(data: &serde_json::Value) {
     let event_type = data.get("type").and_then(|v| v.as_str()).unwrap_or("");
@@ -1233,5 +1291,29 @@ mod tests {
     fn test_format_pipeline_event_error() {
         NO_COLOR.store(true, Ordering::Relaxed);
         format_pipeline_event(&serde_json::json!({"type": "error", "message": "oops"}));
+    }
+
+    #[test]
+    fn test_print_pipeline_questions() {
+        NO_COLOR.store(true, Ordering::Relaxed);
+        let data = serde_json::json!({
+            "questions": [{
+                "id": "abc12345-1234-1234-1234-123456789012",
+                "question": "Which database adapter should we use?",
+                "context": "Found both postgres and sqlite in config"
+            }, {
+                "id": "def12345-1234-1234-1234-123456789012",
+                "question": "Should we add authentication middleware?",
+                "context": null
+            }]
+        });
+        print_pipeline_questions(&data);
+    }
+
+    #[test]
+    fn test_print_pipeline_questions_empty() {
+        NO_COLOR.store(true, Ordering::Relaxed);
+        let data = serde_json::json!({ "questions": [] });
+        print_pipeline_questions(&data);
     }
 }

@@ -294,3 +294,22 @@ Started: Wed Feb 11 06:57:15 PM MSK 2026
   - CLI pipeline start sends both `name` and `goal` as the same description string — daemon expects both params
   - Pipeline commands use LONG_COMMAND_TIMEOUT because `pipeline.start` can run for minutes
 ---
+
+## 2026-02-11 - US-018
+- Implemented CLI pipeline approval and Q&A commands
+- Added 4 new subcommands to `PipelineCommand` enum in cli.rs:
+  - `pipeline approve <pipeline-id>`: sends `pipeline.approve` command
+  - `pipeline reject <pipeline-id> '<feedback>'`: sends `pipeline.reject` with feedback
+  - `pipeline answer <pipeline-id> <question-id> '<answer>'`: sends `pipeline.answer` command
+  - `pipeline questions <pipeline-id>`: sends `pipeline.questions`, displays pending questions table
+- Added `build_command` mappings for all 4 new subcommands in main.rs
+- Added `print_pipeline_questions()` formatter in format.rs: displays questions as table with ID, Question, Context columns
+- Added dispatch for questions response shape in `print_object()` (detects `{ "questions": [...] }`)
+- Added 6 new tests: 4 `build_command` tests (approve, reject, answer, questions), 2 format tests (questions, questions_empty)
+- Files changed: crates/nflow-cli/src/cli.rs, crates/nflow-cli/src/main.rs, crates/nflow-cli/src/format.rs, scripts/ralph/prd.json
+- All 101 nflow-cli tests pass, `cargo build --workspace` succeeds, `cargo clippy --workspace --all-targets` passes (no new warnings)
+- **Learnings for future iterations:**
+  - Pipeline approval commands are non-streaming (standard request/response) — they go through `build_command()` path
+  - `pipeline.approve` is context-aware on the daemon side — one command handles both plan approval and final approval based on current pipeline state
+  - `print_pipeline_questions` guards against questions key appearing in other response shapes with `!obj.contains_key("wave_number")`
+---
