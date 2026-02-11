@@ -1,0 +1,23 @@
+## Codebase Patterns
+- Binary E2E tests (spawning real daemon): use std::os::unix::net::UnixStream (sync) + std::process::Command with HOME env override. daemon_binary_path() uses CARGO_BIN_EXE_nflow-daemon or walks up from current_exe(). wait_for_file() polls with 50ms sleep. project.init needs git_provider: "github" when repo has no remote. project.list response: { projects: [...] } not bare array.
+- Integration tests needing isolated NFLOW_HOME: use create_test_home() → (TempDir guard, PathBuf) with temp .nflow/ dir (0700 perms, logs/ subdir). create_test_db(&nflow_home) → on-disk SQLite with migrations. TempDir guard auto-cleans on drop.
+- Direct DB insert helpers for command tests: insert_test_project(db_path, name) → Uuid; insert_test_spec(db_path, project_id, name, SpecStatus) → Spec. Bypass streaming commands that need Claude.
+- insert_exec_hierarchy(db_path, project_id, wave, story_status, task_status, verify_status) → (session_id, epic_id, story_id, task_id, verify_id) — creates full approved session + work item tree for exec tests
+- CRITICAL: After every cargo build, restart the daemon before testing CLI commands. The running daemon uses the old binary in memory.
+- Pipeline types live in nflow-core/src/pipeline.rs; DB layer in nflow-daemon/src/db/pipeline.rs; migration in migrations/002_pipeline.sql
+- Event bus in nflow-daemon/src/events.rs uses tokio broadcast channel. All event variants are tagged with #[serde(tag = "type", rename_all = "snake_case")]
+- Pipeline prompt templates in prompts/ dir, embedded at compile time via include_str!. Variables use {name} substitution.
+- nflow-cli currently has NO pipeline commands — all pipeline interaction is TUI-only
+- handlers.rs is the main command dispatcher (~10k lines). New handlers registered there.
+- TUI event handler in main.rs matches event "type" as strings from JSON with _ => {} catch-all, so new event variants are safely ignored until handled
+
+## 2026-02-11 - US-004
+- Added 8 new Event variants to nflow-daemon/src/events.rs: PipelineQuestion, PipelineQuestionAnswered, PipelinePlanReady, PipelinePlanApproved, PipelinePlanRejected, PipelineFinalApprovalReady, PipelineFinalApproved, PipelineFinalRejected
+- Added 9 serialization round-trip tests for all new variants
+- Fixed pre-existing test failure in nflow-claude/src/prompt.rs (missing spec_file_path variable)
+- Files changed: crates/nflow-daemon/src/events.rs, crates/nflow-claude/src/prompt.rs
+- **Learnings for future iterations:**
+  - TUI uses string-based event type matching with catch-all, so new events are safely ignored
+  - All Event variants use serde tag="type" with rename_all="snake_case"
+  - Existing tests may break if prompt templates get new variables — always check EMBEDDED_* template tests
+---
