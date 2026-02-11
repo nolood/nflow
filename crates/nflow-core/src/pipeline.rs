@@ -221,10 +221,30 @@ pub struct PlanStep {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImplementBuildResult {
+    pub success: bool,
+    pub output: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImplementTestResult {
+    pub success: bool,
+    pub output: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tests_passed: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tests_failed: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ImplementOutput {
     pub files_changed: Vec<String>,
     pub changes_summary: String,
     pub tests_passed: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub build_result: Option<ImplementBuildResult>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub test_result: Option<ImplementTestResult>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
