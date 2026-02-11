@@ -75,7 +75,7 @@ pub enum ViewAction {
     /// User switched to a different tab — refresh data for that view.
     TabSwitched(View),
     /// Request to start a new pipeline run.
-    PipelineNew { name: String, goal: String },
+    PipelineNew { name: String, goal: String, mode: String },
     /// Request to cancel a pipeline run.
     PipelineCancel(String),
     /// Request to view a pipeline run's detail.
@@ -957,22 +957,29 @@ fn handle_pipeline_new_key(app: &mut App, key: KeyEvent) -> ViewAction {
                 app.status_message = "Name and goal are required".to_string();
                 return ViewAction::None;
             }
+            let mode = new_state.mode.clone();
             app.close_pipeline_new();
-            ViewAction::PipelineNew { name, goal }
+            ViewAction::PipelineNew { name, goal, mode }
+        }
+        KeyCode::Left | KeyCode::Right => {
+            if new_state.focused_field == 2 {
+                new_state.toggle_mode();
+            }
+            ViewAction::None
         }
         KeyCode::Backspace => {
-            if new_state.focused_field == 0 {
-                new_state.name_input.pop();
-            } else {
-                new_state.goal_input.pop();
+            match new_state.focused_field {
+                0 => { new_state.name_input.pop(); }
+                1 => { new_state.goal_input.pop(); }
+                _ => {} // mode field doesn't use backspace
             }
             ViewAction::None
         }
         KeyCode::Char(c) => {
-            if new_state.focused_field == 0 {
-                new_state.name_input.push(c);
-            } else {
-                new_state.goal_input.push(c);
+            match new_state.focused_field {
+                0 => new_state.name_input.push(c),
+                1 => new_state.goal_input.push(c),
+                _ => {} // mode field doesn't use char input
             }
             ViewAction::None
         }

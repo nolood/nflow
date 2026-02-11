@@ -1594,7 +1594,7 @@ fn render_pipeline_list(app: &App, frame: &mut Frame, area: Rect) {
         return;
     }
 
-    let header = Row::new(vec!["Name", "Status", "Stage", "Iteration", "Created"]).style(
+    let header = Row::new(vec!["Name", "Mode", "Status", "Stage", "Iteration", "Created"]).style(
         Style::default()
             .fg(Color::Yellow)
             .add_modifier(Modifier::BOLD),
@@ -1615,6 +1615,7 @@ fn render_pipeline_list(app: &App, frame: &mut Frame, area: Rect) {
             } else {
                 format!("{} {}", icon, run.status)
             };
+            let mode_badge = if run.mode == "manual" { "M" } else { "A" };
             let style = if i == app.pipeline_list.selected {
                 Style::default().bg(Color::DarkGray).fg(Color::White)
             } else {
@@ -1622,6 +1623,7 @@ fn render_pipeline_list(app: &App, frame: &mut Frame, area: Rect) {
             };
             Row::new(vec![
                 run.name.clone(),
+                mode_badge.to_string(),
                 status_str,
                 stage.to_string(),
                 iter_str,
@@ -1632,11 +1634,12 @@ fn render_pipeline_list(app: &App, frame: &mut Frame, area: Rect) {
         .collect();
 
     let widths = [
-        Constraint::Percentage(25),
+        Constraint::Percentage(22),
+        Constraint::Percentage(6),
         Constraint::Percentage(20),
-        Constraint::Percentage(15),
-        Constraint::Percentage(15),
-        Constraint::Percentage(25),
+        Constraint::Percentage(12),
+        Constraint::Percentage(12),
+        Constraint::Percentage(28),
     ];
 
     let table = Table::new(rows, widths).header(header).block(block);
@@ -1805,7 +1808,7 @@ fn render_pipeline_new(app: &App, frame: &mut Frame, area: Rect) {
 
     // Center popup
     let popup_width = 60u16.min(area.width.saturating_sub(4));
-    let popup_height = 10u16.min(area.height.saturating_sub(4));
+    let popup_height = 13u16.min(area.height.saturating_sub(4));
     let x = (area.width.saturating_sub(popup_width)) / 2;
     let y = (area.height.saturating_sub(popup_height)) / 2;
     let popup_area = Rect::new(x, y, popup_width, popup_height);
@@ -1828,27 +1831,25 @@ fn render_pipeline_new(app: &App, frame: &mut Frame, area: Rect) {
             Constraint::Length(1), // Spacer
             Constraint::Length(1), // Goal label
             Constraint::Length(1), // Goal input
+            Constraint::Length(1), // Spacer
+            Constraint::Length(1), // Mode label
+            Constraint::Length(1), // Mode selector
             Constraint::Min(0),    // Padding
             Constraint::Length(1), // Help
         ])
         .split(inner);
 
-    let name_label_style = if new_state.focused_field == 0 {
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(Color::Gray)
-    };
-    let goal_label_style = if new_state.focused_field == 1 {
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(Color::Gray)
+    let field_style = |field: usize| -> Style {
+        if new_state.focused_field == field {
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Gray)
+        }
     };
 
-    frame.render_widget(Paragraph::new("Name:").style(name_label_style), chunks[0]);
+    frame.render_widget(Paragraph::new("Name:").style(field_style(0)), chunks[0]);
 
     let name_display = if new_state.focused_field == 0 {
         format!("{}\u{258C}", &new_state.name_input)
@@ -1860,7 +1861,7 @@ fn render_pipeline_new(app: &App, frame: &mut Frame, area: Rect) {
         chunks[1],
     );
 
-    frame.render_widget(Paragraph::new("Goal:").style(goal_label_style), chunks[3]);
+    frame.render_widget(Paragraph::new("Goal:").style(field_style(1)), chunks[3]);
 
     let goal_display = if new_state.focused_field == 1 {
         format!("{}\u{258C}", &new_state.goal_input)
@@ -1872,10 +1873,32 @@ fn render_pipeline_new(app: &App, frame: &mut Frame, area: Rect) {
         chunks[4],
     );
 
+    frame.render_widget(Paragraph::new("Mode:").style(field_style(2)), chunks[6]);
+
+    let (auto_style, manual_style) = if new_state.mode == "auto" {
+        (
+            Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+            Style::default().fg(Color::DarkGray),
+        )
+    } else {
+        (
+            Style::default().fg(Color::DarkGray),
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        )
+    };
+    let mode_line = Line::from(vec![
+        Span::styled("\u{25C0} ", if new_state.focused_field == 2 { Style::default().fg(Color::Cyan) } else { Style::default().fg(Color::DarkGray) }),
+        Span::styled("Auto", auto_style),
+        Span::raw("  |  "),
+        Span::styled("Manual", manual_style),
+        Span::styled(" \u{25B6}", if new_state.focused_field == 2 { Style::default().fg(Color::Cyan) } else { Style::default().fg(Color::DarkGray) }),
+    ]);
+    frame.render_widget(Paragraph::new(mode_line), chunks[7]);
+
     frame.render_widget(
-        Paragraph::new("Tab: switch field | Enter: start | Esc: cancel")
+        Paragraph::new("Tab: switch field | \u{2190}\u{2192}: toggle mode | Enter: start | Esc: cancel")
             .style(Style::default().fg(Color::DarkGray)),
-        chunks[6],
+        chunks[9],
     );
 }
 

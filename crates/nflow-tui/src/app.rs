@@ -2166,6 +2166,7 @@ impl FilterState {
 pub struct PipelineRunItem {
     pub id: String,
     pub name: String,
+    pub mode: String,
     pub status: String,
     pub current_stage: Option<String>,
     pub iteration: u32,
@@ -2298,7 +2299,9 @@ impl PipelineDetailState {
 pub struct PipelineNewState {
     pub name_input: String,
     pub goal_input: String,
-    /// 0 = name, 1 = goal
+    /// "auto" or "manual"
+    pub mode: String,
+    /// 0 = name, 1 = goal, 2 = mode
     pub focused_field: usize,
 }
 
@@ -2307,12 +2310,21 @@ impl PipelineNewState {
         Self {
             name_input: String::new(),
             goal_input: String::new(),
+            mode: "auto".to_string(),
             focused_field: 0,
         }
     }
 
     pub fn toggle_focus(&mut self) {
-        self.focused_field = if self.focused_field == 0 { 1 } else { 0 };
+        self.focused_field = (self.focused_field + 1) % 3;
+    }
+
+    pub fn toggle_mode(&mut self) {
+        self.mode = if self.mode == "auto" {
+            "manual".to_string()
+        } else {
+            "auto".to_string()
+        };
     }
 }
 

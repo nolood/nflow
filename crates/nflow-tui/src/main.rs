@@ -353,8 +353,8 @@ async fn event_loop(
                 event::ViewAction::ProjectSelect(name) => {
                     app.switch_project(name, client).await;
                 }
-                event::ViewAction::PipelineNew { name, goal } => {
-                    handle_pipeline_start(app, client, &name, &goal).await;
+                event::ViewAction::PipelineNew { name, goal, mode } => {
+                    handle_pipeline_start(app, client, &name, &goal, &mode).await;
                 }
                 event::ViewAction::PipelineCancel(id) => {
                     handle_pipeline_cancel(app, client, &id).await;
@@ -1716,11 +1716,12 @@ async fn handle_spec_delete_action(app: &mut App, client: &mut SocketClient) {
 }
 
 /// Start a new pipeline run (streaming).
-async fn handle_pipeline_start(app: &mut App, client: &mut SocketClient, name: &str, goal: &str) {
+async fn handle_pipeline_start(app: &mut App, client: &mut SocketClient, name: &str, goal: &str, mode: &str) {
     let params = serde_json::json!({
         "project_name": &app.project,
         "name": name,
         "goal": goal,
+        "mode": mode,
     });
 
     match client
@@ -1877,6 +1878,11 @@ async fn handle_pipeline_view_detail(app: &mut App, client: &mut SocketClient, i
                             .get("name")
                             .and_then(|v| v.as_str())
                             .unwrap_or("")
+                            .to_string(),
+                        mode: run_data
+                            .get("mode")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("auto")
                             .to_string(),
                         status: run_data
                             .get("status")
@@ -2037,6 +2043,11 @@ async fn fetch_pipeline_list(app: &mut App, client: &mut SocketClient) {
                             .and_then(|v| v.as_str())
                             .unwrap_or("")
                             .to_string(),
+                        mode: r
+                            .get("mode")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("auto")
+                            .to_string(),
                         status: r
                             .get("status")
                             .and_then(|v| v.as_str())
@@ -2107,6 +2118,11 @@ async fn poll_pipeline_streaming_data(app: &mut App, client: &mut SocketClient) 
                             .get("name")
                             .and_then(|v| v.as_str())
                             .unwrap_or("Pipeline")
+                            .to_string(),
+                        mode: line.data
+                            .get("mode")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("auto")
                             .to_string(),
                         status: line.data
                             .get("status")

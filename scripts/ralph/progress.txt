@@ -30,6 +30,8 @@ Started: Wed Feb 11 06:57:15 PM MSK 2026
 - Pipeline approval overlay: `PipelineApprovalOverlayState` in app.rs, `ApprovalKind` enum (Plan/Final), opened via `open_pipeline_approval_overlay()`, keybinds 'a' approve/'r' reject
 - Approval overlay has two modes: view mode (a/r/j/k/Esc) and rejection mode (text input with Enter/Esc) — controlled by `rejecting` bool field
 - Pipeline status strings for approval gates: "waiting_for_approval" and "waiting_for_final_approval" — used in status bar indicator and detail view
+- `PipelineNewState` has 3 fields (name, goal, mode) — focused_field cycles 0→1→2 with Tab, mode toggles with Left/Right arrows
+- `PipelineRunItem` has `mode: String` field — populated from daemon JSON response, displayed as "M"/"A" badge in pipeline list
 
 ---
 
@@ -236,4 +238,26 @@ Started: Wed Feb 11 06:57:15 PM MSK 2026
   - Pipeline status strings "waiting_for_approval" and "waiting_for_final_approval" match daemon DB values
   - Events flow through both daemon event bus AND streaming data — must handle in both paths for consistent behavior
   - Status bar checks `pipeline_detail.run.status` for waiting indicators — only shown when detail view is open
+---
+
+## 2026-02-11 - US-016
+- Added mode selector to TUI new pipeline dialog
+- Added `mode: String` field to `PipelineNewState` in app.rs (default: "auto")
+- Extended `toggle_focus()` to cycle through 3 fields: name → goal → mode
+- Added `toggle_mode()` method to switch between "auto" and "manual"
+- Updated `handle_pipeline_new_key()` in event.rs: Left/Right arrow keys toggle mode when mode field is focused
+- Updated `ViewAction::PipelineNew` to include `mode: String` field
+- Added `mode: String` field to `PipelineRunItem` in app.rs
+- Updated all 3 `PipelineRunItem` constructions in main.rs (fetch_pipeline_list, handle_pipeline_view_detail, poll_pipeline_streaming_data) to parse `mode` from daemon response (default: "auto")
+- Updated `handle_pipeline_start()` to accept mode parameter and send it in `pipeline.start` command params
+- Updated `render_pipeline_new()` in ui.rs: popup height increased to 13, added Mode label + selector row with visual arrows and highlighted selected option
+- Updated `render_pipeline_list()` in ui.rs: added "Mode" column header, shows "M" for manual and "A" for auto as mode badge, adjusted column widths
+- Files changed: crates/nflow-tui/src/app.rs, crates/nflow-tui/src/event.rs, crates/nflow-tui/src/main.rs, crates/nflow-tui/src/ui.rs, scripts/ralph/prd.json
+- All 152 non-daemon tests pass
+- `cargo build --workspace` succeeds, `cargo clippy --workspace --all-targets` passes (no new warnings)
+- **Learnings for future iterations:**
+  - `PipelineNewState` uses field indices (0=name, 1=goal, 2=mode) with modular arithmetic for cycling: `(field + 1) % 3`
+  - Mode selector uses Left/Right arrows to toggle (not typed input) — field-specific key handling in the match on `focused_field`
+  - `PipelineRunItem.mode` is stored as String (not enum) for simplicity — matches daemon JSON response format
+  - Pipeline list table now has 6 columns (added Mode) — widths adjusted proportionally
 ---
