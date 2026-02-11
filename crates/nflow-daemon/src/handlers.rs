@@ -78,6 +78,7 @@ fn dispatch(req: Request, state: &HandlerState) -> HandlerResult {
         "pipeline.answer" => HandlerResult::Single(handle_pipeline_answer(req, state)),
         "pipeline.approve" => HandlerResult::Single(handle_pipeline_approve(req, state)),
         "pipeline.reject" => HandlerResult::Single(handle_pipeline_reject(req, state)),
+        "pipeline.questions" => HandlerResult::Single(handle_pipeline_questions(req, state)),
         _ => HandlerResult::Single(Response::error(
             req.id,
             &format!("unknown command: {}", req.command),
@@ -7368,6 +7369,56 @@ fn handle_pipeline_reject(req: Request, state: &HandlerState) -> Response {
             ),
         ),
     }
+}
+
+/// Handle "pipeline.questions" command — list pending questions for a pipeline.
+///
+/// Receives: { pipeline_run_id }
+/// Returns: { questions: [{ id, question, context }] }
+fn handle_pipeline_questions(req: Request, state: &HandlerState) -> Response {
+    let id = req.id.clone();
+
+    let run_id_str = match req.params.get("pipeline_run_id").and_then(|v| v.as_str()) {
+        Some(s) => s.to_string(),
+        None => {
+            return Response::error(id, "missing required parameter: pipeline_run_id");
+        }
+    };
+
+    let run_id = match uuid::Uuid::parse_str(&run_id_str) {
+        Ok(u) => u,
+        Err(_) => {
+            return Response::error(id, "INVALID_PARAMS: invalid pipeline_run_id format");
+        }
+    };
+
+    let conn = match db::open_connection(&state.db_path) {
+        Ok(c) => c,
+        Err(e) => return Response::error(id, &format!("database error: {}", e)),
+    };
+
+    let questions = match db::pipeline::get_pending_questions(&conn, &run_id) {
+        Ok(q) => q,
+        Err(e) => return Response::error(id, &format!("database error: {}", e)),
+    };
+
+    let questions_json: Vec<serde_json::Value> = questions
+        .iter()
+        .map(|q| {
+            serde_json::json!({
+                "id": q.id.to_string(),
+                "question": q.question,
+                "context": q.context,
+            })
+        })
+        .collect();
+
+    Response::ok(
+        id,
+        serde_json::json!({
+            "questions": questions_json,
+        }),
+    )
 }
 
 /// Handle "pipeline.answer" command — submit an answer to a planning question.
