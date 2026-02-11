@@ -32,6 +32,11 @@ Started: Wed Feb 11 06:57:15 PM MSK 2026
 - Pipeline status strings for approval gates: "waiting_for_approval" and "waiting_for_final_approval" — used in status bar indicator and detail view
 - `PipelineNewState` has 3 fields (name, goal, mode) — focused_field cycles 0→1→2 with Tab, mode toggles with Left/Right arrows
 - `PipelineRunItem` has `mode: String` field — populated from daemon JSON response, displayed as "M"/"A" badge in pipeline list
+- CLI pipeline commands: `PipelineCommand` subcommand enum in cli.rs, streaming for `start`, non-streaming for list/status/cancel/log
+- `pipeline.start` is a streaming command — handled in `run()` function before `build_command()`; uses `handle_pipeline_stream()` in streaming.rs
+- `pipeline.list`/`pipeline.status` daemon responses now include `mode` field in run JSON — both handlers updated in handlers.rs
+- Pipeline formatting: `format_pipeline_event()` for streaming, `print_pipeline_list/status/logs()` for response rendering in format.rs
+- Socket timeout: pipeline commands use `LONG_COMMAND_TIMEOUT` (300s) since pipeline.start can run for extended periods
 
 ---
 
@@ -260,4 +265,32 @@ Started: Wed Feb 11 06:57:15 PM MSK 2026
   - Mode selector uses Left/Right arrows to toggle (not typed input) — field-specific key handling in the match on `focused_field`
   - `PipelineRunItem.mode` is stored as String (not enum) for simplicity — matches daemon JSON response format
   - Pipeline list table now has 6 columns (added Mode) — widths adjusted proportionally
+---
+
+## 2026-02-11 - US-017
+- Implemented CLI pipeline subcommand group: start, list, status, cancel, log
+- Added `PipelineCommand` subcommand enum to `cli.rs` with 5 subcommands:
+  - `pipeline start <description> --mode manual|auto --max-iterations N`: streaming command, streams pipeline progress to stdout
+  - `pipeline list`: prints table with ID, Description, Mode, Status, Iteration, Created
+  - `pipeline status <pipeline-id>`: prints pipeline detail + stage history
+  - `pipeline cancel <pipeline-id>`: cancels running pipeline
+  - `pipeline log <pipeline-id> --stage plan|implement|review --iteration N`: shows stage logs
+- Added `handle_pipeline_stream()` in streaming.rs for streaming pipeline start output
+- Added pipeline-specific formatters in format.rs:
+  - `format_pipeline_status()`: colored status strings for pipeline states (including waiting_for_approval etc.)
+  - `print_pipeline_list()`: table format for pipeline.list response
+  - `print_pipeline_status()`: detail format for pipeline.status response
+  - `print_pipeline_logs()`: log content display for pipeline.log response
+  - `format_pipeline_event()`: streaming event formatter for pipeline start output
+- Updated daemon handlers: added `mode` field to `pipeline.list` and `pipeline.status` response JSON (both handlers now include `r.mode.to_string()`)
+- Updated `command_timeout()` in socket_client.rs: pipeline commands now use LONG_COMMAND_TIMEOUT (300s)
+- Added 11 new tests: 5 build_command tests (list, status, cancel, log, log_no_filters), 6 format tests (pipeline_status_variants, list, list_empty, status_detail, logs, pipeline_events)
+- Files changed: crates/nflow-cli/src/cli.rs, crates/nflow-cli/src/main.rs, crates/nflow-cli/src/streaming.rs, crates/nflow-cli/src/format.rs, crates/nflow-cli/src/socket_client.rs, crates/nflow-daemon/src/handlers.rs, scripts/ralph/prd.json
+- All 95 nflow-cli tests pass, `cargo build --workspace` succeeds, `cargo clippy --workspace --all-targets` passes (no new warnings)
+- **Learnings for future iterations:**
+  - `pipeline.start` is a streaming command (returns `HandlerResult::Streaming(rx)`) — must be handled separately in `run()` before `build_command()` call
+  - Non-streaming pipeline commands (list, status, cancel, log) go through `build_command()` → standard request/response flow
+  - Daemon response JSON for `pipeline.list` and `pipeline.status` did NOT include `mode` field — had to update handlers.rs
+  - CLI pipeline start sends both `name` and `goal` as the same description string — daemon expects both params
+  - Pipeline commands use LONG_COMMAND_TIMEOUT because `pipeline.start` can run for minutes
 ---

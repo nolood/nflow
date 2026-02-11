@@ -150,6 +150,10 @@ pub enum Commands {
         wave: Option<u32>,
     },
 
+    /// Manage pipeline runs (plan → implement → review)
+    #[command(subcommand)]
+    Pipeline(PipelineCommand),
+
     /// Manage git worktrees
     #[command(subcommand)]
     Worktree(WorktreeCommand),
@@ -312,6 +316,52 @@ pub enum PlanCommand {
         /// Target a specific wave (default: latest draft)
         #[arg(long)]
         wave: Option<u32>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum PipelineCommand {
+    /// Start a new pipeline run
+    Start {
+        /// Pipeline description / goal
+        description: String,
+
+        /// Execution mode: manual (human-in-the-loop) or auto (fully autonomous)
+        #[arg(long, default_value = "auto")]
+        mode: String,
+
+        /// Maximum iteration cycles before giving up
+        #[arg(long, default_value = "5")]
+        max_iterations: u32,
+    },
+
+    /// List all pipeline runs for the current project
+    List,
+
+    /// Show pipeline run details and stage history
+    Status {
+        /// Pipeline run ID
+        pipeline_id: String,
+    },
+
+    /// Cancel a running pipeline
+    Cancel {
+        /// Pipeline run ID
+        pipeline_id: String,
+    },
+
+    /// Show stage logs for a pipeline run
+    Log {
+        /// Pipeline run ID
+        pipeline_id: String,
+
+        /// Filter by stage type: plan, implement, or review
+        #[arg(long)]
+        stage: Option<String>,
+
+        /// Filter by iteration number
+        #[arg(long)]
+        iteration: Option<u32>,
     },
 }
 

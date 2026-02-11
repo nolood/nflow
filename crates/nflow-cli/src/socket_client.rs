@@ -337,7 +337,10 @@ impl StreamingReader<'_> {
 ///
 /// Spec and plan commands get 300s; all others get 60s.
 fn command_timeout(command: &str) -> Duration {
-    if command.starts_with("spec.") || command.starts_with("plan.") {
+    if command.starts_with("spec.")
+        || command.starts_with("plan.")
+        || command.starts_with("pipeline.")
+    {
         LONG_COMMAND_TIMEOUT
     } else {
         DEFAULT_COMMAND_TIMEOUT
@@ -708,6 +711,8 @@ mod tests {
         assert_eq!(command_timeout("spec.resume"), LONG_COMMAND_TIMEOUT);
         assert_eq!(command_timeout("plan.generate"), LONG_COMMAND_TIMEOUT);
         assert_eq!(command_timeout("plan.feedback"), LONG_COMMAND_TIMEOUT);
+        assert_eq!(command_timeout("pipeline.start"), LONG_COMMAND_TIMEOUT);
+        assert_eq!(command_timeout("pipeline.list"), LONG_COMMAND_TIMEOUT);
     }
 
     #[tokio::test]

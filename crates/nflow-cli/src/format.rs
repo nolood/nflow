@@ -60,6 +60,20 @@ fn format_status(status: &str) -> String {
     }
 }
 
+/// Format a pipeline status string with icon.
+fn format_pipeline_status(status: &str) -> String {
+    match status.to_lowercase().as_str() {
+        "running" => styled("\u{25b6} running", &[YELLOW, BOLD]),
+        "completed" => styled("\u{2714} completed", &[GREEN]),
+        "failed" => styled("\u{2718} failed", &[RED, BOLD]),
+        "cancelled" => styled("\u{2015} cancelled", &[DIM]),
+        "waiting_for_approval" => styled("\u{25cb} waiting for approval", &[YELLOW]),
+        "waiting_for_final_approval" => styled("\u{25cb} waiting for final approval", &[YELLOW]),
+        "pending" => styled("\u{00b7} pending", &[GRAY]),
+        other => other.to_string(),
+    }
+}
+
 /// Format and print a daemon response in human-readable form.
 ///
 /// Dispatches to specialized formatters based on the response data shape.
@@ -150,6 +164,24 @@ fn print_object(data: &serde_json::Value, command: &str) {
     // exec.status format (waves array)
     if obj.contains_key("waves") {
         print_exec_status(data);
+        return;
+    }
+
+    // pipeline.list format
+    if obj.contains_key("runs") {
+        print_pipeline_list(data);
+        return;
+    }
+
+    // pipeline.status format
+    if obj.contains_key("run") && obj.contains_key("stages") {
+        print_pipeline_status(data);
+        return;
+    }
+
+    // pipeline.log format
+    if obj.contains_key("logs") && obj.contains_key("pipeline_run_id") {
+        print_pipeline_logs(data);
         return;
     }
 
@@ -497,6 +529,256 @@ fn print_exec_status(data: &serde_json::Value) {
     }
 }
 
+/// Render pipeline.list as a table.
+fn print_pipeline_list(data: &serde_json::Value) {
+    let runs = match data.get("runs").and_then(|v| v.as_array()) {
+        Some(r) => r,
+        None => {
+            println!("{}", styled("(no pipeline runs)", &[DIM]));
+            return;
+        }
+    };
+
+    if runs.is_empty() {
+        println!("{}", styled("(no pipeline runs)", &[DIM]));
+        return;
+    }
+
+    // Print header
+    println!(
+        "  {:<38} {:<30} {:<6} {:<28} {:<5} {}",
+        styled("ID", &[BOLD]),
+        styled("Description", &[BOLD]),
+        styled("Mode", &[BOLD]),
+        styled("Status", &[BOLD]),
+        styled("Iter", &[BOLD]),
+        styled("Created", &[BOLD]),
+    );
+
+    for run in runs {
+        let id = run.get("id").and_then(|v| v.as_str()).unwrap_or("?");
+        let name = run.get("name").and_then(|v| v.as_str()).unwrap_or("");
+        let mode = run.get("mode").and_then(|v| v.as_str()).unwrap_or("auto");
+        let status = run
+            .get("status")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+        let iteration = run.get("iteration").and_then(|v| v.as_u64()).unwrap_or(0);
+        let max_iter = run
+            .get("max_iterations")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let created = run
+            .get("created_at")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        // Truncate created to just date+time
+        let created_short = if created.len() > 19 {
+            &created[..19]
+        } else {
+            created
+        };
+
+        let mode_badge = match mode {
+            "manual" => styled("M", &[YELLOW, BOLD]),
+            _ => styled("A", &[CYAN]),
+        };
+
+        let desc_truncated = if name.len() > 28 {
+            format!("{}...", &name[..25])
+        } else {
+            name.to_string()
+        };
+
+        println!(
+            "  {:<38} {:<30} {:<6} {:<28} {}/{} {}",
+            styled(&id[..8.min(id.len())], &[CYAN]),
+            desc_truncated,
+            mode_badge,
+            format_pipeline_status(status),
+            iteration,
+            max_iter,
+            styled(created_short, &[DIM]),
+        );
+    }
+}
+
+/// Render pipeline.status detail view.
+fn print_pipeline_status(data: &serde_json::Value) {
+    let run = match data.get("run") {
+        Some(r) => r,
+        None => return,
+    };
+
+    let id = run.get("id").and_then(|v| v.as_str()).unwrap_or("?");
+    let name = run.get("name").and_then(|v| v.as_str()).unwrap_or("");
+    let goal = run.get("goal").and_then(|v| v.as_str()).unwrap_or("");
+    let mode = run.get("mode").and_then(|v| v.as_str()).unwrap_or("auto");
+    let status = run
+        .get("status")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    let stage = run
+        .get("current_stage")
+        .and_then(|v| v.as_str())
+        .unwrap_or("-");
+    let iteration = run.get("iteration").and_then(|v| v.as_u64()).unwrap_or(0);
+    let max_iter = run
+        .get("max_iterations")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let created = run
+        .get("created_at")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+
+    println!("{}", styled(&format!("Pipeline: {}", name), &[BOLD]));
+    println!("  {}: {}", styled("ID", &[DIM]), id);
+    println!("  {}: {}", styled("Goal", &[DIM]), goal);
+    println!("  {}: {}", styled("Mode", &[DIM]), mode);
+    println!("  {}: {}", styled("Status", &[DIM]), format_pipeline_status(status));
+    println!("  {}: {}", styled("Stage", &[DIM]), stage);
+    println!(
+        "  {}: {}/{}",
+        styled("Iteration", &[DIM]),
+        iteration,
+        max_iter
+    );
+    println!("  {}: {}", styled("Created", &[DIM]), created);
+
+    // Print stages
+    if let Some(stages) = data.get("stages").and_then(|v| v.as_array()) {
+        if !stages.is_empty() {
+            println!("\n{}", styled("Stages:", &[BOLD]));
+            for stage in stages {
+                let stype = stage
+                    .get("stage_type")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("?");
+                let siter = stage.get("iteration").and_then(|v| v.as_u64()).unwrap_or(0);
+                let sstatus = stage
+                    .get("status")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown");
+                let started = stage
+                    .get("started_at")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("-");
+                let finished = stage
+                    .get("finished_at")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("-");
+
+                println!(
+                    "  {} #{} {} (started: {}, finished: {})",
+                    styled(stype, &[BOLD, CYAN]),
+                    siter,
+                    format_pipeline_status(sstatus),
+                    styled(started, &[DIM]),
+                    styled(finished, &[DIM]),
+                );
+            }
+        }
+    }
+}
+
+/// Render pipeline.log output.
+fn print_pipeline_logs(data: &serde_json::Value) {
+    let logs = match data.get("logs").and_then(|v| v.as_array()) {
+        Some(l) => l,
+        None => {
+            println!("{}", styled("(no logs)", &[DIM]));
+            return;
+        }
+    };
+
+    for log_entry in logs {
+        let stype = log_entry
+            .get("stage_type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("?");
+        let iteration = log_entry
+            .get("iteration")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let sstatus = log_entry
+            .get("status")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+        let content = log_entry
+            .get("content")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+
+        println!(
+            "{} #{} {}",
+            styled(&format!("--- {} ---", stype), &[BOLD]),
+            iteration,
+            format_pipeline_status(sstatus),
+        );
+        if content.is_empty() {
+            println!("{}", styled("(no log content)", &[DIM]));
+        } else {
+            println!("{}", content);
+        }
+        println!();
+    }
+}
+
+/// Format a streaming pipeline event with colors.
+pub fn format_pipeline_event(data: &serde_json::Value) {
+    let event_type = data.get("type").and_then(|v| v.as_str()).unwrap_or("");
+    match event_type {
+        "text" => {
+            if let Some(text) = data.get("text").and_then(|v| v.as_str()) {
+                print!("{}", text);
+            }
+        }
+        "tool_use" => {
+            let name = data
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            println!("{}", styled(&format!("[tool: {}]", name), &[DIM]));
+        }
+        "tool_result" => {
+            if let Some(content) = data.get("content").and_then(|v| v.as_str()) {
+                let truncated = if content.len() > 200 {
+                    format!("{}...", &content[..200])
+                } else {
+                    content.to_string()
+                };
+                println!("{}", styled(&format!("[result: {}]", truncated), &[DIM]));
+            }
+        }
+        "result" => {
+            if let Some(text) = data.get("text").and_then(|v| v.as_str()) {
+                println!("\n{}\n{}", styled("--- Result ---", &[BOLD]), text);
+            }
+        }
+        "error" => {
+            if let Some(msg) = data.get("message").and_then(|v| v.as_str()) {
+                eprintln!("{}", styled(&format!("error: {}", msg), &[RED, BOLD]));
+            }
+        }
+        _ => {
+            // Pipeline-specific events: print status changes
+            if let Some(status) = data.get("status").and_then(|v| v.as_str()) {
+                let stage = data.get("current_stage").and_then(|v| v.as_str());
+                let iter = data.get("iteration").and_then(|v| v.as_u64());
+                let mut msg = format!("[pipeline: {}]", format_pipeline_status(status));
+                if let Some(s) = stage {
+                    msg = format!("{} stage: {}", msg, styled(s, &[CYAN]));
+                }
+                if let Some(i) = iter {
+                    msg = format!("{} iteration: {}", msg, i);
+                }
+                println!("{}", msg);
+            }
+        }
+    }
+}
+
 /// Format an error message from the daemon with a suggested action.
 ///
 /// Error messages from the daemon use prefixes like "NOT_FOUND:", "ALREADY_EXISTS:",
@@ -840,5 +1122,116 @@ mod tests {
         assert!(!suggest_action("ALREADY_EXISTS: x").is_empty());
         assert!(!suggest_action("INVALID_STATE: x").is_empty());
         assert!(suggest_action("random error").is_empty());
+    }
+
+    #[test]
+    fn test_format_pipeline_status_variants() {
+        NO_COLOR.store(true, Ordering::Relaxed);
+        assert!(format_pipeline_status("running").contains("running"));
+        assert!(format_pipeline_status("completed").contains("completed"));
+        assert!(format_pipeline_status("failed").contains("failed"));
+        assert!(format_pipeline_status("cancelled").contains("cancelled"));
+        assert!(format_pipeline_status("waiting_for_approval").contains("waiting for approval"));
+        assert!(format_pipeline_status("waiting_for_final_approval").contains("waiting for final approval"));
+        assert!(format_pipeline_status("pending").contains("pending"));
+        assert_eq!(format_pipeline_status("custom"), "custom");
+    }
+
+    #[test]
+    fn test_print_pipeline_list() {
+        NO_COLOR.store(true, Ordering::Relaxed);
+        let data = serde_json::json!({
+            "runs": [{
+                "id": "abc12345-1234-1234-1234-123456789012",
+                "name": "Test pipeline",
+                "goal": "Do something",
+                "mode": "manual",
+                "status": "running",
+                "iteration": 1,
+                "max_iterations": 5,
+                "created_at": "2026-02-11T10:00:00+00:00",
+            }]
+        });
+        print_pipeline_list(&data);
+    }
+
+    #[test]
+    fn test_print_pipeline_list_empty() {
+        NO_COLOR.store(true, Ordering::Relaxed);
+        let data = serde_json::json!({ "runs": [] });
+        print_pipeline_list(&data);
+    }
+
+    #[test]
+    fn test_print_pipeline_status_detail() {
+        NO_COLOR.store(true, Ordering::Relaxed);
+        let data = serde_json::json!({
+            "run": {
+                "id": "abc12345-1234-1234-1234-123456789012",
+                "project_id": "proj-id",
+                "name": "Test pipeline",
+                "goal": "Do something",
+                "mode": "auto",
+                "status": "running",
+                "current_stage": "implement",
+                "iteration": 2,
+                "max_iterations": 5,
+                "created_at": "2026-02-11T10:00:00+00:00",
+                "updated_at": "2026-02-11T10:05:00+00:00",
+            },
+            "stages": [{
+                "id": "stage-1",
+                "stage_type": "plan",
+                "iteration": 1,
+                "status": "completed",
+                "started_at": "2026-02-11T10:00:00+00:00",
+                "finished_at": "2026-02-11T10:02:00+00:00",
+            }, {
+                "id": "stage-2",
+                "stage_type": "implement",
+                "iteration": 1,
+                "status": "running",
+                "started_at": "2026-02-11T10:02:00+00:00",
+                "finished_at": null,
+            }]
+        });
+        print_pipeline_status(&data);
+    }
+
+    #[test]
+    fn test_print_pipeline_logs() {
+        NO_COLOR.store(true, Ordering::Relaxed);
+        let data = serde_json::json!({
+            "pipeline_run_id": "abc-123",
+            "logs": [{
+                "stage_type": "plan",
+                "iteration": 1,
+                "status": "completed",
+                "content": "Plan output here..."
+            }]
+        });
+        print_pipeline_logs(&data);
+    }
+
+    #[test]
+    fn test_format_pipeline_event_text() {
+        NO_COLOR.store(true, Ordering::Relaxed);
+        format_pipeline_event(&serde_json::json!({"type": "text", "text": "hello"}));
+    }
+
+    #[test]
+    fn test_format_pipeline_event_status() {
+        NO_COLOR.store(true, Ordering::Relaxed);
+        format_pipeline_event(&serde_json::json!({
+            "status": "running",
+            "current_stage": "plan",
+            "iteration": 1
+        }));
+    }
+
+    #[test]
+    fn test_format_pipeline_event_error() {
+        NO_COLOR.store(true, Ordering::Relaxed);
+        format_pipeline_event(&serde_json::json!({"type": "error", "message": "oops"}));
     }
 }

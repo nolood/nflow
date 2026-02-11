@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use clap::Parser;
-use cli::{Cli, Commands, DaemonCommand, SpecCommand};
+use cli::{Cli, Commands, DaemonCommand, PipelineCommand, SpecCommand};
 use daemon_client::{daemon_status, daemon_stop, ensure_daemon};
 use error::CliError;
 use socket_client::{ResponseStatus, SocketClient};
@@ -105,6 +105,25 @@ async fn run(cli: Cli) -> error::Result<()> {
             }
 
             streaming::handle_spec_dialogue(&mut client, "spec.resume", params, cancelled).await
+        }
+
+        // --- Streaming: pipeline start ---
+        Commands::Pipeline(PipelineCommand::Start {
+            description,
+            mode,
+            max_iterations,
+        }) => {
+            ensure_daemon()?;
+            let mut client = SocketClient::connect().await?;
+            let project = resolve_project(&cli.project)?;
+            let params = serde_json::json!({
+                "project_name": project,
+                "name": description,
+                "goal": description,
+                "mode": mode,
+                "max_iterations": max_iterations,
+            });
+            streaming::handle_pipeline_stream(&mut client, params, cancelled).await
         }
 
         // --- Streaming: log follow ---
@@ -454,6 +473,36 @@ fn build_command(
             }),
         )),
 
+        Commands::Pipeline(PipelineCommand::List) => Ok((
+            "pipeline.list".to_string(),
+            serde_json::json!({ "project_name": project }),
+        )),
+
+        Commands::Pipeline(PipelineCommand::Status { pipeline_id }) => Ok((
+            "pipeline.status".to_string(),
+            serde_json::json!({ "pipeline_run_id": pipeline_id }),
+        )),
+
+        Commands::Pipeline(PipelineCommand::Cancel { pipeline_id }) => Ok((
+            "pipeline.cancel".to_string(),
+            serde_json::json!({ "pipeline_run_id": pipeline_id }),
+        )),
+
+        Commands::Pipeline(PipelineCommand::Log {
+            pipeline_id,
+            stage,
+            iteration,
+        }) => {
+            let mut params = serde_json::json!({ "pipeline_run_id": pipeline_id });
+            if let Some(s) = stage {
+                params["stage_type"] = serde_json::Value::String(s);
+            }
+            if let Some(i) = iteration {
+                params["iteration"] = serde_json::json!(i);
+            }
+            Ok(("pipeline.log".to_string(), params))
+        }
+
         Commands::Tui => {
             // TUI launch is handled separately — not a daemon command
             Err(CliError::Socket("TUI is not yet implemented".to_string()))
@@ -463,6 +512,7 @@ fn build_command(
         Commands::Daemon(_)
         | Commands::Spec(SpecCommand::New { .. })
         | Commands::Spec(SpecCommand::Resume { .. })
+        | Commands::Pipeline(PipelineCommand::Start { .. })
         | Commands::Log { .. } => {
             unreachable!("streaming commands handled before build_command")
         }
@@ -614,5 +664,76 @@ mod tests {
         assert_eq!(params["logs"], true);
         assert_eq!(params["older_than"], "7d");
         assert_eq!(params["dry_run"], true);
+    }
+
+    #[test]
+    fn test_build_command_pipeline_list() {
+        let (cmd, params) = build_command(
+            &Some("proj".to_string()),
+            Commands::Pipeline(cli::PipelineCommand::List),
+        )
+        .unwrap();
+        assert_eq!(cmd, "pipeline.list");
+        assert_eq!(params["project_name"], "proj");
+    }
+
+    #[test]
+    fn test_build_command_pipeline_status() {
+        let (cmd, params) = build_command(
+            &None,
+            Commands::Pipeline(cli::PipelineCommand::Status {
+                pipeline_id: "abc-123".to_string(),
+            }),
+        )
+        .unwrap();
+        assert_eq!(cmd, "pipeline.status");
+        assert_eq!(params["pipeline_run_id"], "abc-123");
+    }
+
+    #[test]
+    fn test_build_command_pipeline_cancel() {
+        let (cmd, params) = build_command(
+            &None,
+            Commands::Pipeline(cli::PipelineCommand::Cancel {
+                pipeline_id: "abc-123".to_string(),
+            }),
+        )
+        .unwrap();
+        assert_eq!(cmd, "pipeline.cancel");
+        assert_eq!(params["pipeline_run_id"], "abc-123");
+    }
+
+    #[test]
+    fn test_build_command_pipeline_log() {
+        let (cmd, params) = build_command(
+            &None,
+            Commands::Pipeline(cli::PipelineCommand::Log {
+                pipeline_id: "abc-123".to_string(),
+                stage: Some("plan".to_string()),
+                iteration: Some(2),
+            }),
+        )
+        .unwrap();
+        assert_eq!(cmd, "pipeline.log");
+        assert_eq!(params["pipeline_run_id"], "abc-123");
+        assert_eq!(params["stage_type"], "plan");
+        assert_eq!(params["iteration"], 2);
+    }
+
+    #[test]
+    fn test_build_command_pipeline_log_no_filters() {
+        let (cmd, params) = build_command(
+            &None,
+            Commands::Pipeline(cli::PipelineCommand::Log {
+                pipeline_id: "abc-123".to_string(),
+                stage: None,
+                iteration: None,
+            }),
+        )
+        .unwrap();
+        assert_eq!(cmd, "pipeline.log");
+        assert_eq!(params["pipeline_run_id"], "abc-123");
+        assert!(params.get("stage_type").is_none());
+        assert!(params.get("iteration").is_none());
     }
 }

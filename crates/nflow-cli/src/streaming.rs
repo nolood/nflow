@@ -49,6 +49,46 @@ pub async fn handle_log_follow(
     Ok(())
 }
 
+/// Handle a streaming pipeline start session (`nflow pipeline start`).
+///
+/// Streams pipeline progress events to stdout. Stops on:
+/// - Pipeline completion (`done: true`)
+/// - Ctrl+C (graceful exit)
+/// - Daemon error
+pub async fn handle_pipeline_stream(
+    client: &mut SocketClient,
+    params: serde_json::Value,
+    cancelled: Arc<AtomicBool>,
+) -> Result<()> {
+    let mut reader = client
+        .send_streaming_command("pipeline.start", params)
+        .await?;
+
+    while let Some(line) = reader.next_line().await? {
+        if cancelled.load(Ordering::Relaxed) {
+            break;
+        }
+
+        if line.status == ResponseStatus::Error {
+            let msg = line
+                .data
+                .get("message")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown error");
+            eprintln!("error: {}", msg);
+            return Err(CliError::Socket(msg.to_string()));
+        }
+
+        crate::format::format_pipeline_event(&line.data);
+
+        if line.done {
+            break;
+        }
+    }
+
+    Ok(())
+}
+
 /// Handle an interactive spec dialogue session.
 ///
 /// The session flow:
