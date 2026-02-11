@@ -54,6 +54,50 @@ pub enum Event {
         iteration: u32,
         line: String,
     },
+    /// A planning question was emitted by the Plan agent.
+    PipelineQuestion {
+        pipeline_run_id: String,
+        question_id: String,
+        question: String,
+        context: Option<String>,
+    },
+    /// A planning question was answered (by user or auto-agent).
+    PipelineQuestionAnswered {
+        pipeline_run_id: String,
+        question_id: String,
+        answer: String,
+        answered_by: String,
+    },
+    /// The plan is ready for user approval (manual mode).
+    PipelinePlanReady {
+        pipeline_run_id: String,
+        project_id: String,
+        plan_summary: String,
+    },
+    /// The plan was approved by the user.
+    PipelinePlanApproved {
+        pipeline_run_id: String,
+    },
+    /// The plan was rejected by the user with feedback.
+    PipelinePlanRejected {
+        pipeline_run_id: String,
+        feedback: String,
+    },
+    /// Final approval is ready (manual mode, after review passes).
+    PipelineFinalApprovalReady {
+        pipeline_run_id: String,
+        project_id: String,
+        summary: String,
+    },
+    /// Final result was approved by the user.
+    PipelineFinalApproved {
+        pipeline_run_id: String,
+    },
+    /// Final result was rejected by the user with feedback.
+    PipelineFinalRejected {
+        pipeline_run_id: String,
+        feedback: String,
+    },
 }
 
 /// A client subscription identified by a unique ID.
@@ -393,6 +437,204 @@ mod tests {
         match received {
             Event::AgentOutput { line, .. } => assert_eq!(line, "via sender"),
             _ => panic!("expected AgentOutput"),
+        }
+    }
+
+    #[test]
+    fn test_event_serialization_pipeline_question() {
+        let event = Event::PipelineQuestion {
+            pipeline_run_id: "pr-1".to_string(),
+            question_id: "q-1".to_string(),
+            question: "Which auth method?".to_string(),
+            context: Some("JWT or session cookies".to_string()),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains(r#""type":"pipeline_question""#));
+        assert!(json.contains(r#""question_id":"q-1""#));
+        assert!(json.contains(r#""question":"Which auth method?""#));
+
+        let deserialized: Event = serde_json::from_str(&json).unwrap();
+        match deserialized {
+            Event::PipelineQuestion {
+                pipeline_run_id,
+                question_id,
+                question,
+                context,
+            } => {
+                assert_eq!(pipeline_run_id, "pr-1");
+                assert_eq!(question_id, "q-1");
+                assert_eq!(question, "Which auth method?");
+                assert_eq!(context, Some("JWT or session cookies".to_string()));
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn test_event_serialization_pipeline_question_no_context() {
+        let event = Event::PipelineQuestion {
+            pipeline_run_id: "pr-1".to_string(),
+            question_id: "q-2".to_string(),
+            question: "What framework?".to_string(),
+            context: None,
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains(r#""context":null"#));
+
+        let deserialized: Event = serde_json::from_str(&json).unwrap();
+        match deserialized {
+            Event::PipelineQuestion { context, .. } => assert_eq!(context, None),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn test_event_serialization_pipeline_question_answered() {
+        let event = Event::PipelineQuestionAnswered {
+            pipeline_run_id: "pr-1".to_string(),
+            question_id: "q-1".to_string(),
+            answer: "Use JWT".to_string(),
+            answered_by: "user".to_string(),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains(r#""type":"pipeline_question_answered""#));
+        assert!(json.contains(r#""answer":"Use JWT""#));
+        assert!(json.contains(r#""answered_by":"user""#));
+
+        let deserialized: Event = serde_json::from_str(&json).unwrap();
+        match deserialized {
+            Event::PipelineQuestionAnswered {
+                answer,
+                answered_by,
+                ..
+            } => {
+                assert_eq!(answer, "Use JWT");
+                assert_eq!(answered_by, "user");
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn test_event_serialization_pipeline_plan_ready() {
+        let event = Event::PipelinePlanReady {
+            pipeline_run_id: "pr-1".to_string(),
+            project_id: "proj-1".to_string(),
+            plan_summary: "Add auth module with 3 files".to_string(),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains(r#""type":"pipeline_plan_ready""#));
+        assert!(json.contains(r#""plan_summary":"Add auth module with 3 files""#));
+
+        let deserialized: Event = serde_json::from_str(&json).unwrap();
+        match deserialized {
+            Event::PipelinePlanReady {
+                plan_summary,
+                project_id,
+                ..
+            } => {
+                assert_eq!(plan_summary, "Add auth module with 3 files");
+                assert_eq!(project_id, "proj-1");
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn test_event_serialization_pipeline_plan_approved() {
+        let event = Event::PipelinePlanApproved {
+            pipeline_run_id: "pr-1".to_string(),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains(r#""type":"pipeline_plan_approved""#));
+        assert!(json.contains(r#""pipeline_run_id":"pr-1""#));
+
+        let deserialized: Event = serde_json::from_str(&json).unwrap();
+        match deserialized {
+            Event::PipelinePlanApproved { pipeline_run_id } => {
+                assert_eq!(pipeline_run_id, "pr-1");
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn test_event_serialization_pipeline_plan_rejected() {
+        let event = Event::PipelinePlanRejected {
+            pipeline_run_id: "pr-1".to_string(),
+            feedback: "Need more error handling".to_string(),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains(r#""type":"pipeline_plan_rejected""#));
+        assert!(json.contains(r#""feedback":"Need more error handling""#));
+
+        let deserialized: Event = serde_json::from_str(&json).unwrap();
+        match deserialized {
+            Event::PipelinePlanRejected { feedback, .. } => {
+                assert_eq!(feedback, "Need more error handling");
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn test_event_serialization_pipeline_final_approval_ready() {
+        let event = Event::PipelineFinalApprovalReady {
+            pipeline_run_id: "pr-1".to_string(),
+            project_id: "proj-1".to_string(),
+            summary: "All changes implemented and reviewed".to_string(),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains(r#""type":"pipeline_final_approval_ready""#));
+        assert!(json.contains(r#""summary":"All changes implemented and reviewed""#));
+
+        let deserialized: Event = serde_json::from_str(&json).unwrap();
+        match deserialized {
+            Event::PipelineFinalApprovalReady {
+                summary,
+                project_id,
+                ..
+            } => {
+                assert_eq!(summary, "All changes implemented and reviewed");
+                assert_eq!(project_id, "proj-1");
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn test_event_serialization_pipeline_final_approved() {
+        let event = Event::PipelineFinalApproved {
+            pipeline_run_id: "pr-1".to_string(),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains(r#""type":"pipeline_final_approved""#));
+
+        let deserialized: Event = serde_json::from_str(&json).unwrap();
+        match deserialized {
+            Event::PipelineFinalApproved { pipeline_run_id } => {
+                assert_eq!(pipeline_run_id, "pr-1");
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn test_event_serialization_pipeline_final_rejected() {
+        let event = Event::PipelineFinalRejected {
+            pipeline_run_id: "pr-1".to_string(),
+            feedback: "Tests are failing".to_string(),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains(r#""type":"pipeline_final_rejected""#));
+        assert!(json.contains(r#""feedback":"Tests are failing""#));
+
+        let deserialized: Event = serde_json::from_str(&json).unwrap();
+        match deserialized {
+            Event::PipelineFinalRejected { feedback, .. } => {
+                assert_eq!(feedback, "Tests are failing");
+            }
+            _ => panic!("wrong variant"),
         }
     }
 

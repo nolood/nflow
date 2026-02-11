@@ -364,6 +364,7 @@ mod tests {
         vars.insert("project_name", "nflow");
         vars.insert("project_path", "/home/user/nflow");
         vars.insert("additional_context", "");
+        vars.insert("spec_file_path", "/home/user/nflow/.nflow/specs/test.md");
         let result = render_template(EMBEDDED_SPEC_SESSION, &vars).unwrap();
         assert!(result.contains("nflow"));
         assert!(result.contains("/home/user/nflow"));
