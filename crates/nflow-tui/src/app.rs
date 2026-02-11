@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::time::Instant;
 
 use crate::error::Result;
@@ -2463,6 +2464,12 @@ pub struct App {
     pub pipeline_new: Option<PipelineNewState>,
     /// Streaming request ID for an active pipeline (if streaming).
     pub pipeline_streaming_request_id: Option<String>,
+    /// Ring buffer for pipeline agent output (capacity 1000).
+    pub pipeline_output_buffer: VecDeque<String>,
+    /// Scroll position for the pipeline output buffer.
+    pub pipeline_output_scroll: usize,
+    /// Whether the output pane auto-scrolls to the bottom.
+    pub pipeline_auto_scroll: bool,
 }
 
 /// Truncate a string to at most `max_chars` characters, appending "..." if truncated.
@@ -2514,6 +2521,9 @@ impl App {
             pipeline_detail: None,
             pipeline_new: None,
             pipeline_streaming_request_id: None,
+            pipeline_output_buffer: VecDeque::with_capacity(1000),
+            pipeline_output_scroll: 0,
+            pipeline_auto_scroll: true,
         }
     }
 
@@ -2614,6 +2624,9 @@ impl App {
         self.pipeline_detail = None;
         self.pipeline_new = None;
         self.pipeline_streaming_request_id = None;
+        self.pipeline_output_buffer.clear();
+        self.pipeline_output_scroll = 0;
+        self.pipeline_auto_scroll = true;
         self.current_wave = None;
         self.active_agent_count = 0;
         // Close overlay

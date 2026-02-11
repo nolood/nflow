@@ -1449,6 +1449,11 @@ async fn handle_daemon_event(
                         let iteration = event.get("iteration").and_then(|v| v.as_u64()).unwrap_or(1) as u32;
                         if let Some(line) = event.get("line").and_then(|v| v.as_str()) {
                             detail.append_stage_output(stage_type, iteration, line.to_string());
+                            // Push to ring buffer (cap at 1000)
+                            if app.pipeline_output_buffer.len() >= 1000 {
+                                app.pipeline_output_buffer.pop_front();
+                            }
+                            app.pipeline_output_buffer.push_back(line.to_string());
                         }
                     }
                 }
@@ -1771,6 +1776,10 @@ async fn handle_pipeline_view_detail(app: &mut App, client: &mut SocketClient, i
                     }
 
                     app.pipeline_detail = Some(detail);
+                    // Clear output buffer when switching pipeline runs
+                    app.pipeline_output_buffer.clear();
+                    app.pipeline_output_scroll = 0;
+                    app.pipeline_auto_scroll = true;
                 }
             }
         }
@@ -1895,6 +1904,10 @@ async fn poll_pipeline_streaming_data(app: &mut App, client: &mut SocketClient) 
                     let mut detail = PipelineDetailState::new(run_item);
                     detail.is_streaming = true;
                     app.pipeline_detail = Some(detail);
+                    // Clear output buffer for new streaming pipeline
+                    app.pipeline_output_buffer.clear();
+                    app.pipeline_output_scroll = 0;
+                    app.pipeline_auto_scroll = true;
                 }
             }
 
@@ -1909,6 +1922,11 @@ async fn poll_pipeline_streaming_data(app: &mut App, client: &mut SocketClient) 
                             if let Some((stage_type, iteration)) = detail.current_streaming_stage.clone() {
                                 detail.append_stage_output(&stage_type, iteration, text.to_string());
                             }
+                            // Push to ring buffer
+                            if app.pipeline_output_buffer.len() >= 1000 {
+                                app.pipeline_output_buffer.pop_front();
+                            }
+                            app.pipeline_output_buffer.push_back(text.to_string());
                         }
                     }
                     Some("stage_start") => {

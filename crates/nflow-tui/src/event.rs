@@ -976,12 +976,26 @@ fn handle_pipeline_detail_key(app: &mut App, key: KeyEvent) -> ViewAction {
             if let Some(detail) = &mut app.pipeline_detail {
                 detail.scroll_down();
             }
+            // Also scroll the live output buffer down
+            let max_scroll = app.pipeline_output_buffer.len().saturating_sub(1);
+            if app.pipeline_output_scroll < max_scroll {
+                app.pipeline_output_scroll += 1;
+            }
+            // Re-enable auto-scroll when at the bottom
+            if app.pipeline_output_scroll >= max_scroll {
+                app.pipeline_auto_scroll = true;
+            }
             ViewAction::None
         }
         KeyCode::Up | KeyCode::Char('k') => {
             if let Some(detail) = &mut app.pipeline_detail {
                 detail.scroll_up();
             }
+            // Scroll live output buffer up and disable auto-scroll
+            if app.pipeline_output_scroll > 0 {
+                app.pipeline_output_scroll -= 1;
+            }
+            app.pipeline_auto_scroll = false;
             ViewAction::None
         }
         // Page down (Ctrl+d)
@@ -992,6 +1006,11 @@ fn handle_pipeline_detail_key(app: &mut App, key: KeyEvent) -> ViewAction {
                     detail.scroll_down();
                 }
             }
+            let max_scroll = app.pipeline_output_buffer.len().saturating_sub(1);
+            app.pipeline_output_scroll = (app.pipeline_output_scroll + 20).min(max_scroll);
+            if app.pipeline_output_scroll >= max_scroll {
+                app.pipeline_auto_scroll = true;
+            }
             ViewAction::None
         }
         // Page up (Ctrl+u)
@@ -1001,6 +1020,8 @@ fn handle_pipeline_detail_key(app: &mut App, key: KeyEvent) -> ViewAction {
                     detail.scroll_up();
                 }
             }
+            app.pipeline_output_scroll = app.pipeline_output_scroll.saturating_sub(20);
+            app.pipeline_auto_scroll = false;
             ViewAction::None
         }
         // Jump to bottom (G)
@@ -1008,6 +1029,8 @@ fn handle_pipeline_detail_key(app: &mut App, key: KeyEvent) -> ViewAction {
             if let Some(detail) = &mut app.pipeline_detail {
                 detail.scroll_offset = u16::MAX; // Will be clamped in render
             }
+            app.pipeline_output_scroll = app.pipeline_output_buffer.len().saturating_sub(1);
+            app.pipeline_auto_scroll = true;
             ViewAction::None
         }
         // Jump to top (g)
@@ -1015,6 +1038,8 @@ fn handle_pipeline_detail_key(app: &mut App, key: KeyEvent) -> ViewAction {
             if let Some(detail) = &mut app.pipeline_detail {
                 detail.scroll_offset = 0;
             }
+            app.pipeline_output_scroll = 0;
+            app.pipeline_auto_scroll = false;
             ViewAction::None
         }
         _ => ViewAction::None,

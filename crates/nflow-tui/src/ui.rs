@@ -1649,6 +1649,18 @@ fn pipeline_status_icon(status: &str) -> (&str, Color) {
     }
 }
 
+/// Get a stage status indicator: spinner for running, checkmark for completed, X for failed.
+fn pipeline_stage_icon(status: &str) -> String {
+    match status {
+        "running" => format!("{}", spinner_char()),
+        "completed" => "\u{2713}".to_string(),
+        "failed" => "\u{2717}".to_string(),
+        "pending" => "\u{25CB}".to_string(),
+        "cancelled" => "\u{2298}".to_string(),
+        _ => " ".to_string(),
+    }
+}
+
 /// Render the pipeline detail view (stages + output).
 fn render_pipeline_detail(app: &App, frame: &mut Frame, area: Rect) {
     let detail = match &app.pipeline_detail {
@@ -1656,13 +1668,19 @@ fn render_pipeline_detail(app: &App, frame: &mut Frame, area: Rect) {
         None => return,
     };
 
-    // Horizontal split: left = stages list, right = output
+    // Horizontal split: left = stages + live output, right = stage output
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(30), Constraint::Percentage(70)])
         .split(area);
 
-    // Left pane: stages
+    // Left pane: vertical split — stages on top, live output on bottom
+    let left_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
+        .split(chunks[0]);
+
+    // Left top: stages
     let stages_title = if detail.is_streaming {
         format!(" {} \u{2014} Stages [STREAMING...] ", detail.run.name)
     } else {
@@ -1683,8 +1701,9 @@ fn render_pipeline_detail(app: &App, frame: &mut Frame, area: Rect) {
         .iter()
         .enumerate()
         .map(|(i, stage)| {
-            let (icon, status_color) = pipeline_status_icon(&stage.status);
+            let icon = pipeline_stage_icon(&stage.status);
             let label = format!("{} {} (iter {})", icon, stage.stage_type, stage.iteration);
+            let (_, status_color) = pipeline_status_icon(&stage.status);
             let style = if i == detail.selected_stage {
                 Style::default().bg(Color::DarkGray).fg(Color::White)
             } else {
@@ -1696,9 +1715,48 @@ fn render_pipeline_detail(app: &App, frame: &mut Frame, area: Rect) {
 
     let stages_table = Table::new(stage_rows, [Constraint::Percentage(100)]).block(stages_block);
 
-    frame.render_widget(stages_table, chunks[0]);
+    frame.render_widget(stages_table, left_chunks[0]);
 
-    // Right pane: output
+    // Left bottom: live output buffer (ring buffer)
+    let live_title = if app.pipeline_auto_scroll {
+        " Live Output [AUTO] "
+    } else {
+        " Live Output "
+    };
+    let live_border_color = if detail.is_streaming {
+        Color::Yellow
+    } else {
+        Color::Blue
+    };
+    let live_block = Block::default()
+        .title(live_title)
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(live_border_color));
+
+    let buffer_lines: Vec<Line> = app
+        .pipeline_output_buffer
+        .iter()
+        .map(|l| Line::from(l.as_str().to_owned()))
+        .collect();
+
+    let total_lines = buffer_lines.len();
+    let inner_height = live_block.inner(left_chunks[1]).height as usize;
+
+    // Auto-scroll: clamp scroll to show the bottom
+    let live_scroll = if app.pipeline_auto_scroll {
+        total_lines.saturating_sub(inner_height) as u16
+    } else {
+        app.pipeline_output_scroll as u16
+    };
+
+    let live_output = Paragraph::new(buffer_lines)
+        .block(live_block)
+        .wrap(Wrap { trim: false })
+        .scroll((live_scroll, 0));
+
+    frame.render_widget(live_output, left_chunks[1]);
+
+    // Right pane: per-stage output
     let output_title = if detail.is_streaming {
         " Output [STREAMING...] "
     } else {

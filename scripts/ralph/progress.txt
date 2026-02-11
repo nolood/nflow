@@ -20,6 +20,8 @@ Started: Wed Feb 11 06:57:15 PM MSK 2026
 - `run_pipeline_stage()` returns a 3-tuple: `(StageOutput, Option<String>, String)` — the third element is raw result_text for question detection
 - For Plan stages, `run_pipeline_stage` strips PIPELINE_QUESTIONS from text before parsing plan JSON to avoid picking up questions as plan output
 - Question routing: Auto mode spawns parallel auto-answerer tasks (tokio::spawn), Manual mode polls DB every 500ms until all questions answered
+- TUI ring buffers: pipeline_output_buffer is on App (not detail state) — survives detail state recreation when opening pipeline detail views
+- `pipeline_stage_icon()` in ui.rs returns dynamic spinner for running stages via `spinner_char()`, static icons for other states
 
 ---
 
@@ -133,4 +135,40 @@ Started: Wed Feb 11 06:57:15 PM MSK 2026
   - `run_pipeline_stage()` now returns a 3-tuple with raw result_text — all callers must destructure the third element (use `_` prefix if unused)
   - For parallel async tasks within an async block, use `tokio::spawn` + clone all necessary data into the moved closure
   - Manual mode question waiting uses DB polling (500ms interval) — simple and robust, avoids additional signal channel complexity
+---
+
+## 2026-02-11 - US-012
+- Updated `prompts/pipeline_implement.md` with mandatory build/test verification section
+- Added 4-step workflow: detect build system, run build, run tests, report results
+- Added `build_result` and `test_result` fields to the JSON output schema in the prompt
+- Added `ImplementBuildResult` struct to `nflow-core/src/pipeline.rs`: `{ success: bool, output: String }`
+- Added `ImplementTestResult` struct: `{ success: bool, output: String, tests_passed: Option<u32>, tests_failed: Option<u32> }`
+- Updated `ImplementOutput` struct with optional `build_result` and `test_result` fields (both `skip_serializing_if = "Option::is_none"`)
+- All 298 nflow-core tests pass, `cargo build --workspace` succeeds, `cargo clippy --workspace --all-targets` passes (no new warnings)
+- Files changed: prompts/pipeline_implement.md, crates/nflow-core/src/pipeline.rs, scripts/ralph/prd.json
+- **Learnings for future iterations:**
+  - `ImplementBuildResult` and `ImplementTestResult` are separate structs — nested in `ImplementOutput` as optional fields for backward compatibility
+  - The prompt uses `build_result` and `test_result` field names matching the Rust struct field names for consistent JSON deserialization
+  - Existing `tests_passed: Option<bool>` on `ImplementOutput` is kept for backward compatibility — the new `test_result` struct provides more detailed info
+---
+
+## 2026-02-11 - US-013
+- Implemented real-time agent output streaming in TUI pipeline detail view
+- Added `pipeline_output_buffer: VecDeque<String>` (capacity 1000), `pipeline_output_scroll: usize`, and `pipeline_auto_scroll: bool` fields to `App` struct
+- Updated `pipeline_agent_output` event handler and streaming text handler to push lines to the ring buffer (cap at 1000 via pop_front)
+- Restructured `render_pipeline_detail` layout: left pane now has vertical split — stages on top (40%), live output on bottom (60%), stage-specific output on right (70%)
+- Added `pipeline_stage_icon()` function: spinner_char() for running, checkmark for completed, X for failed, circle for pending
+- Live output pane auto-scrolls to bottom when `pipeline_auto_scroll` is true; title shows "[AUTO]" indicator
+- k/arrow-up scrolls up and disables auto_scroll; j/arrow-down scrolls down; reaching bottom re-enables auto_scroll
+- G jumps to bottom (re-enables auto), g jumps to top (disables auto); Ctrl+d/Ctrl+u page down/up also manage auto_scroll
+- Output buffer cleared when opening a different pipeline detail (both manual navigation and streaming creation)
+- Buffer also cleared on project switch
+- Files changed: crates/nflow-tui/src/app.rs, crates/nflow-tui/src/ui.rs, crates/nflow-tui/src/event.rs, crates/nflow-tui/src/main.rs, scripts/ralph/prd.json
+- All tests pass: 558 daemon, 782 non-daemon
+- `cargo build --workspace` succeeds, `cargo clippy --workspace --all-targets` passes (no new warnings)
+- **Learnings for future iterations:**
+  - `pipeline_output_buffer` is on `App` (not `PipelineDetailState`) so it persists across detail state recreation
+  - `pipeline_stage_icon()` returns a `String` (not `&str`) because spinner_char() returns a dynamic char
+  - The live output pane uses the ring buffer directly; the right pane uses the per-stage `stage_outputs` HashMap — they're complementary views
+  - Auto-scroll is managed both in the render function (compute scroll offset) and in key handlers (enable/disable flag)
 ---
