@@ -1101,7 +1101,10 @@ fn handle_pipeline_question_overlay_key(app: &mut App, key: KeyEvent) -> ViewAct
         KeyCode::Enter => {
             // Extract answer and question data before modifying app state
             let (answer, question_data) = {
-                let overlay = app.pipeline_question_overlay.as_ref().unwrap();
+                let overlay = match app.pipeline_question_overlay.as_ref() {
+                    Some(o) => o,
+                    None => return ViewAction::None,
+                };
                 let answer = overlay.answer_input.trim().to_string();
                 let question_data = overlay.current_question().cloned();
                 (answer, question_data)
@@ -1177,12 +1180,22 @@ fn handle_pipeline_approval_overlay_key(app: &mut App, key: KeyEvent) -> ViewAct
             KeyCode::Enter => {
                 // Submit rejection with feedback
                 let (run_id, feedback) = {
-                    let overlay = app.pipeline_approval_overlay.as_ref().unwrap();
+                    let overlay = match app.pipeline_approval_overlay.as_ref() {
+                        Some(o) => o,
+                        None => return ViewAction::None,
+                    };
                     (
                         overlay.pipeline_run_id.clone(),
                         overlay.feedback_input.trim().to_string(),
                     )
                 };
+
+                // Validate that feedback is not empty
+                if feedback.is_empty() {
+                    app.status_message = "Rejection feedback cannot be empty".to_string();
+                    return ViewAction::None;
+                }
+
                 app.close_pipeline_approval_overlay();
                 ViewAction::PipelineReject {
                     pipeline_run_id: run_id,
@@ -1211,12 +1224,10 @@ fn handle_pipeline_approval_overlay_key(app: &mut App, key: KeyEvent) -> ViewAct
             }
             KeyCode::Char('a') => {
                 // Approve
-                let run_id = app
-                    .pipeline_approval_overlay
-                    .as_ref()
-                    .unwrap()
-                    .pipeline_run_id
-                    .clone();
+                let run_id = match app.pipeline_approval_overlay.as_ref() {
+                    Some(overlay) => overlay.pipeline_run_id.clone(),
+                    None => return ViewAction::None,
+                };
                 app.close_pipeline_approval_overlay();
                 ViewAction::PipelineApprove {
                     pipeline_run_id: run_id,

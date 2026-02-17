@@ -264,12 +264,22 @@ pub async fn handle_pipeline_stream(
 /// 4. If a question was pending and session not completed, prompt user for input
 /// 5. Send the answer via `spec.answer` and start a new stream
 /// 6. Repeat until session completes or user sends Ctrl+D
+///
+/// In non-interactive mode (or when stdin is not a TTY), questions are stored
+/// in the daemon and the user is directed to `nflow spec questions`.
 pub async fn handle_spec_dialogue(
     client: &mut SocketClient,
     command: &str,
     params: serde_json::Value,
     cancelled: Arc<AtomicBool>,
+    non_interactive: bool,
 ) -> Result<()> {
+    let interactive = !non_interactive && stdin_is_tty();
+    let spec_name_hint = params
+        .get("spec_name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("<name>")
+        .to_string();
     let mut reader = client.send_streaming_command(command, params).await?;
 
     loop {
@@ -337,6 +347,15 @@ pub async fn handle_spec_dialogue(
         }
 
         if let Some(question) = pending_question {
+            if !interactive {
+                // Non-interactive mode: questions stored in daemon, print hint and exit
+                println!(
+                    "\nSpec session paused with pending questions.\nView with: nflow spec questions {}",
+                    spec_name_hint
+                );
+                break;
+            }
+
             // Display the question
             let question_text = question.get("text").and_then(|v| v.as_str()).unwrap_or("");
             if !question_text.is_empty() {

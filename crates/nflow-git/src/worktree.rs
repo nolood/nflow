@@ -52,18 +52,35 @@ pub(crate) async fn run_git_command(repo_path: &Path, args: &[&str]) -> Result<S
     }
 }
 
-/// Creates a git worktree at `worktree_path` based on `base_branch`.
+/// Creates a git worktree at `worktree_path` with a new branch based on `base_branch`.
 ///
-/// Runs `git fetch origin {base_branch}` then
-/// `git worktree add {worktree_path} origin/{base_branch}`.
+/// If `new_branch` is provided, creates the worktree with `-b new_branch` so
+/// a fresh branch is created (avoids "already checked out" errors).
+///
+/// Attempts `git fetch origin {base_branch}` first. If fetch succeeds, uses
+/// `origin/{base_branch}` as the start point. If fetch fails (e.g., no remote),
+/// falls back to the local `base_branch`.
 ///
 /// Returns an error if:
 /// - `worktree_path` already exists
 /// - `repo_path` is not a git repository
-/// - Either git command fails
+/// - The worktree creation command fails
 pub async fn create_worktree(
     repo_path: &Path,
     worktree_path: &Path,
+    base_branch: &str,
+) -> Result<()> {
+    create_worktree_with_branch(repo_path, worktree_path, None, base_branch).await
+}
+
+/// Creates a git worktree at `worktree_path`, optionally creating a new branch.
+///
+/// When `new_branch` is `Some(name)`, runs `git worktree add -b name path start_point`.
+/// When `new_branch` is `None`, runs `git worktree add path start_point` (legacy behavior).
+pub async fn create_worktree_with_branch(
+    repo_path: &Path,
+    worktree_path: &Path,
+    new_branch: Option<&str>,
     base_branch: &str,
 ) -> Result<()> {
     // Validate repo_path is a git repository
@@ -76,16 +93,32 @@ pub async fn create_worktree(
         ));
     }
 
-    // Fetch the base branch from origin
-    run_git_command(repo_path, &["fetch", "origin", base_branch]).await?;
-
-    // Create the worktree
+    // Convert worktree path to string first
     let worktree_str = worktree_path
         .to_str()
         .ok_or_else(|| GitError::CommandFailed("Invalid worktree path encoding".to_string()))?;
 
-    let remote_ref = format!("origin/{base_branch}");
-    run_git_command(repo_path, &["worktree", "add", worktree_str, &remote_ref]).await?;
+    // Try to fetch from origin. If it succeeds, use origin/{base_branch}.
+    // If it fails (no remote), fall back to the local branch.
+    let fetch_ok = run_git_command(repo_path, &["fetch", "origin", base_branch]).await.is_ok();
+
+    let start_point = if fetch_ok {
+        format!("origin/{base_branch}")
+    } else {
+        base_branch.to_string()
+    };
+
+    let mut args = vec!["worktree", "add"];
+    let branch_flag;
+    if let Some(branch) = new_branch {
+        branch_flag = branch.to_string();
+        args.push("-b");
+        args.push(&branch_flag);
+    }
+    args.push(worktree_str);
+    args.push(&start_point);
+
+    run_git_command(repo_path, &args).await?;
 
     Ok(())
 }

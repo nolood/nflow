@@ -717,20 +717,13 @@ async fn execute_complete_story(
         return;
     }
 
-    // 5. Create the named branch from the current (detached) HEAD.
-    //    Worktrees are created in detached HEAD state via `git worktree add path origin/main`,
-    //    so we must create a local branch before pushing.
-    info!(
-        "complete_story: creating branch {} for story {}",
-        branch_name, story.short_id
-    );
+    // 5. Ensure branch exists. The branch is typically created during worktree setup,
+    //    but create it here as a fallback if worktree was created in detached HEAD mode.
     if let Err(e) = nflow_git::branch::create_branch(&worktree_path, &branch_name).await {
-        warn!(
-            "complete_story: branch creation failed for story {}: {}",
-            story_id, e
+        info!(
+            "complete_story: branch '{}' already exists or creation skipped for story {}: {}",
+            branch_name, story.short_id, e
         );
-        fail_story_on_completion_error(conn, story_id, &story, event_bus);
-        return;
     }
 
     // 6. Push the branch
@@ -738,11 +731,16 @@ async fn execute_complete_story(
         "complete_story: pushing branch {} for story {}",
         branch_name, story.short_id
     );
-    if let Err(e) = nflow_git::branch::push_branch(&worktree_path, &branch_name).await {
-        warn!("complete_story: push failed for story {}: {}", story_id, e);
-        fail_story_on_completion_error(conn, story_id, &story, event_bus);
-        return;
-    }
+    let push_ok = match nflow_git::branch::push_branch(&worktree_path, &branch_name).await {
+        Ok(()) => true,
+        Err(e) => {
+            warn!(
+                "complete_story: push failed for story {} (non-fatal): {}",
+                story_id, e
+            );
+            false
+        }
+    };
 
     // 7. Load tasks and render MR body from template
     let tasks = match db::work_items::list_work_items_by_parent(conn, story_id) {
@@ -775,48 +773,55 @@ async fn execute_complete_story(
         })
     };
 
-    // 8. Create MR/PR based on git provider
-    info!(
-        "complete_story: creating MR for story {} via {:?}",
-        story.short_id, project.git_provider
-    );
-    let mr_result = match project.git_provider {
-        nflow_core::project::GitProvider::Github => {
-            nflow_git::mr::create_github_pr(
-                &worktree_path,
-                &mr_title,
-                &mr_body,
-                &project.base_branch,
-            )
-            .await
-        }
-        nflow_core::project::GitProvider::Gitlab => {
-            nflow_git::mr::create_gitlab_mr(
-                &worktree_path,
-                &mr_title,
-                &mr_body,
-                &project.base_branch,
-            )
-            .await
-        }
-    };
+    // 8. Create MR/PR based on git provider (only if push succeeded)
+    let mr_url = if push_ok {
+        info!(
+            "complete_story: creating MR for story {} via {:?}",
+            story.short_id, project.git_provider
+        );
+        let mr_result = match project.git_provider {
+            nflow_core::project::GitProvider::Github => {
+                nflow_git::mr::create_github_pr(
+                    &worktree_path,
+                    &mr_title,
+                    &mr_body,
+                    &project.base_branch,
+                )
+                .await
+            }
+            nflow_core::project::GitProvider::Gitlab => {
+                nflow_git::mr::create_gitlab_mr(
+                    &worktree_path,
+                    &mr_title,
+                    &mr_body,
+                    &project.base_branch,
+                )
+                .await
+            }
+        };
 
-    let mr_url = match mr_result {
-        Ok(url) => {
-            info!(
-                "complete_story: MR created for story {}: {}",
-                story.short_id, url
-            );
-            Some(url)
+        match mr_result {
+            Ok(url) => {
+                info!(
+                    "complete_story: MR created for story {}: {}",
+                    story.short_id, url
+                );
+                Some(url)
+            }
+            Err(e) => {
+                warn!(
+                    "complete_story: MR creation failed for story {} (non-fatal): {}",
+                    story_id, e
+                );
+                None
+            }
         }
-        Err(e) => {
-            warn!(
-                "complete_story: MR creation failed for story {}: {}",
-                story_id, e
-            );
-            fail_story_on_completion_error(conn, story_id, &story, event_bus);
-            return;
-        }
+    } else {
+        warn!(
+            "complete_story: skipping MR creation for story {} due to push failure",
+            story.short_id
+        );
+        None
     };
 
     // 9. Store mr_url in DB
@@ -1421,7 +1426,7 @@ async fn execute_start_story(
     );
 
     if let Err(e) =
-        nflow_git::worktree::create_worktree(repo_path, &worktree_path, &project.base_branch).await
+        nflow_git::worktree::create_worktree_with_branch(repo_path, &worktree_path, Some(&branch_name), &project.base_branch).await
     {
         warn!(
             "execute: worktree creation failed for story {}: {}",

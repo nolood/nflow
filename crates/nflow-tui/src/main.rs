@@ -118,6 +118,22 @@ async fn run(args: Args) -> error::Result<()> {
     // Subscribe to daemon events for real-time updates
     app.subscribe_events(&mut client).await.ok();
 
+    // Install panic hook to restore terminal on panic
+    // This must be done BEFORE enabling raw mode to ensure terminal cleanup
+    let original_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |panic_info| {
+        // Best-effort terminal restoration (ignore errors, we're panicking anyway)
+        let _ = crossterm::terminal::disable_raw_mode();
+        let _ = crossterm::execute!(
+            std::io::stderr(),
+            crossterm::terminal::LeaveAlternateScreen,
+            crossterm::event::DisableMouseCapture
+        );
+        let _ = crossterm::execute!(std::io::stderr(), crossterm::cursor::Show);
+        // Call original panic hook to print panic info
+        original_hook(panic_info);
+    }));
+
     // Set up terminal
     let mut tui = terminal::setup()?;
 
@@ -428,12 +444,6 @@ async fn poll_streaming_data(app: &mut App, client: &mut SocketClient) {
 
     match client.try_read_streaming_line(poll_timeout).await {
         Ok(Some(line)) => {
-            // Check if this is a daemon event rather than dialogue data
-            if line.event.is_some() {
-                handle_daemon_event(app, client, &line).await;
-                return;
-            }
-
             let dialogue = match &mut app.spec_dialogue {
                 Some(d) => d,
                 None => return,
@@ -1073,12 +1083,6 @@ async fn poll_execute_streaming_data(app: &mut App, client: &mut SocketClient) {
 
     match client.try_read_streaming_line(poll_timeout).await {
         Ok(Some(line)) => {
-            // Check if this is a daemon event (from subscription) rather than streaming data
-            if line.event.is_some() {
-                handle_daemon_event(app, client, &line).await;
-                return;
-            }
-
             if line.status == ResponseStatus::Error {
                 let msg = line
                     .data
@@ -1177,12 +1181,6 @@ async fn poll_logs_streaming_data(app: &mut App, client: &mut SocketClient) {
 
     match client.try_read_streaming_line(poll_timeout).await {
         Ok(Some(line)) => {
-            // Check if this is a daemon event (from subscription) rather than streaming data
-            if line.event.is_some() {
-                handle_daemon_event(app, client, &line).await;
-                return;
-            }
-
             if line.status == ResponseStatus::Error {
                 let msg = line
                     .data
@@ -1220,12 +1218,6 @@ async fn poll_decomposition_streaming_data(app: &mut App, client: &mut SocketCli
 
     match client.try_read_streaming_line(poll_timeout).await {
         Ok(Some(line)) => {
-            // Check if this is a daemon event (from subscription) rather than streaming data
-            if line.event.is_some() {
-                handle_daemon_event(app, client, &line).await;
-                return;
-            }
-
             if line.status == ResponseStatus::Error {
                 let msg = line
                     .data
@@ -1296,10 +1288,7 @@ async fn poll_daemon_events(app: &mut App, client: &mut SocketClient) {
     let poll_timeout = std::time::Duration::from_millis(10);
 
     match client.try_read_streaming_line(poll_timeout).await {
-        Ok(Some(line)) => {
-            if line.event.is_some() {
-                handle_daemon_event(app, client, &line).await;
-            }
+        Ok(Some(_line)) => {
             // Non-event lines while not streaming are unexpected; ignore them.
         }
         Ok(None) => {
@@ -1312,292 +1301,6 @@ async fn poll_daemon_events(app: &mut App, client: &mut SocketClient) {
     }
 }
 
-/// Handle a daemon event received via the event subscription.
-async fn handle_daemon_event(
-    app: &mut App,
-    client: &mut SocketClient,
-    line: &socket_client::StreamingResponseLine,
-) {
-    let event = match &line.event {
-        Some(e) => e,
-        None => return,
-    };
-
-    let event_type = event.get("type").and_then(|v| v.as_str()).unwrap_or("");
-
-    match event_type {
-        "status_change" => {
-            let new_status = event
-                .get("new_status")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let item_type = event
-                .get("item_type")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-
-            app.apply_status_change("", new_status, item_type);
-
-            // Refresh the execute tree to pick up the status change
-            app.fetch_execute(client).await.ok();
-        }
-        "agent_output" => {
-            let task_id = event.get("task_id").and_then(|v| v.as_str()).unwrap_or("");
-            let output_line = event.get("line").and_then(|v| v.as_str()).unwrap_or("");
-
-            app.apply_agent_output(task_id, output_line);
-        }
-        "story_completed" => {
-            let story_id = event.get("story_id").and_then(|v| v.as_str()).unwrap_or("");
-            let mr_url = event.get("mr_url").and_then(|v| v.as_str());
-
-            app.apply_story_completed(story_id, mr_url);
-
-            // Refresh the execute tree to pick up completion status
-            app.fetch_execute(client).await.ok();
-        }
-        "decomposition_completed" => {
-            app.decomposition_output.stop_streaming();
-            app.viewing_decomposition_output = false;
-            app.fetch_plan(client).await.ok();
-            let summary = app.count_plan_items();
-            app.decomposition_phase = DecompositionPhase::Completed(summary);
-            app.completion_shown_at = Some(Instant::now());
-            app.decomposition_last_event_at = None;
-            app.status_message = "Plan generation complete".to_string();
-            app.fetch_execute(client).await.ok();
-        }
-        "pipeline_stage_change" => {
-            if let Some(run_id) = event.get("pipeline_run_id").and_then(|v| v.as_str()) {
-                let stage_type = event
-                    .get("stage_type")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                let iteration =
-                    event.get("iteration").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-                let new_status = event
-                    .get("new_status")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-
-                // Update list view
-                if let Some(item) = app.pipeline_list.runs.iter_mut().find(|r| r.id == run_id) {
-                    item.current_stage = Some(stage_type.to_string());
-                    item.iteration = iteration;
-                    if new_status == "running" {
-                        item.status = "running".to_string();
-                    }
-                }
-
-                // Update detail view if open
-                if let Some(detail) = &mut app.pipeline_detail {
-                    if run_id == detail.run.id {
-                        // Update run metadata
-                        detail.run.current_stage = Some(stage_type.to_string());
-                        detail.run.iteration = iteration;
-
-                        // Update existing stage or add new one
-                        let stage_exists = detail.stages.iter_mut().find(|s|
-                            s.stage_type == stage_type && s.iteration == iteration
-                        );
-                        if let Some(existing) = stage_exists {
-                            existing.status = new_status.to_string();
-                        } else {
-                            detail.stages.push(PipelineStageItem {
-                                stage_type: stage_type.to_string(),
-                                iteration,
-                                status: new_status.to_string(),
-                            });
-                        }
-                        detail.append_stage_output(
-                            stage_type,
-                            iteration,
-                            format!("--- {} (iter {}) -> {} ---", stage_type, iteration, new_status)
-                        );
-                    }
-                }
-            }
-        }
-        "pipeline_completed" => {
-            if let Some(run_id) = event.get("pipeline_run_id").and_then(|v| v.as_str()) {
-                let final_status = event
-                    .get("status")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("completed");
-
-                // Update list view
-                if let Some(item) = app.pipeline_list.runs.iter_mut().find(|r| r.id == run_id) {
-                    item.status = final_status.to_string();
-                }
-
-                // Update detail view if open
-                if let Some(detail) = &mut app.pipeline_detail {
-                    if run_id == detail.run.id {
-                        detail.run.status = final_status.to_string();
-                        detail.is_streaming = false;
-                        // Append completion message to the last stage
-                        if let Some(last_stage) = detail.stages.last().cloned() {
-                            detail.append_stage_output(
-                                &last_stage.stage_type,
-                                last_stage.iteration,
-                                format!("\n=== Pipeline {} ===\n", final_status)
-                            );
-                        }
-                    }
-                }
-            }
-
-            app.status_message = "Pipeline completed".to_string();
-            fetch_pipeline_list(app, client).await;
-        }
-        "pipeline_agent_output" => {
-            if let Some(detail) = &mut app.pipeline_detail {
-                if let Some(run_id) = event.get("pipeline_run_id").and_then(|v| v.as_str()) {
-                    if run_id == detail.run.id {
-                        let stage_type = event.get("stage_type").and_then(|v| v.as_str()).unwrap_or("unknown");
-                        let iteration = event.get("iteration").and_then(|v| v.as_u64()).unwrap_or(1) as u32;
-                        if let Some(line) = event.get("line").and_then(|v| v.as_str()) {
-                            detail.append_stage_output(stage_type, iteration, line.to_string());
-                            // Push to ring buffer (cap at 1000)
-                            if app.pipeline_output_buffer.len() >= 1000 {
-                                app.pipeline_output_buffer.pop_front();
-                            }
-                            app.pipeline_output_buffer.push_back(line.to_string());
-                        }
-                    }
-                }
-            }
-        }
-        "pipeline_question" => {
-            if let Some(run_id) = event.get("pipeline_run_id").and_then(|v| v.as_str()) {
-                let question_id = event.get("question_id").and_then(|v| v.as_str()).unwrap_or("");
-                let question = event.get("question").and_then(|v| v.as_str()).unwrap_or("");
-                let context = event.get("context").and_then(|v| v.as_str()).map(|s| s.to_string());
-
-                if !question_id.is_empty() && !question.is_empty() {
-                    let pending = crate::app::PendingQuestion {
-                        question_id: question_id.to_string(),
-                        pipeline_run_id: run_id.to_string(),
-                        question: question.to_string(),
-                        context,
-                    };
-
-                    // Add to pending questions list (avoid duplicates)
-                    if !app.pipeline_pending_questions.iter().any(|q| q.question_id == question_id) {
-                        app.pipeline_pending_questions.push(pending);
-                    }
-
-                    // Auto-open question overlay if we're viewing this pipeline's detail in manual mode
-                    if app.pipeline_detail.is_some() && !app.in_pipeline_question_overlay() {
-                        app.open_pipeline_question_overlay();
-                    }
-                }
-            }
-        }
-        "pipeline_question_answered" => {
-            if let Some(question_id) = event.get("question_id").and_then(|v| v.as_str()) {
-                app.remove_pending_question(question_id);
-            }
-        }
-        "pipeline_plan_ready" => {
-            if let Some(run_id) = event.get("pipeline_run_id").and_then(|v| v.as_str()) {
-                let summary = event
-                    .get("plan_summary")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("Plan is ready for review.")
-                    .to_string();
-
-                // Update pipeline status in list and detail views
-                if let Some(item) = app.pipeline_list.runs.iter_mut().find(|r| r.id == run_id) {
-                    item.status = "waiting_for_approval".to_string();
-                }
-                if let Some(detail) = &mut app.pipeline_detail {
-                    if detail.run.id == run_id {
-                        detail.run.status = "waiting_for_approval".to_string();
-                    }
-                }
-
-                // Auto-open approval overlay if viewing this pipeline
-                if app.pipeline_detail.as_ref().map_or(false, |d| d.run.id == run_id) {
-                    app.open_pipeline_approval_overlay(
-                        run_id.to_string(),
-                        crate::app::ApprovalKind::Plan,
-                        summary,
-                    );
-                }
-            }
-        }
-        "pipeline_final_approval_ready" => {
-            if let Some(run_id) = event.get("pipeline_run_id").and_then(|v| v.as_str()) {
-                let summary = event
-                    .get("summary")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("All stages completed. Review the results.")
-                    .to_string();
-
-                // Update pipeline status in list and detail views
-                if let Some(item) = app.pipeline_list.runs.iter_mut().find(|r| r.id == run_id) {
-                    item.status = "waiting_for_final_approval".to_string();
-                }
-                if let Some(detail) = &mut app.pipeline_detail {
-                    if detail.run.id == run_id {
-                        detail.run.status = "waiting_for_final_approval".to_string();
-                    }
-                }
-
-                // Auto-open approval overlay if viewing this pipeline
-                if app.pipeline_detail.as_ref().map_or(false, |d| d.run.id == run_id) {
-                    app.open_pipeline_approval_overlay(
-                        run_id.to_string(),
-                        crate::app::ApprovalKind::Final,
-                        summary,
-                    );
-                }
-            }
-        }
-        "pipeline_plan_approved" | "pipeline_final_approved" => {
-            if let Some(run_id) = event.get("pipeline_run_id").and_then(|v| v.as_str()) {
-                // Update status back to running (or completed for final)
-                let new_status = if event_type == "pipeline_final_approved" {
-                    "completed"
-                } else {
-                    "running"
-                };
-                if let Some(item) = app.pipeline_list.runs.iter_mut().find(|r| r.id == run_id) {
-                    item.status = new_status.to_string();
-                }
-                if let Some(detail) = &mut app.pipeline_detail {
-                    if detail.run.id == run_id {
-                        detail.run.status = new_status.to_string();
-                    }
-                }
-                // Close approval overlay if it's for this run
-                if app.pipeline_approval_overlay.as_ref().map_or(false, |o| o.pipeline_run_id == run_id) {
-                    app.close_pipeline_approval_overlay();
-                }
-            }
-        }
-        "pipeline_plan_rejected" | "pipeline_final_rejected" => {
-            if let Some(run_id) = event.get("pipeline_run_id").and_then(|v| v.as_str()) {
-                if let Some(item) = app.pipeline_list.runs.iter_mut().find(|r| r.id == run_id) {
-                    item.status = "running".to_string();
-                }
-                if let Some(detail) = &mut app.pipeline_detail {
-                    if detail.run.id == run_id {
-                        detail.run.status = "running".to_string();
-                    }
-                }
-                // Close approval overlay if it's for this run
-                if app.pipeline_approval_overlay.as_ref().map_or(false, |o| o.pipeline_run_id == run_id) {
-                    app.close_pipeline_approval_overlay();
-                }
-            }
-        }
-        _ => {
-            // Unknown event type -- ignore
-        }
-    }
-}
 
 /// Handle viewing a spec's content in the pager.
 async fn handle_spec_view(app: &mut App, client: &mut SocketClient) {
@@ -2080,12 +1783,6 @@ async fn poll_pipeline_streaming_data(app: &mut App, client: &mut SocketClient) 
 
     match client.try_read_streaming_line(poll_timeout).await {
         Ok(Some(line)) => {
-            // Check if this is a daemon event
-            if line.event.is_some() {
-                handle_daemon_event(app, client, &line).await;
-                return;
-            }
-
             if line.done {
                 app.pipeline_streaming_request_id = None;
                 app.status_message = "Pipeline completed".to_string();
@@ -2164,11 +1861,8 @@ async fn poll_pipeline_streaming_data(app: &mut App, client: &mut SocketClient) 
                             if let Some((stage_type, iteration)) = detail.current_streaming_stage.clone() {
                                 detail.append_stage_output(&stage_type, iteration, text.to_string());
                             }
-                            // Push to ring buffer
-                            if app.pipeline_output_buffer.len() >= 1000 {
-                                app.pipeline_output_buffer.pop_front();
-                            }
-                            app.pipeline_output_buffer.push_back(text.to_string());
+                            // Push to ring buffer with size limit
+                            app.push_pipeline_output(text.to_string());
                         }
                     }
                     Some("stage_start") => {
@@ -2191,6 +1885,37 @@ async fn poll_pipeline_streaming_data(app: &mut App, client: &mut SocketClient) 
                                 format!("=== {} completed ===\n", stage)
                             );
                         }
+                    }
+                    Some("tool_use") => {
+                        // Display tool invocation in the output
+                        if let Some(tool_name) = line.data.get("name").and_then(|v| v.as_str()) {
+                            let display_line = if tool_name == "Task" || tool_name.to_lowercase().contains("subagent") {
+                                // Subagent invocation
+                                let description = line.data.get("description")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or(tool_name);
+                                format!("🤖 Subagent: {}\n", description)
+                            } else {
+                                // Regular tool
+                                format!("🔧 Tool: {}\n", tool_name)
+                            };
+
+                            if let Some((stage_type, iteration)) = detail.current_streaming_stage.clone() {
+                                detail.append_stage_output(&stage_type, iteration, display_line.clone());
+                            }
+                            // Push to ring buffer with size limit
+                            app.push_pipeline_output(display_line);
+                        }
+                    }
+                    Some("tool_result") => {
+                        // Display tool completion (brief indicator, not full content)
+                        let display_line = "✅ Tool result received\n".to_string();
+
+                        if let Some((stage_type, iteration)) = detail.current_streaming_stage.clone() {
+                            detail.append_stage_output(&stage_type, iteration, display_line.clone());
+                        }
+                        // Push to ring buffer with size limit
+                        app.push_pipeline_output(display_line);
                     }
                     Some("pipeline_question") => {
                         let question_id = line.data.get("question_id").and_then(|v| v.as_str()).unwrap_or("");

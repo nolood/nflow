@@ -366,6 +366,16 @@ impl ClaudeRunner {
             cmd.current_dir(dir);
         }
 
+        // Clear env vars that prevent nested Claude sessions.
+        // The daemon may be started from within a Claude Code session,
+        // inheriting these vars which block spawning child Claude processes.
+        cmd.env_remove("CLAUDECODE");
+        cmd.env_remove("CLAUDE_CODE_ENTRYPOINT");
+
+        // Bypass permission checks — nflow agents run non-interactively
+        // and cannot prompt the user for tool approvals.
+        cmd.arg("--dangerously-skip-permissions");
+
         // Pipe stdout and stderr for streaming
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
@@ -481,6 +491,7 @@ mod tests {
         assert!(output.contains("stream-json"));
         assert!(output.contains("--verbose"));
         assert!(output.contains("--include-partial-messages"));
+        assert!(output.contains("--dangerously-skip-permissions"));
     }
 
     #[tokio::test]
@@ -501,10 +512,11 @@ mod tests {
 
         let line = process.stdout.next_line().await.unwrap();
         let output = line.unwrap_or_default();
-        // Should have -p and --output-format but not optional flags
+        // Should have -p, --output-format, and --dangerously-skip-permissions but not optional flags
         assert!(output.contains("-p"));
         assert!(output.contains("minimal"));
         assert!(output.contains("--output-format"));
+        assert!(output.contains("--dangerously-skip-permissions"));
         assert!(!output.contains("--verbose"));
         assert!(!output.contains("--include-partial-messages"));
         assert!(!output.contains("--append-system-prompt-file"));
@@ -669,6 +681,7 @@ mod tests {
         assert!(output.contains("stream-json"));
         assert!(output.contains("--verbose"));
         assert!(output.contains("--include-partial-messages"));
+        assert!(output.contains("--dangerously-skip-permissions"));
     }
 
     #[tokio::test]

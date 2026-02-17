@@ -114,6 +114,23 @@ pub fn find_draft_session(
     }
 }
 
+/// Find the latest session that can be discarded (in_progress or failed).
+pub fn find_discardable_session(
+    conn: &Connection,
+    project_id: &Uuid,
+) -> Result<Option<DecompositionSession>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, project_id, wave_number, status, claude_session_id, error_message, created_at, updated_at
+         FROM decomposition_sessions WHERE project_id = ?1 AND status IN ('in_progress', 'failed')
+         ORDER BY created_at DESC LIMIT 1",
+    )?;
+    let mut rows = stmt.query_map(params![project_id.to_string()], row_to_session)?;
+    match rows.next() {
+        Some(row) => Ok(Some(row?)),
+        None => Ok(None),
+    }
+}
+
 pub fn list_sessions_by_project(
     conn: &Connection,
     project_id: &Uuid,
@@ -147,6 +164,7 @@ pub fn update_session_status(
 }
 
 /// Set session status to failed with an error message in a single query.
+/// Also releases associated specs so they can be re-decomposed.
 pub fn update_session_error(conn: &Connection, id: &Uuid, error_message: &str) -> Result<()> {
     conn.execute(
         "UPDATE decomposition_sessions SET status = 'failed', error_message = ?1, updated_at = ?2 WHERE id = ?3",
@@ -155,6 +173,17 @@ pub fn update_session_error(conn: &Connection, id: &Uuid, error_message: &str) -
             Utc::now().to_rfc3339(),
             id.to_string(),
         ],
+    )?;
+    // Release specs so they're available for re-decomposition
+    release_session_specs(conn, id)?;
+    Ok(())
+}
+
+/// Delete decomposition_specs rows for a session, freeing the specs for reuse.
+pub fn release_session_specs(conn: &Connection, session_id: &Uuid) -> Result<()> {
+    conn.execute(
+        "DELETE FROM decomposition_specs WHERE session_id = ?1",
+        params![session_id.to_string()],
     )?;
     Ok(())
 }

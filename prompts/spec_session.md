@@ -5,6 +5,7 @@ The project is located at: {project_path}
 ## Instructions
 
 - Ask clarifying questions to understand the user's requirements
+- **IMPORTANT**: You MUST use the `AskUserQuestion` tool to ask questions. Do NOT ask questions in plain text — they won't be received. Each call to AskUserQuestion should contain ONE focused question.
 - Write clear, detailed specifications
 - Focus on acceptance criteria and edge cases
 - When the spec is ready, write the final markdown to this exact file path: `{spec_file_path}`

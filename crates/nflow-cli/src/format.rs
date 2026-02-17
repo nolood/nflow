@@ -185,9 +185,15 @@ fn print_object(data: &serde_json::Value, command: &str) {
         return;
     }
 
-    // pipeline.questions format
+    // pipeline.questions / spec.questions format
     if obj.contains_key("questions") && !obj.contains_key("wave_number") {
         print_pipeline_questions(data);
+        return;
+    }
+
+    // spec.answer_question format
+    if obj.contains_key("answered") && obj.contains_key("remaining") {
+        print_spec_answer_result(data);
         return;
     }
 
@@ -779,6 +785,43 @@ fn print_pipeline_questions(data: &serde_json::Value) {
             styled(&qid[..8.min(qid.len())], &[CYAN]),
             question_truncated,
             styled(&context_truncated, &[DIM]),
+        );
+    }
+}
+
+/// Render spec.answer_question result.
+fn print_spec_answer_result(data: &serde_json::Value) {
+    let all_answered = data
+        .get("all_answered")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let remaining = data
+        .get("remaining")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let resuming = data
+        .get("resuming")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    if all_answered && resuming {
+        println!(
+            "{}",
+            styled("All questions answered — resuming session.", &[GREEN])
+        );
+    } else if all_answered {
+        let msg = if let Some(err) = data.get("resume_error").and_then(|v| v.as_str()) {
+            format!("All questions answered. Note: {}", err)
+        } else {
+            "All questions answered.".to_string()
+        };
+        println!("{}", styled(&msg, &[GREEN]));
+    } else {
+        println!(
+            "{} ({} question{} remaining)",
+            styled("Answered.", &[GREEN]),
+            remaining,
+            if remaining == 1 { "" } else { "s" }
         );
     }
 }

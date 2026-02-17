@@ -97,6 +97,9 @@ fn dispatch(req: Request, state: &HandlerState) -> HandlerResult {
         "pipeline.approve" => HandlerResult::Single(handle_pipeline_approve(req, state)),
         "pipeline.reject" => HandlerResult::Single(handle_pipeline_reject(req, state)),
         "pipeline.questions" => HandlerResult::Single(handle_pipeline_questions(req, state)),
+        "spec.questions" => HandlerResult::Single(handle_spec_questions(req, state)),
+        "spec.answer_question" => handle_spec_answer_question(req, state),
+        "subscribe" => HandlerResult::Single(handle_subscribe(req, state)),
         _ => HandlerResult::Single(Response::error(
             req.id,
             &format!("unknown command: {}", req.command),
@@ -596,11 +599,12 @@ fn handle_spec_answer(req: Request, state: &HandlerState) -> HandlerResult {
         }
     };
 
-    // Validate session is active
-    if !spec.session_active {
+    // Validate session is NOT active (no Claude process running) and has a session to resume.
+    // session_active=false means Claude process ended; claude_session_id means we can resume.
+    if spec.session_active {
         return HandlerResult::Single(Response::error(
             id,
-            "INVALID_STATE: no active session for this spec",
+            "INVALID_STATE: a Claude process is already running for this spec",
         ));
     }
 
@@ -699,9 +703,22 @@ async fn stream_claude_spec_session(
                     if let nflow_claude::stream::StreamEvent::ToolUse { input, .. } = &event {
                         let question = input.get("question").and_then(|v| v.as_str()).unwrap_or("");
                         let options = input.get("options");
+
+                        // Persist question to spec_questions table
+                        let options_str = options.map(|o| o.to_string());
+                        let sq = nflow_core::spec::SpecQuestion::new(
+                            spec_id,
+                            question.to_string(),
+                            options_str,
+                        );
+                        if let Ok(conn) = db::open_connection(db_path) {
+                            let _ = db::spec_questions::insert_spec_question(&conn, &sq);
+                        }
+
                         let mut q = serde_json::json!({
                             "type": "question",
                             "text": question,
+                            "question_id": sq.id.to_string(),
                         });
                         if let Some(opts) = options {
                             q["options"] = opts.clone();
@@ -766,22 +783,21 @@ async fn stream_claude_spec_session(
     let spec_file_exists = Path::new(spec_file_path).exists();
     let session_completed = spec_file_exists;
 
-    // Update DB: store claude_session_id; if completed, mark session inactive.
+    // Update DB: always mark session_active=false (Claude process is done).
+    // Pending spec_questions rows signal "waiting for answers" instead of session_active.
     // Only overwrite claude_session_id if we got a new one — avoid clobbering
     // a valid session_id from a previous turn when this turn produced None.
     if let Ok(conn) = db::open_connection(db_path) {
-        if session_completed {
+        if session_id.is_some() {
             let _ = db::specs::update_spec_session(&conn, &spec_id, false, session_id.as_deref());
-        } else if session_id.is_some() {
-            // Session still active (waiting for user answer), store the new session ID
-            let _ = db::specs::update_spec_session(&conn, &spec_id, true, session_id.as_deref());
         } else {
-            // No session_id from this turn — keep existing claude_session_id, just mark active
+            // No session_id from this turn — keep existing claude_session_id
             let existing_sid = db::specs::get_spec_by_id(&conn, &spec_id)
                 .ok()
                 .flatten()
                 .and_then(|s| s.claude_session_id);
-            let _ = db::specs::update_spec_session(&conn, &spec_id, true, existing_sid.as_deref());
+            let _ =
+                db::specs::update_spec_session(&conn, &spec_id, false, existing_sid.as_deref());
         }
     }
 
@@ -2653,7 +2669,8 @@ fn handle_plan_approve(req: Request, state: &HandlerState) -> Response {
 
     let wave_number: Option<u32> = req
         .params
-        .get("wave_number")
+        .get("wave")
+        .or_else(|| req.params.get("wave_number"))
         .and_then(|v| v.as_u64())
         .map(|n| n as u32);
 
@@ -2760,7 +2777,8 @@ fn handle_plan_discard(req: Request, state: &HandlerState) -> Response {
 
     let wave_number: Option<u32> = req
         .params
-        .get("wave_number")
+        .get("wave")
+        .or_else(|| req.params.get("wave_number"))
         .and_then(|v| v.as_u64())
         .map(|n| n as u32);
 
@@ -2782,7 +2800,7 @@ fn handle_plan_discard(req: Request, state: &HandlerState) -> Response {
         Err(e) => return Response::error(id, &format!("database error: {}", e)),
     };
 
-    // Find session (by wave_number or latest non-discarded)
+    // Find session (by wave number or latest discardable)
     let session = if let Some(wave) = wave_number {
         match db::decomposition_sessions::get_session_by_wave(&conn, &project.id, wave) {
             Ok(Some(s)) => s,
@@ -2792,24 +2810,31 @@ fn handle_plan_discard(req: Request, state: &HandlerState) -> Response {
             Err(e) => return Response::error(id, &format!("database error: {}", e)),
         }
     } else {
-        match db::decomposition_sessions::find_draft_session(&conn, &project.id) {
+        match db::decomposition_sessions::find_discardable_session(&conn, &project.id) {
             Ok(Some(s)) => s,
             Ok(None) => {
-                return Response::error(id, "NOT_FOUND: no draft wave found for this project")
+                return Response::error(id, "NOT_FOUND: no discardable wave found for this project (must be in_progress or failed)")
             }
             Err(e) => return Response::error(id, &format!("database error: {}", e)),
         }
     };
 
-    // Validate session is not already discarded
-    if session.status == DecompositionStatus::Discarded {
-        return Response::error(
-            id,
-            &format!(
-                "INVALID_STATE: wave W{} is already discarded",
-                session.wave_number
-            ),
-        );
+    // Validate session can be discarded (not already discarded or completed)
+    match session.status {
+        DecompositionStatus::Discarded => {
+            return Response::error(
+                id,
+                &format!(
+                    "INVALID_STATE: wave W{} is already discarded",
+                    session.wave_number
+                ),
+            );
+        }
+        DecompositionStatus::InProgress
+        | DecompositionStatus::Approved
+        | DecompositionStatus::Failed => {
+            // These are all valid states for discard
+        }
     }
 
     // Check for in_progress stories — must stop them first
@@ -2843,6 +2868,11 @@ fn handle_plan_discard(req: Request, state: &HandlerState) -> Response {
         if let Err(e) = db::specs::update_spec_status(&conn, spec_id, SpecStatus::Approved) {
             return Response::error(id, &format!("database error: {}", e));
         }
+    }
+
+    // Release decomposition_specs mapping so specs are truly free
+    if let Err(e) = db::decomposition_sessions::release_session_specs(&conn, &session.id) {
+        return Response::error(id, &format!("database error: {}", e));
     }
 
     // Update session status to discarded
@@ -5754,10 +5784,17 @@ fn handle_config_show(req: Request, state: &HandlerState) -> Response {
         PartialConfig::default()
     };
 
-    // Load env vars
-    let env_vars: Vec<(String, String)> = std::env::vars()
-        .filter(|(k, _)| k.starts_with("NFLOW_"))
-        .collect();
+    // Load env vars — prefer client-forwarded overrides over daemon's own env
+    let env_vars: Vec<(String, String)> = if let Some(overrides) = req.params.get("env_overrides").and_then(|v| v.as_object()) {
+        overrides
+            .iter()
+            .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+            .collect()
+    } else {
+        std::env::vars()
+            .filter(|(k, _)| k.starts_with("NFLOW_"))
+            .collect()
+    };
     let env_refs: Vec<(&str, &str)> = env_vars
         .iter()
         .map(|(k, v)| (k.as_str(), v.as_str()))
@@ -6446,6 +6483,7 @@ async fn run_pipeline_stage(
     }
 
     let mut parser = nflow_claude::stream::StreamParser::new(process.stdout);
+    let mut stderr_lines = process.stderr;
     let mut child = process.child;
     let mut result_text = String::new();
     let mut session_id = None;
@@ -6525,6 +6563,33 @@ async fn run_pipeline_stage(
                             ))
                             .await;
                     }
+                    nflow_claude::stream::StreamEvent::ToolUse { name, input } => {
+                        let _ = tx
+                            .send(StreamingResponseLine::data(
+                                req_id.to_string(),
+                                serde_json::json!({
+                                    "type": "tool_use",
+                                    "stage_type": stage_type_str,
+                                    "iteration": iteration,
+                                    "name": name,
+                                    "input": input,
+                                }),
+                            ))
+                            .await;
+                    }
+                    nflow_claude::stream::StreamEvent::ToolResult { content } => {
+                        let _ = tx
+                            .send(StreamingResponseLine::data(
+                                req_id.to_string(),
+                                serde_json::json!({
+                                    "type": "tool_result",
+                                    "stage_type": stage_type_str,
+                                    "iteration": iteration,
+                                    "content": content,
+                                }),
+                            ))
+                            .await;
+                    }
                     _ => {}
                 }
             }
@@ -6553,7 +6618,46 @@ async fn run_pipeline_stage(
         let _ = log_writer.flush().await;
     }
 
-    let _exit_status = child.wait().await.ok();
+    let exit_status = child.wait().await.ok();
+
+    // If Claude produced no result, read stderr for error details
+    if result_text.is_empty() {
+        let mut stderr_output = String::new();
+        while let Ok(Some(line)) = stderr_lines.next_line().await {
+            if !line.is_empty() {
+                stderr_output.push_str(&line);
+                stderr_output.push('\n');
+            }
+        }
+
+        let exit_code = exit_status.as_ref().and_then(|s| s.code());
+        let error_msg = if !stderr_output.is_empty() {
+            format!(
+                "Claude process produced no output (exit code: {:?}). stderr: {}",
+                exit_code,
+                stderr_output.trim()
+            )
+        } else {
+            format!(
+                "Claude process produced no output (exit code: {:?})",
+                exit_code
+            )
+        };
+
+        // Update stage as failed
+        if let Ok(conn) = db::open_connection(db_path) {
+            let _ = db::pipeline::update_pipeline_stage(
+                &conn,
+                &stage.id,
+                "failed",
+                Some(&error_msg),
+                None,
+                Some(chrono::Utc::now()),
+            );
+        }
+
+        return Err(error_msg);
+    }
 
     // For Plan stages, strip PIPELINE_QUESTIONS section before parsing the plan output.
     // The raw result_text (with questions) is still returned for the caller to detect questions.
@@ -7456,6 +7560,27 @@ fn handle_pipeline_start(req: Request, state: &HandlerState) -> HandlerResult {
     HandlerResult::Streaming(rx)
 }
 
+/// Resolve a pipeline run ID string to a full UUID.
+/// Accepts either a full UUID or a short prefix (min 4 chars).
+fn resolve_pipeline_run_id(
+    conn: &rusqlite::Connection,
+    id_str: &str,
+) -> std::result::Result<uuid::Uuid, String> {
+    // Try full UUID first
+    if let Ok(uuid) = uuid::Uuid::parse_str(id_str) {
+        return Ok(uuid);
+    }
+    // Try prefix match (min 4 chars to avoid too many matches)
+    if id_str.len() < 4 {
+        return Err("INVALID_PARAMS: pipeline_run_id must be at least 4 characters".to_string());
+    }
+    match db::pipeline::resolve_pipeline_run_by_prefix(conn, id_str) {
+        Ok(Some(run)) => Ok(run.id),
+        Ok(None) => Err(format!("NOT_FOUND: no pipeline run matching '{}'", id_str)),
+        Err(e) => Err(format!("{}", e)),
+    }
+}
+
 /// Handle "pipeline.status" command.
 ///
 /// Receives: { pipeline_run_id }
@@ -7470,16 +7595,16 @@ fn handle_pipeline_status(req: Request, state: &HandlerState) -> Response {
         }
     };
 
-    let run_id = match uuid::Uuid::parse_str(&run_id_str) {
-        Ok(u) => u,
-        Err(_) => {
-            return Response::error(id, "INVALID_PARAMS: invalid pipeline_run_id format");
-        }
-    };
-
     let conn = match db::open_connection(&state.db_path) {
         Ok(c) => c,
         Err(e) => return Response::error(id, &format!("database error: {}", e)),
+    };
+
+    let run_id = match resolve_pipeline_run_id(&conn, &run_id_str) {
+        Ok(u) => u,
+        Err(e) => {
+            return Response::error(id, &e);
+        }
     };
 
     let run = match db::pipeline::get_pipeline_run(&conn, &run_id) {
@@ -7609,16 +7734,16 @@ fn handle_pipeline_cancel(req: Request, state: &HandlerState) -> Response {
         }
     };
 
-    let run_id = match uuid::Uuid::parse_str(&run_id_str) {
-        Ok(u) => u,
-        Err(_) => {
-            return Response::error(id, "INVALID_PARAMS: invalid pipeline_run_id format");
-        }
-    };
-
     let conn = match db::open_connection(&state.db_path) {
         Ok(c) => c,
         Err(e) => return Response::error(id, &format!("database error: {}", e)),
+    };
+
+    let run_id = match resolve_pipeline_run_id(&conn, &run_id_str) {
+        Ok(u) => u,
+        Err(e) => {
+            return Response::error(id, &e);
+        }
     };
 
     let run = match db::pipeline::get_pipeline_run(&conn, &run_id) {
@@ -7632,11 +7757,13 @@ fn handle_pipeline_cancel(req: Request, state: &HandlerState) -> Response {
         Err(e) => return Response::error(id, &format!("database error: {}", e)),
     };
 
-    if run.status != nflow_core::pipeline::PipelineStatus::Running {
+    if run.status != nflow_core::pipeline::PipelineStatus::Running
+        && run.status != nflow_core::pipeline::PipelineStatus::WaitingForApproval
+    {
         return Response::error(
             id,
             &format!(
-                "INVALID_STATE: pipeline run is not running (status: {})",
+                "INVALID_STATE: pipeline run cannot be cancelled (status: {})",
                 run.status
             ),
         );
@@ -7681,13 +7808,6 @@ fn handle_pipeline_log(req: Request, state: &HandlerState) -> Response {
         }
     };
 
-    let run_id = match uuid::Uuid::parse_str(&run_id_str) {
-        Ok(u) => u,
-        Err(_) => {
-            return Response::error(id, "INVALID_PARAMS: invalid pipeline_run_id format");
-        }
-    };
-
     let stage_type_str = req
         .params
         .get("stage_type")
@@ -7703,6 +7823,13 @@ fn handle_pipeline_log(req: Request, state: &HandlerState) -> Response {
     let conn = match db::open_connection(&state.db_path) {
         Ok(c) => c,
         Err(e) => return Response::error(id, &format!("database error: {}", e)),
+    };
+
+    let run_id = match resolve_pipeline_run_id(&conn, &run_id_str) {
+        Ok(u) => u,
+        Err(e) => {
+            return Response::error(id, &e);
+        }
     };
 
     match db::pipeline::get_pipeline_run(&conn, &run_id) {
@@ -7785,16 +7912,16 @@ fn handle_pipeline_approve(req: Request, state: &HandlerState) -> Response {
         }
     };
 
-    let run_id = match uuid::Uuid::parse_str(&run_id_str) {
-        Ok(u) => u,
-        Err(_) => {
-            return Response::error(id, "INVALID_PARAMS: invalid pipeline_run_id format");
-        }
-    };
-
     let conn = match db::open_connection(&state.db_path) {
         Ok(c) => c,
         Err(e) => return Response::error(id, &format!("database error: {}", e)),
+    };
+
+    let run_id = match resolve_pipeline_run_id(&conn, &run_id_str) {
+        Ok(u) => u,
+        Err(e) => {
+            return Response::error(id, &e);
+        }
     };
 
     let run = match db::pipeline::get_pipeline_run(&conn, &run_id) {
@@ -7904,13 +8031,6 @@ fn handle_pipeline_reject(req: Request, state: &HandlerState) -> Response {
         }
     };
 
-    let run_id = match uuid::Uuid::parse_str(&run_id_str) {
-        Ok(u) => u,
-        Err(_) => {
-            return Response::error(id, "INVALID_PARAMS: invalid pipeline_run_id format");
-        }
-    };
-
     let feedback = match req.params.get("feedback").and_then(|v| v.as_str()) {
         Some(s) => s.to_string(),
         None => {
@@ -7921,6 +8041,13 @@ fn handle_pipeline_reject(req: Request, state: &HandlerState) -> Response {
     let conn = match db::open_connection(&state.db_path) {
         Ok(c) => c,
         Err(e) => return Response::error(id, &format!("database error: {}", e)),
+    };
+
+    let run_id = match resolve_pipeline_run_id(&conn, &run_id_str) {
+        Ok(u) => u,
+        Err(e) => {
+            return Response::error(id, &e);
+        }
     };
 
     let run = match db::pipeline::get_pipeline_run(&conn, &run_id) {
@@ -8083,16 +8210,16 @@ fn handle_pipeline_questions(req: Request, state: &HandlerState) -> Response {
         }
     };
 
-    let run_id = match uuid::Uuid::parse_str(&run_id_str) {
-        Ok(u) => u,
-        Err(_) => {
-            return Response::error(id, "INVALID_PARAMS: invalid pipeline_run_id format");
-        }
-    };
-
     let conn = match db::open_connection(&state.db_path) {
         Ok(c) => c,
         Err(e) => return Response::error(id, &format!("database error: {}", e)),
+    };
+
+    let run_id = match resolve_pipeline_run_id(&conn, &run_id_str) {
+        Ok(u) => u,
+        Err(e) => {
+            return Response::error(id, &e);
+        }
     };
 
     let questions = match db::pipeline::get_pending_questions(&conn, &run_id) {
@@ -8133,13 +8260,6 @@ fn handle_pipeline_answer(req: Request, state: &HandlerState) -> Response {
         }
     };
 
-    let run_id = match uuid::Uuid::parse_str(&run_id_str) {
-        Ok(u) => u,
-        Err(_) => {
-            return Response::error(id, "INVALID_PARAMS: invalid pipeline_run_id format");
-        }
-    };
-
     let question_id_str = match req.params.get("question_id").and_then(|v| v.as_str()) {
         Some(s) => s.to_string(),
         None => {
@@ -8164,6 +8284,13 @@ fn handle_pipeline_answer(req: Request, state: &HandlerState) -> Response {
     let conn = match db::open_connection(&state.db_path) {
         Ok(c) => c,
         Err(e) => return Response::error(id, &format!("database error: {}", e)),
+    };
+
+    let run_id = match resolve_pipeline_run_id(&conn, &run_id_str) {
+        Ok(u) => u,
+        Err(e) => {
+            return Response::error(id, &e);
+        }
     };
 
     // Validate pipeline exists and is in Running state with current_stage=Plan
@@ -8230,6 +8357,307 @@ fn handle_pipeline_answer(req: Request, state: &HandlerState) -> Response {
         id,
         serde_json::json!({
             "answered": true,
+        }),
+    )
+}
+
+/// Handle "spec.questions" command — list pending questions for a spec.
+///
+/// Receives: { project_name, spec_name }
+/// Returns: { questions: [{ id, question, options }] }
+fn handle_spec_questions(req: Request, state: &HandlerState) -> Response {
+    let id = req.id.clone();
+
+    let project_name = match req.params.get("project_name").and_then(|v| v.as_str()) {
+        Some(n) => n.to_string(),
+        None => {
+            return Response::error(id, "missing required parameter: project_name");
+        }
+    };
+
+    let spec_name = match req.params.get("spec_name").and_then(|v| v.as_str()) {
+        Some(n) => n.to_string(),
+        None => {
+            return Response::error(id, "missing required parameter: spec_name");
+        }
+    };
+
+    let conn = match db::open_connection(&state.db_path) {
+        Ok(c) => c,
+        Err(e) => return Response::error(id, &format!("database error: {}", e)),
+    };
+
+    let project = match db::projects::get_project_by_name(&conn, &project_name) {
+        Ok(Some(p)) => p,
+        Ok(None) => {
+            return Response::error(
+                id,
+                &format!("NOT_FOUND: project '{}' not found", project_name),
+            );
+        }
+        Err(e) => return Response::error(id, &format!("database error: {}", e)),
+    };
+
+    let spec = match db::specs::get_spec_by_name(&conn, &project.id, &spec_name) {
+        Ok(Some(s)) => s,
+        Ok(None) => {
+            return Response::error(
+                id,
+                &format!("NOT_FOUND: spec '{}' not found", spec_name),
+            );
+        }
+        Err(e) => return Response::error(id, &format!("database error: {}", e)),
+    };
+
+    let questions = match db::spec_questions::get_pending_questions(&conn, &spec.id) {
+        Ok(q) => q,
+        Err(e) => return Response::error(id, &format!("database error: {}", e)),
+    };
+
+    let questions_json: Vec<serde_json::Value> = questions
+        .iter()
+        .map(|q| {
+            let mut qj = serde_json::json!({
+                "id": q.id.to_string(),
+                "question": q.question,
+            });
+            if let Some(opts) = &q.options {
+                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(opts) {
+                    qj["options"] = parsed;
+                }
+            }
+            qj
+        })
+        .collect();
+
+    Response::ok(
+        id,
+        serde_json::json!({
+            "questions": questions_json,
+        }),
+    )
+}
+
+/// Handle "spec.answer_question" command — answer a pending spec question.
+///
+/// Receives: { project_name, spec_name, question_id, answer }
+/// Returns: { answered: true, all_answered: bool, remaining: u32 }
+///
+/// When all questions are answered, auto-resumes the Claude session.
+fn handle_spec_answer_question(req: Request, state: &HandlerState) -> HandlerResult {
+    let id = req.id.clone();
+
+    let project_name = match req.params.get("project_name").and_then(|v| v.as_str()) {
+        Some(n) => n.to_string(),
+        None => {
+            return HandlerResult::Single(Response::error(
+                id,
+                "missing required parameter: project_name",
+            ));
+        }
+    };
+
+    let spec_name = match req.params.get("spec_name").and_then(|v| v.as_str()) {
+        Some(n) => n.to_string(),
+        None => {
+            return HandlerResult::Single(Response::error(
+                id,
+                "missing required parameter: spec_name",
+            ));
+        }
+    };
+
+    let question_id_str = match req.params.get("question_id").and_then(|v| v.as_str()) {
+        Some(s) => s.to_string(),
+        None => {
+            return HandlerResult::Single(Response::error(
+                id,
+                "missing required parameter: question_id",
+            ));
+        }
+    };
+
+    let question_id = match uuid::Uuid::parse_str(&question_id_str) {
+        Ok(u) => u,
+        Err(_) => {
+            return HandlerResult::Single(Response::error(
+                id,
+                "INVALID_PARAMS: invalid question_id format",
+            ));
+        }
+    };
+
+    let answer = match req.params.get("answer").and_then(|v| v.as_str()) {
+        Some(s) => s.to_string(),
+        None => {
+            return HandlerResult::Single(Response::error(
+                id,
+                "missing required parameter: answer",
+            ));
+        }
+    };
+
+    let conn = match db::open_connection(&state.db_path) {
+        Ok(c) => c,
+        Err(e) => {
+            return HandlerResult::Single(Response::error(id, &format!("database error: {}", e)));
+        }
+    };
+
+    let project = match db::projects::get_project_by_name(&conn, &project_name) {
+        Ok(Some(p)) => p,
+        Ok(None) => {
+            return HandlerResult::Single(Response::error(
+                id,
+                &format!("NOT_FOUND: project '{}' not found", project_name),
+            ));
+        }
+        Err(e) => {
+            return HandlerResult::Single(Response::error(id, &format!("database error: {}", e)));
+        }
+    };
+
+    let spec = match db::specs::get_spec_by_name(&conn, &project.id, &spec_name) {
+        Ok(Some(s)) => s,
+        Ok(None) => {
+            return HandlerResult::Single(Response::error(
+                id,
+                &format!("NOT_FOUND: spec '{}' not found", spec_name),
+            ));
+        }
+        Err(e) => {
+            return HandlerResult::Single(Response::error(id, &format!("database error: {}", e)));
+        }
+    };
+
+    // Answer the question
+    let updated = match db::spec_questions::answer_question(&conn, &question_id, &answer) {
+        Ok(b) => b,
+        Err(e) => {
+            return HandlerResult::Single(Response::error(id, &format!("database error: {}", e)));
+        }
+    };
+
+    if !updated {
+        return HandlerResult::Single(Response::error(
+            id,
+            &format!(
+                "NOT_FOUND: question '{}' not found or already answered",
+                question_id_str
+            ),
+        ));
+    }
+
+    // Check remaining questions
+    let pending = match db::spec_questions::get_pending_questions(&conn, &spec.id) {
+        Ok(q) => q,
+        Err(e) => {
+            return HandlerResult::Single(Response::error(id, &format!("database error: {}", e)));
+        }
+    };
+
+    let remaining = pending.len() as u32;
+    let all_answered = remaining == 0;
+
+    if !all_answered {
+        return HandlerResult::Single(Response::ok(
+            id,
+            serde_json::json!({
+                "answered": true,
+                "all_answered": false,
+                "remaining": remaining,
+            }),
+        ));
+    }
+
+    // All answered — build combined answer text and auto-resume session in background
+    let all_questions = match db::spec_questions::get_all_questions(&conn, &spec.id) {
+        Ok(q) => q,
+        Err(e) => {
+            return HandlerResult::Single(Response::error(id, &format!("database error: {}", e)));
+        }
+    };
+
+    let combined_answer = all_questions
+        .iter()
+        .filter(|q| q.answered)
+        .map(|q| format!("Q: {}\nA: {}", q.question, q.answer.as_deref().unwrap_or("")))
+        .collect::<Vec<_>>()
+        .join("\n\n");
+
+    // Must have a claude_session_id to resume
+    let claude_session_id = match &spec.claude_session_id {
+        Some(sid) => sid.clone(),
+        None => {
+            return HandlerResult::Single(Response::ok(
+                id,
+                serde_json::json!({
+                    "answered": true,
+                    "all_answered": true,
+                    "remaining": 0,
+                    "resume_error": "spec has no claude session to resume",
+                }),
+            ));
+        }
+    };
+
+    // Mark session active before spawning
+    let _ = db::specs::update_spec_session(&conn, &spec.id, true, Some(&claude_session_id));
+
+    // Clean up answered questions for next round
+    let _ = db::spec_questions::delete_questions_for_spec(&conn, &spec.id);
+
+    // Build RunConfig for resumed spec session
+    let mut run_config = nflow_claude::runner::RunConfig::for_spec(combined_answer, true);
+    run_config.resume_session = Some(claude_session_id);
+    run_config.working_dir = Some(PathBuf::from(&project.path));
+
+    // Fire-and-forget: spawn Claude resume in background.
+    // New questions (if any) will appear in spec_questions table.
+    let spec_id = spec.id;
+    let spec_file_path_str = spec.file_path.clone();
+    let db_path = state.db_path.clone();
+
+    tokio::spawn(async move {
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        stream_claude_spec_session(
+            tx,
+            "background-resume".to_string(),
+            run_config,
+            spec_id,
+            &spec_file_path_str,
+            &db_path,
+        )
+        .await;
+    });
+
+    HandlerResult::Single(Response::ok(
+        id,
+        serde_json::json!({
+            "answered": true,
+            "all_answered": true,
+            "remaining": 0,
+            "resuming": true,
+        }),
+    ))
+}
+
+/// Handle "subscribe" command.
+///
+/// This command is sent by the TUI to subscribe to real-time updates for a project.
+/// Currently implemented as a no-op that returns success, preventing errors in the TUI.
+///
+/// Receives: { project_name? }
+/// Returns: { status: "ok" }
+fn handle_subscribe(req: Request, _state: &HandlerState) -> Response {
+    let id = req.id.clone();
+
+    // For now, just acknowledge the subscription without doing anything.
+    // The TUI expects a success response to avoid showing errors.
+    Response::ok(
+        id,
+        serde_json::json!({
+            "status": "subscribed",
         }),
     )
 }
@@ -9283,16 +9711,16 @@ mod tests {
     }
 
     #[test]
-    fn test_handle_spec_answer_no_active_session() {
-        let (state, db_dir) = make_db_state("spec_answer_inactive");
+    fn test_handle_spec_answer_session_already_running() {
+        let (state, db_dir) = make_db_state("spec_answer_running");
         let project_id = insert_test_project(&state, "answer-project");
 
-        // Create a spec with session_active=false
+        // Create a spec with session_active=true (Claude process running)
         let conn = db::open_connection(&state.db_path).unwrap();
         let spec_id = uuid::Uuid::new_v4();
         conn.execute(
             "INSERT INTO specs (id, project_id, name, file_path, status, session_active, created_at, updated_at)
-             VALUES (?1, ?2, 'my-spec', '/tmp/spec.md', 'draft', 0, '2024-01-01', '2024-01-01')",
+             VALUES (?1, ?2, 'my-spec', '/tmp/spec.md', 'draft', 1, '2024-01-01', '2024-01-01')",
             rusqlite::params![spec_id.to_string(), project_id.to_string()],
         )
         .unwrap();
@@ -9316,7 +9744,7 @@ mod tests {
                 assert!(resp.data["message"]
                     .as_str()
                     .unwrap()
-                    .contains("no active session"));
+                    .contains("already running"));
             }
             _ => panic!("expected Single response for error"),
         }
@@ -9328,12 +9756,12 @@ mod tests {
         let (state, db_dir) = make_db_state("spec_answer_nosession");
         let project_id = insert_test_project(&state, "nosession-project");
 
-        // Create a spec with session_active=true but no claude_session_id
+        // Create a spec with session_active=false and no claude_session_id
         let conn = db::open_connection(&state.db_path).unwrap();
         let spec_id = uuid::Uuid::new_v4();
         conn.execute(
             "INSERT INTO specs (id, project_id, name, file_path, status, session_active, created_at, updated_at)
-             VALUES (?1, ?2, 'my-spec', '/tmp/spec.md', 'draft', 1, '2024-01-01', '2024-01-01')",
+             VALUES (?1, ?2, 'my-spec', '/tmp/spec.md', 'draft', 0, '2024-01-01', '2024-01-01')",
             rusqlite::params![spec_id.to_string(), project_id.to_string()],
         )
         .unwrap();
@@ -9369,12 +9797,12 @@ mod tests {
         let (state, db_dir) = make_db_state("spec_answer_streaming");
         let project_id = insert_test_project(&state, "streaming-project");
 
-        // Create a spec with session_active=true and a claude_session_id
+        // Create a spec with session_active=false and a claude_session_id (ready to resume)
         let conn = db::open_connection(&state.db_path).unwrap();
         let spec_id = uuid::Uuid::new_v4();
         conn.execute(
             "INSERT INTO specs (id, project_id, name, file_path, status, session_active, claude_session_id, created_at, updated_at)
-             VALUES (?1, ?2, 'my-spec', '/tmp/spec.md', 'draft', 1, 'session-abc', '2024-01-01', '2024-01-01')",
+             VALUES (?1, ?2, 'my-spec', '/tmp/spec.md', 'draft', 0, 'session-abc', '2024-01-01', '2024-01-01')",
             rusqlite::params![spec_id.to_string(), project_id.to_string()],
         )
         .unwrap();

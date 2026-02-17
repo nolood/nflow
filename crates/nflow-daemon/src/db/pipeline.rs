@@ -7,7 +7,7 @@ use nflow_core::pipeline::{
     StageStatus,
 };
 
-use super::Result;
+use super::{DbError, Result};
 
 // ─── Status Conversions ──────────────────────────────────
 
@@ -208,6 +208,32 @@ pub fn get_pipeline_run(conn: &Connection, id: &Uuid) -> Result<Option<PipelineR
     }
 }
 
+/// Resolve a pipeline run ID from a short prefix (e.g. "41fc16b9" → full UUID).
+/// Returns Ok(Some(run)) if exactly one match, Ok(None) if no match, Err if ambiguous.
+pub fn resolve_pipeline_run_by_prefix(
+    conn: &Connection,
+    prefix: &str,
+) -> Result<Option<PipelineRun>> {
+    let pattern = format!("{}%", prefix);
+    let mut stmt = conn.prepare(
+        "SELECT id, project_id, name, goal, mode, status, current_stage, iteration, max_iterations, created_at, updated_at
+         FROM pipeline_runs WHERE id LIKE ?1",
+    )?;
+    let rows: Vec<PipelineRun> = stmt
+        .query_map(params![pattern], row_to_pipeline_run)?
+        .filter_map(|r| r.ok())
+        .collect();
+    match rows.len() {
+        0 => Ok(None),
+        1 => Ok(Some(rows.into_iter().next().unwrap())),
+        _ => Err(DbError::AmbiguousId(format!(
+            "ambiguous pipeline_run_id prefix '{}': matches {} runs",
+            prefix,
+            rows.len()
+        ))),
+    }
+}
+
 pub fn list_pipeline_runs(conn: &Connection, project_id: &Uuid) -> Result<Vec<PipelineRun>> {
     let mut stmt = conn.prepare(
         "SELECT id, project_id, name, goal, mode, status, current_stage, iteration, max_iterations, created_at, updated_at
@@ -227,7 +253,7 @@ pub fn get_active_pipeline_run(
 ) -> Result<Option<PipelineRun>> {
     let mut stmt = conn.prepare(
         "SELECT id, project_id, name, goal, mode, status, current_stage, iteration, max_iterations, created_at, updated_at
-         FROM pipeline_runs WHERE project_id = ?1 AND status = 'running' LIMIT 1",
+         FROM pipeline_runs WHERE project_id = ?1 AND status IN ('pending', 'running', 'waiting_for_approval', 'waiting_for_final_approval') LIMIT 1",
     )?;
     let mut rows = stmt.query_map(params![project_id.to_string()], row_to_pipeline_run)?;
     match rows.next() {

@@ -152,6 +152,35 @@ impl Spec {
     }
 }
 
+// ─── Spec Questions ─────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpecQuestion {
+    pub id: Uuid,
+    pub spec_id: Uuid,
+    pub question: String,
+    pub options: Option<String>,
+    pub answered: bool,
+    pub answer: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub answered_at: Option<DateTime<Utc>>,
+}
+
+impl SpecQuestion {
+    pub fn new(spec_id: Uuid, question: String, options: Option<String>) -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            spec_id,
+            question,
+            options,
+            answered: false,
+            answer: None,
+            created_at: Utc::now(),
+            answered_at: None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

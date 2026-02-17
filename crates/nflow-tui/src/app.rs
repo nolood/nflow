@@ -4,6 +4,11 @@ use std::time::Instant;
 use crate::error::Result;
 use crate::socket_client::{ResponseStatus, SocketClient};
 
+// Buffer size limits to prevent unbounded growth
+const MAX_PIPELINE_OUTPUT_BUFFER: usize = 10_000;
+const MAX_DECOMPOSITION_OUTPUT_LINES: usize = 10_000;
+const MAX_STAGE_OUTPUT_LINES: usize = 10_000;
+
 /// Current phase of the plan decomposition process.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DecompositionPhase {
@@ -229,7 +234,6 @@ impl SpecDialogueState {
 }
 
 /// State for the spec content pager sub-view.
-#[derive(Debug)]
 pub struct SpecPagerState {
     /// The spec name displayed in the header.
     pub spec_name: String,
@@ -242,6 +246,22 @@ pub struct SpecPagerState {
     pub scroll_offset: u16,
     /// Total number of lines in the content.
     pub total_lines: u16,
+    /// Cached parsed markdown: (source_text, parsed_lines).
+    /// Only re-parse when source changes. Uses RefCell for interior mutability during rendering.
+    pub markdown_cache: std::cell::RefCell<Option<(String, Vec<ratatui::text::Line<'static>>)>>,
+}
+
+impl std::fmt::Debug for SpecPagerState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SpecPagerState")
+            .field("spec_name", &self.spec_name)
+            .field("content", &self.content)
+            .field("lines", &self.lines)
+            .field("scroll_offset", &self.scroll_offset)
+            .field("total_lines", &self.total_lines)
+            .field("markdown_cache", &"<RefCell>")
+            .finish()
+    }
 }
 
 impl SpecPagerState {
@@ -255,6 +275,7 @@ impl SpecPagerState {
             lines,
             scroll_offset: 0,
             total_lines,
+            markdown_cache: std::cell::RefCell::new(None),
         }
     }
 
@@ -1476,6 +1497,10 @@ impl DecompositionOutputState {
     /// Append a line of streaming output.
     pub fn append_line(&mut self, line: String) {
         self.lines.push(line);
+        // Cap at MAX_DECOMPOSITION_OUTPUT_LINES - drain oldest entries if exceeded
+        if self.lines.len() > MAX_DECOMPOSITION_OUTPUT_LINES {
+            self.lines.drain(0..(self.lines.len() - MAX_DECOMPOSITION_OUTPUT_LINES));
+        }
         self.total_lines = self.lines.len() as u16;
         // Auto-scroll when streaming (keep at bottom)
         self.scroll_offset = 0;
@@ -2250,7 +2275,12 @@ impl PipelineDetailState {
     /// Append output to a specific stage's output buffer.
     pub fn append_stage_output(&mut self, stage_type: &str, iteration: u32, text: String) {
         let key = Self::stage_key(stage_type, iteration);
-        self.stage_outputs.entry(key).or_default().push(text);
+        let lines = self.stage_outputs.entry(key).or_default();
+        lines.push(text);
+        // Cap at MAX_STAGE_OUTPUT_LINES - remove oldest entries if exceeded
+        if lines.len() > MAX_STAGE_OUTPUT_LINES {
+            lines.drain(0..(lines.len() - MAX_STAGE_OUTPUT_LINES));
+        }
     }
 
     /// Get the output lines for the currently selected stage.
@@ -2728,6 +2758,19 @@ impl App {
         self.pipeline_auto_scroll = true;
         self.current_wave = None;
         self.active_agent_count = 0;
+        // Reset decomposition-related state
+        self.decomposition_phase = DecompositionPhase::Idle;
+        self.decomposition_output = DecompositionOutputState::new();
+        self.viewing_decomposition_output = false;
+        self.completion_shown_at = None;
+        self.streaming_preview_dismissed = false;
+        self.decomposition_last_event_at = None;
+        // Reset filter state
+        self.filter_state = FilterState::new();
+        // Reset pipeline questions/answers state
+        self.pipeline_pending_questions.clear();
+        self.pipeline_question_overlay = None;
+        self.pipeline_approval_overlay = None;
         // Close overlay
         self.project_switcher = None;
         self.overlay = None;
@@ -3099,6 +3142,14 @@ impl App {
         self.pipeline_streaming_request_id.is_some()
     }
 
+    /// Push a line to the pipeline output buffer, enforcing size limit.
+    pub fn push_pipeline_output(&mut self, line: String) {
+        if self.pipeline_output_buffer.len() >= MAX_PIPELINE_OUTPUT_BUFFER {
+            self.pipeline_output_buffer.pop_front();
+        }
+        self.pipeline_output_buffer.push_back(line);
+    }
+
     /// Fetch the execute tree from the daemon.
     pub async fn fetch_execute(&mut self, client: &mut SocketClient) -> Result<()> {
         let resp = client
@@ -3118,17 +3169,28 @@ impl App {
     }
 
     /// Subscribe to daemon events for real-time updates.
+    /// Gracefully handles errors by logging a warning instead of failing.
     pub async fn subscribe_events(&mut self, client: &mut SocketClient) -> Result<()> {
         if self.event_subscription.subscribed {
             return Ok(());
         }
 
-        let resp = client
+        match client
             .send_command("subscribe", serde_json::json!({}))
-            .await?;
-
-        if resp.status == ResponseStatus::Ok {
-            self.event_subscription.subscribed = true;
+            .await
+        {
+            Ok(resp) => {
+                if resp.status == ResponseStatus::Ok {
+                    self.event_subscription.subscribed = true;
+                } else {
+                    // Subscribe command not supported by daemon - silently continue
+                    // (The daemon may not implement this command yet)
+                }
+            }
+            Err(_) => {
+                // Subscribe failed - silently continue without failing the TUI
+                // Real-time updates won't work, but the TUI can still poll for updates
+            }
         }
 
         Ok(())

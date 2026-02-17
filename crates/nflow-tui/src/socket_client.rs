@@ -65,9 +65,6 @@ pub struct StreamingResponseLine {
     pub data: serde_json::Value,
     #[serde(default)]
     pub done: bool,
-    /// Optional event payload (from daemon event subscription).
-    #[serde(default)]
-    pub event: Option<serde_json::Value>,
 }
 
 /// A connected socket client to the nflow daemon.
@@ -285,7 +282,10 @@ impl SocketClient {
 
 /// Determine the appropriate command timeout based on command name.
 fn command_timeout(command: &str) -> Duration {
-    if command.starts_with("spec.") || command.starts_with("plan.") {
+    if command.starts_with("spec.")
+        || command.starts_with("plan.")
+        || command.starts_with("pipeline.")
+    {
         LONG_COMMAND_TIMEOUT
     } else {
         DEFAULT_COMMAND_TIMEOUT

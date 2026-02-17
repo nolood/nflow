@@ -110,16 +110,17 @@ fn markdown_to_lines(text: &str, base_style: Style) -> Vec<Line<'static>> {
 
         // List items: render bullet
         let (list_prefix, content) = if raw_line.starts_with("- ") {
-            ("  • ".to_string(), &raw_line[2..])
+            ("  • ".to_string(), raw_line.get(2..).unwrap_or(""))
         } else if raw_line.starts_with("* ") {
-            ("  • ".to_string(), &raw_line[2..])
+            ("  • ".to_string(), raw_line.get(2..).unwrap_or(""))
         } else if raw_line.len() > 2
-            && raw_line.as_bytes()[0].is_ascii_digit()
-            && raw_line[1..].starts_with(". ")
+            && raw_line.chars().next().map_or(false, |c| c.is_ascii_digit())
+            && raw_line.get(1..).map_or(false, |s| s.starts_with(". "))
         {
+            let first_char = raw_line.chars().next().unwrap_or('0');
             (
-                format!("  {}. ", raw_line.as_bytes()[0] as char),
-                &raw_line[3..],
+                format!("  {}. ", first_char),
+                raw_line.get(3..).unwrap_or(""),
             )
         } else {
             (String::new(), raw_line)
@@ -1332,7 +1333,17 @@ fn render_logs_task_list(app: &App, frame: &mut Frame, area: Rect) {
         .copied()
         .collect();
 
-    let selected_vis_idx = tree.selected;
+    // Map tree.selected (index into full visible nodes) to the filtered task list
+    let selected_vis_idx = visible
+        .iter()
+        .position(|(idx, _)| *idx == tree.selected)
+        .and_then(|pos| {
+            // Find which position this is in the filtered task_visible list
+            task_visible.iter().position(|(idx, _)| {
+                visible.get(pos).map(|(i, _)| *i == *idx).unwrap_or(false)
+            })
+        })
+        .unwrap_or(0);
 
     // Scrolling: compute viewport
     let scroll_offset = if selected_vis_idx >= inner_height {
@@ -1419,9 +1430,27 @@ fn render_spec_pager(app: &App, frame: &mut Frame, area: Rect) {
     let max_scroll = pager.total_lines.saturating_sub(inner_height);
     let scroll = pager.scroll_offset.min(max_scroll);
 
-    // Build lines with markdown rendering
+    // Use cached markdown or parse and cache if needed
     let full_text = pager.lines.join("\n");
-    let content_lines: Vec<Line> = markdown_to_lines(&full_text, Style::default().fg(Color::White));
+    let content_lines: Vec<Line> = {
+        let mut cache = pager.markdown_cache.borrow_mut();
+
+        // Check if cache is valid (same source text)
+        let needs_parse = match &*cache {
+            Some((cached_text, _)) => cached_text != &full_text,
+            None => true,
+        };
+
+        if needs_parse {
+            // Parse and update cache
+            let parsed = markdown_to_lines(&full_text, Style::default().fg(Color::White));
+            *cache = Some((full_text.clone(), parsed.clone()));
+            parsed
+        } else {
+            // Use cached result
+            cache.as_ref().unwrap().1.clone()
+        }
+    };
 
     let paragraph = Paragraph::new(content_lines)
         .block(block)
@@ -1743,17 +1772,26 @@ fn render_pipeline_detail(app: &App, frame: &mut Frame, area: Rect) {
         .borders(Borders::ALL)
         .border_style(Style::default().fg(live_border_color));
 
-    let buffer_lines: Vec<Line> = app
-        .pipeline_output_buffer
-        .iter()
-        .map(|l| Line::from(l.as_str().to_owned()))
-        .collect();
+    let buffer_lines: Vec<Line> = if app.pipeline_output_buffer.is_empty() {
+        // Show placeholder when there's no output yet
+        vec![Line::from(Span::styled(
+            "Waiting for output...",
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::ITALIC),
+        ))]
+    } else {
+        app.pipeline_output_buffer
+            .iter()
+            .map(|l| Line::from(l.as_str().to_owned()))
+            .collect()
+    };
 
     let total_lines = buffer_lines.len();
     let inner_height = live_block.inner(left_chunks[1]).height as usize;
 
-    // Auto-scroll: clamp scroll to show the bottom
-    let live_scroll = if app.pipeline_auto_scroll {
+    // Auto-scroll: clamp scroll to show the bottom (but not for placeholder)
+    let live_scroll = if app.pipeline_auto_scroll && !app.pipeline_output_buffer.is_empty() {
         total_lines.saturating_sub(inner_height) as u16
     } else {
         app.pipeline_output_scroll as u16
@@ -1789,7 +1827,15 @@ fn render_pipeline_detail(app: &App, frame: &mut Frame, area: Rect) {
         .map(|l| Line::from(l.as_str()))
         .collect();
 
-    let scroll = detail.scroll_offset;
+    // Auto-scroll for right panel when streaming (similar to left panel logic)
+    let stage_total_lines = output_text.len();
+    let stage_inner_height = output_block.inner(chunks[1]).height as usize;
+    let scroll = if detail.is_streaming && app.pipeline_auto_scroll {
+        // Auto-scroll to bottom when streaming
+        stage_total_lines.saturating_sub(stage_inner_height) as u16
+    } else {
+        detail.scroll_offset
+    };
 
     let output = Paragraph::new(output_text)
         .block(output_block)
@@ -1809,6 +1855,26 @@ fn render_pipeline_new(app: &App, frame: &mut Frame, area: Rect) {
     // Center popup
     let popup_width = 60u16.min(area.width.saturating_sub(4));
     let popup_height = 13u16.min(area.height.saturating_sub(4));
+
+    // Guard against terminals that are too small (need at least 12 rows for full dialog)
+    if popup_height < 10 {
+        let warning_area = Rect::new(
+            area.width.saturating_sub(40) / 2,
+            area.height / 2,
+            40.min(area.width),
+            3.min(area.height),
+        );
+        frame.render_widget(Clear, warning_area);
+        let warning_block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Yellow));
+        let warning_msg = Paragraph::new("Terminal too small\nResize to continue")
+            .block(warning_block)
+            .style(Style::default().fg(Color::Yellow));
+        frame.render_widget(warning_msg, warning_area);
+        return;
+    }
+
     let x = (area.width.saturating_sub(popup_width)) / 2;
     let y = (area.height.saturating_sub(popup_height)) / 2;
     let popup_area = Rect::new(x, y, popup_width, popup_height);

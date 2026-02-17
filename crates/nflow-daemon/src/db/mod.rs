@@ -11,6 +11,8 @@ pub enum DbError {
     Io(#[from] std::io::Error),
     #[error("Migration error: {0}")]
     Migration(String),
+    #[error("Ambiguous ID: {0}")]
+    AmbiguousId(String),
 }
 
 pub type Result<T> = std::result::Result<T, DbError>;
@@ -20,6 +22,7 @@ pub mod agent_runs;
 pub mod decomposition_sessions;
 pub mod pipeline;
 pub mod projects;
+pub mod spec_questions;
 pub mod specs;
 pub mod work_items;
 
@@ -27,6 +30,8 @@ const MIGRATIONS: &[(u32, &str)] = &[
     (1, include_str!("../../migrations/001_init.sql")),
     (2, include_str!("../../migrations/002_pipeline.sql")),
     (3, include_str!("../../migrations/003_error_tracking.sql")),
+    (4, include_str!("../../migrations/004_pipeline_mode.sql")),
+    (5, include_str!("../../migrations/005_spec_questions.sql")),
 ];
 
 /// Open a SQLite connection with WAL mode and foreign keys enabled.
@@ -125,7 +130,7 @@ mod tests {
         let conn = in_memory_conn();
         let dummy_path = Path::new("/nonexistent/nflow.db");
         let version = run_migrations(&conn, dummy_path).unwrap();
-        assert_eq!(version, 3);
+        assert_eq!(version, 5);
 
         // Verify all tables exist
         let tables: Vec<String> = conn
@@ -145,6 +150,8 @@ mod tests {
         assert!(tables.contains(&"decomposition_specs".to_string()));
         assert!(tables.contains(&"pipeline_runs".to_string()));
         assert!(tables.contains(&"pipeline_stages".to_string()));
+        assert!(tables.contains(&"pipeline_questions".to_string()));
+        assert!(tables.contains(&"spec_questions".to_string()));
         assert!(tables.contains(&"schema_version".to_string()));
     }
 
@@ -154,8 +161,8 @@ mod tests {
         let dummy_path = Path::new("/nonexistent/nflow.db");
         let v1 = run_migrations(&conn, dummy_path).unwrap();
         let v2 = run_migrations(&conn, dummy_path).unwrap();
-        assert_eq!(v1, 3);
-        assert_eq!(v2, 3);
+        assert_eq!(v1, 5);
+        assert_eq!(v2, 5);
     }
 
     #[test]
@@ -163,7 +170,7 @@ mod tests {
         let conn = in_memory_conn();
         let dummy_path = Path::new("/nonexistent/nflow.db");
         run_migrations(&conn, dummy_path).unwrap();
-        assert_eq!(current_version(&conn).unwrap(), 3);
+        assert_eq!(current_version(&conn).unwrap(), 5);
     }
 
     #[test]
@@ -175,14 +182,14 @@ mod tests {
         let count: u32 = conn
             .query_row("SELECT COUNT(*) FROM schema_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(count, 3);
+        assert_eq!(count, 5);
 
         let max_version: u32 = conn
             .query_row("SELECT MAX(version) FROM schema_version", [], |row| {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(max_version, 3);
+        assert_eq!(max_version, 5);
     }
 
     #[test]
@@ -289,7 +296,7 @@ mod tests {
 
         let conn = open_connection(&db_path).unwrap();
         let version = run_migrations(&conn, &db_path).unwrap();
-        assert_eq!(version, 3);
+        assert_eq!(version, 5);
 
         // Verify WAL mode
         let mode: String = conn

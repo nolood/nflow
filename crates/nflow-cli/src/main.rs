@@ -77,6 +77,7 @@ async fn run(cli: Cli) -> error::Result<()> {
         Commands::Spec(SpecCommand::New {
             name,
             with_codebase,
+            non_interactive,
         }) => {
             ensure_daemon()?;
             let mut client = SocketClient::connect().await?;
@@ -88,7 +89,14 @@ async fn run(cli: Cli) -> error::Result<()> {
                 "with_codebase": with_codebase,
             });
 
-            streaming::handle_spec_dialogue(&mut client, "spec.new", params, cancelled).await
+            streaming::handle_spec_dialogue(
+                &mut client,
+                "spec.new",
+                params,
+                cancelled,
+                non_interactive,
+            )
+            .await
         }
 
         // --- Streaming: spec resume ---
@@ -104,7 +112,8 @@ async fn run(cli: Cli) -> error::Result<()> {
                 params["spec_name"] = serde_json::Value::String(n);
             }
 
-            streaming::handle_spec_dialogue(&mut client, "spec.resume", params, cancelled).await
+            streaming::handle_spec_dialogue(&mut client, "spec.resume", params, cancelled, false)
+                .await
         }
 
         // --- Streaming: pipeline start ---
@@ -291,6 +300,28 @@ fn build_command(
             }),
         )),
 
+        Commands::Spec(SpecCommand::Questions { name }) => Ok((
+            "spec.questions".to_string(),
+            serde_json::json!({
+                "project_name": project,
+                "spec_name": name,
+            }),
+        )),
+
+        Commands::Spec(SpecCommand::AnswerQuestion {
+            name,
+            question,
+            answer,
+        }) => Ok((
+            "spec.answer_question".to_string(),
+            serde_json::json!({
+                "project_name": project,
+                "spec_name": name,
+                "question_id": question,
+                "answer": answer,
+            }),
+        )),
+
         Commands::Plan(cli::PlanCommand::Generate {
             specs,
             with_codebase,
@@ -430,13 +461,13 @@ fn build_command(
 
         Commands::Worktree(cli::WorktreeCommand::List) => Ok((
             "worktree.list".to_string(),
-            serde_json::json!({ "project_name": project }),
+            serde_json::json!({ "project": project }),
         )),
 
         Commands::Worktree(cli::WorktreeCommand::Clean { all }) => Ok((
             "worktree.clean".to_string(),
             serde_json::json!({
-                "project_name": project,
+                "project": project,
                 "all": all,
             }),
         )),
@@ -448,7 +479,7 @@ fn build_command(
             dry_run,
         } => {
             let mut params = serde_json::json!({
-                "project_name": project,
+                "project": project,
                 "logs": logs,
                 "all": all,
                 "dry_run": dry_run,
@@ -456,22 +487,40 @@ fn build_command(
             if let Some(age) = older_than {
                 params["older_than"] = serde_json::Value::String(age);
             }
-            Ok(("cleanup".to_string(), params))
+            Ok(("cleanup.logs".to_string(), params))
         }
 
-        Commands::Config(cli::ConfigCommand::Show) => Ok((
-            "config.show".to_string(),
-            serde_json::json!({ "project_name": project }),
-        )),
+        Commands::Config(cli::ConfigCommand::Show) => {
+            let env_overrides: serde_json::Map<String, serde_json::Value> = std::env::vars()
+                .filter(|(k, _)| k.starts_with("NFLOW_"))
+                .map(|(k, v)| (k, serde_json::Value::String(v)))
+                .collect();
+            let mut params = serde_json::json!({ "project_name": project });
+            if !env_overrides.is_empty() {
+                params["env_overrides"] = serde_json::Value::Object(env_overrides);
+            }
+            Ok(("config.show".to_string(), params))
+        }
 
-        Commands::Config(cli::ConfigCommand::Set { key, value }) => Ok((
-            "config.set".to_string(),
-            serde_json::json!({
-                "project_name": project,
-                "key": key,
-                "value": value,
-            }),
-        )),
+        Commands::Config(cli::ConfigCommand::Set { key, value }) => {
+            let json_value: serde_json::Value = if let Ok(n) = value.parse::<i64>() {
+                serde_json::json!(n)
+            } else if value == "true" {
+                serde_json::json!(true)
+            } else if value == "false" {
+                serde_json::json!(false)
+            } else {
+                serde_json::json!(value)
+            };
+            Ok((
+                "config.set".to_string(),
+                serde_json::json!({
+                    "project_name": project,
+                    "key": key,
+                    "value": json_value,
+                }),
+            ))
+        }
 
         Commands::Pipeline(PipelineCommand::List) => Ok((
             "pipeline.list".to_string(),
@@ -679,7 +728,7 @@ mod tests {
         .unwrap();
         assert_eq!(cmd, "config.set");
         assert_eq!(params["key"], "max_parallel");
-        assert_eq!(params["value"], "8");
+        assert_eq!(params["value"], 8);
     }
 
     #[test]
@@ -694,7 +743,7 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(cmd, "cleanup");
+        assert_eq!(cmd, "cleanup.logs");
         assert_eq!(params["logs"], true);
         assert_eq!(params["older_than"], "7d");
         assert_eq!(params["dry_run"], true);

@@ -230,6 +230,10 @@ pub enum SpecCommand {
         /// Give Claude access to the project's source code
         #[arg(long)]
         with_codebase: bool,
+
+        /// Non-interactive mode: store questions for later, don't prompt stdin
+        #[arg(long, alias = "async")]
+        non_interactive: bool,
     },
 
     /// List specs for the current project
@@ -267,6 +271,26 @@ pub enum SpecCommand {
         /// Skip confirmation for approved specs
         #[arg(long)]
         force: bool,
+    },
+
+    /// List pending questions for a spec session
+    Questions {
+        /// Spec name
+        name: String,
+    },
+
+    /// Answer a pending spec question by ID
+    #[command(name = "answer-question")]
+    AnswerQuestion {
+        /// Spec name
+        name: String,
+
+        /// Question ID to answer
+        #[arg(long)]
+        question: String,
+
+        /// Your answer to the question
+        answer: String,
     },
 }
 
